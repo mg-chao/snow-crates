@@ -668,10 +668,10 @@ fn create_duplication(
     let output1: IDXGIOutput1 = output
         .cast()
         .context("failed to query IDXGIOutput1")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     unsafe { output1.DuplicateOutput(device) }
         .context("DuplicateOutput failed")
-        .map_err(CaptureError::Platform)
+        .map_err(CaptureError::platform)
 }
 
 fn try_acquire_frame(
@@ -689,7 +689,7 @@ fn try_acquire_frame(
         if error.code() == DXGI_ERROR_ACCESS_LOST {
             return Ok(TryAcquireResult::AccessLost);
         }
-        return Err(CaptureError::Platform(
+        return Err(CaptureError::platform(
             anyhow::Error::from(error).context("AcquireNextFrame failed"),
         ));
     }
@@ -707,7 +707,7 @@ fn try_acquire_frame(
     let texture: ID3D11Texture2D = resource
         .cast()
         .context("failed to cast acquired IDXGIResource to ID3D11Texture2D")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     Ok(TryAcquireResult::Ok(texture, info))
 }
 
@@ -764,10 +764,12 @@ fn with_monitor_context<T>(
     action: &'static str,
 ) -> CaptureResult<T> {
     result.map_err(|error| match error {
-        CaptureError::Platform(inner) => CaptureError::Platform(inner.context(format!(
-            "failed to {action} capturer for {}",
-            monitor.name()
-        ))),
+        CaptureError::Platform(inner) => {
+            CaptureError::platform(anyhow::anyhow!("{inner:#}").context(format!(
+                "failed to {action} capturer for {}",
+                monitor.name()
+            )))
+        }
         other => other,
     })
 }
@@ -902,7 +904,7 @@ impl StagingRing {
                 let mut query: Option<ID3D11Query> = None;
                 unsafe { device.CreateQuery(&query_desc, Some(&mut query)) }
                     .context("CreateQuery for staging ring failed")
-                    .map_err(CaptureError::Platform)?;
+                    .map_err(CaptureError::platform)?;
                 self.queries[i] = query;
             }
         }
@@ -1600,7 +1602,7 @@ struct OutputCapturer {
 impl OutputCapturer {
     fn new(resolved: &ResolvedMonitor) -> CaptureResult<Self> {
         let (device, context) = d3d11::create_d3d11_device_for_adapter(&resolved.adapter, true)
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let duplication = create_duplication(&resolved.output, &device)?;
         let hdr_to_sdr = hdr_to_sdr_params(resolved.hdr_metadata);
         let gpu_tonemapper = if hdr_to_sdr.is_some() {
@@ -1851,7 +1853,7 @@ impl OutputCapturer {
 
         let slot = &self.region.slots[slot_idx];
         let source_desc = slot.source_desc.ok_or_else(|| {
-            CaptureError::Platform(anyhow::anyhow!(
+            CaptureError::platform(anyhow::anyhow!(
                 "DXGI region slot is populated but missing source descriptor"
             ))
         })?;
@@ -1886,12 +1888,12 @@ impl OutputCapturer {
 
         let slot = &self.region.slots[slot_idx];
         let staging = slot.staging.as_ref().ok_or_else(|| {
-            CaptureError::Platform(anyhow::anyhow!(
+            CaptureError::platform(anyhow::anyhow!(
                 "DXGI region slot is populated but missing staging texture"
             ))
         })?;
         let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
-            CaptureError::Platform(anyhow::anyhow!(
+            CaptureError::platform(anyhow::anyhow!(
                 "DXGI region slot is populated but missing staging resource"
             ))
         })?;
@@ -2671,7 +2673,7 @@ pub(crate) struct WindowsMonitorCapturer {
 
 impl WindowsMonitorCapturer {
     pub(crate) fn new(monitor: &MonitorId, resolver: Arc<MonitorResolver>) -> CaptureResult<Self> {
-        let com = super::com::CoInitGuard::init_multithreaded().map_err(CaptureError::Platform)?;
+        let com = super::com::CoInitGuard::init_multithreaded().map_err(CaptureError::platform)?;
         let resolved = resolver.resolve_monitor(monitor)?;
         let output = with_monitor_context(OutputCapturer::new(&resolved), monitor, "initialize")?;
         Ok(Self {
@@ -2814,7 +2816,7 @@ fn monitor_rect(hmon: HMONITOR) -> CaptureResult<RECT> {
         ..Default::default()
     };
     if !unsafe { GetMonitorInfoW(hmon, &mut info) }.as_bool() {
-        return Err(CaptureError::Platform(anyhow::anyhow!(
+        return Err(CaptureError::platform(anyhow::anyhow!(
             "GetMonitorInfoW failed for DXGI window capture"
         )));
     }
@@ -2859,7 +2861,7 @@ pub(crate) struct WindowsDxgiWindowCapturer {
 
 impl WindowsDxgiWindowCapturer {
     pub(crate) fn new(window: &WindowId, resolver: Arc<MonitorResolver>) -> CaptureResult<Self> {
-        let com = super::com::CoInitGuard::init_multithreaded().map_err(CaptureError::Platform)?;
+        let com = super::com::CoInitGuard::init_multithreaded().map_err(CaptureError::platform)?;
         let hwnd = HWND(window.raw_handle() as *mut std::ffi::c_void);
 
         if hwnd.0.is_null() {
@@ -2868,7 +2870,7 @@ impl WindowsDxgiWindowCapturer {
                 window.stable_id()
             )));
         }
-        if !unsafe { IsWindow(hwnd) }.as_bool() {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(CaptureError::InvalidTarget(format!(
                 "window handle is not valid: {}",
                 window.stable_id()
@@ -2976,7 +2978,7 @@ impl WindowsDxgiWindowCapturer {
     ) -> CaptureResult<Frame> {
         let hwnd = self.hwnd.0;
 
-        if !unsafe { IsWindow(hwnd) }.as_bool() {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(CaptureError::InvalidTarget(
                 "window no longer exists".into(),
             ));
@@ -2989,7 +2991,7 @@ impl WindowsDxgiWindowCapturer {
         unsafe { GetWindowRect(hwnd, &mut win_rect) }
             .ok()
             .context("GetWindowRect failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         let win_w = win_rect.right - win_rect.left;
         let win_h = win_rect.bottom - win_rect.top;
@@ -3024,7 +3026,7 @@ impl WindowsDxgiWindowCapturer {
                     unsafe { GetWindowRect(hwnd, &mut win_rect) }
                         .ok()
                         .context("GetWindowRect failed during DXGI window capture recovery")
-                        .map_err(CaptureError::Platform)?;
+                        .map_err(CaptureError::platform)?;
                     let retry_blit = self.resolve_window_blit(hwnd, &win_rect)?;
                     let retry_has_history = history_enabled
                         && frame.width() == retry_blit.width

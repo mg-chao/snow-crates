@@ -1,4 +1,4 @@
-﻿use std::collections::VecDeque;
+use std::collections::VecDeque;
 use std::mem::{size_of, size_of_val};
 use std::ptr;
 use std::slice;
@@ -6,11 +6,12 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_UNSUPPORTED_FORMAT,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_NOPERSIST, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-    IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, WAVE_FORMAT_PCM,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_E_UNSUPPORTED_FORMAT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_NOPERSIST,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient, IAudioClient,
+    IMMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    WAVEFORMATEXTENSIBLE_0,
 };
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
 use windows::Win32::System::Com::{CLSCTX_ALL, CoTaskMemFree};
@@ -57,13 +58,16 @@ struct PacketAccumulator {
 }
 
 impl PacketAccumulator {
-    fn new(source: AudioSourceKind, format: AudioFormat, packet_duration: std::time::Duration) -> AudioResult<Self> {
+    fn new(
+        source: AudioSourceKind,
+        format: AudioFormat,
+        packet_duration: std::time::Duration,
+    ) -> AudioResult<Self> {
         let bytes_per_frame = format.bytes_per_frame()?;
-        let mut target_frames =
-            (format.sample_rate as u128)
-                .checked_mul(packet_duration.as_nanos())
-                .and_then(|value| value.checked_div(1_000_000_000))
-                .ok_or(AudioError::BufferOverflow)? as u32;
+        let mut target_frames = (format.sample_rate as u128)
+            .checked_mul(packet_duration.as_nanos())
+            .and_then(|value| value.checked_div(1_000_000_000))
+            .ok_or(AudioError::BufferOverflow)? as u32;
         if target_frames == 0 {
             target_frames = 1;
         }
@@ -119,12 +123,11 @@ impl PacketAccumulator {
                 .bytes_per_frame
                 .checked_mul(self.target_frames as usize)
                 .ok_or(AudioError::BufferOverflow)?;
-            let mut data = Vec::with_capacity(packet_byte_count);
-            for _ in 0..packet_byte_count {
-                if let Some(byte) = self.buffer.pop_front() {
-                    data.push(byte);
-                }
-            }
+
+            // Ensure the deque's internal storage is contiguous so we can
+            // drain efficiently instead of popping byte-by-byte.
+            self.buffer.make_contiguous();
+            let data: Vec<u8> = self.buffer.drain(..packet_byte_count).collect();
 
             if data.len() != packet_byte_count {
                 return Err(AudioError::BufferOverflow);
@@ -132,10 +135,13 @@ impl PacketAccumulator {
 
             self.buffered_frames -= self.target_frames;
             *sequence = sequence.wrapping_add(1);
-            let pending = self.pending_meta.clone().unwrap_or_else(|| PendingMetadata {
-                is_silent: true,
-                ..Default::default()
-            });
+            let pending = self
+                .pending_meta
+                .clone()
+                .unwrap_or_else(|| PendingMetadata {
+                    is_silent: true,
+                    ..Default::default()
+                });
 
             output.push(AudioPacket {
                 source: self.source,
@@ -224,16 +230,11 @@ impl WasapiSource {
 
         let event = EventHandle::new_auto_reset(false)?;
         let selector = config.device.clone();
-        let (runtime, converter) = init_runtime(
-            kind,
-            flow,
-            &selector,
-            &config,
-            &enumerator,
-            event.raw(),
-        )?;
+        let (runtime, converter) =
+            init_runtime(kind, flow, &selector, &config, &enumerator, event.raw())?;
 
-        let accumulator = PacketAccumulator::new(kind, config.output_format, config.packet_duration)?;
+        let accumulator =
+            PacketAccumulator::new(kind, config.output_format, config.packet_duration)?;
 
         Ok(Self {
             kind,
@@ -295,15 +296,13 @@ impl WasapiSource {
             let mut qpc_position = 0u64;
 
             unsafe {
-                self.runtime
-                    .capture_client
-                    .GetBuffer(
-                        &mut data_ptr,
-                        &mut frames,
-                        &mut flags,
-                        Some(&mut device_position),
-                        Some(&mut qpc_position),
-                    )
+                self.runtime.capture_client.GetBuffer(
+                    &mut data_ptr,
+                    &mut frames,
+                    &mut flags,
+                    Some(&mut device_position),
+                    Some(&mut qpc_position),
+                )
             }
             .map_err(|err| map_hresult(err.code(), "IAudioCaptureClient::GetBuffer"))?;
 
@@ -318,11 +317,10 @@ impl WasapiSource {
 
                 let converted = if is_silent {
                     self.silence_scratch.resize(byte_count, 0);
-                    self.converter
-                        .convert_chunk(&self.silence_scratch, frames)
+                    self.converter.convert_chunk(&self.silence_scratch, frames)
                 } else {
                     if data_ptr.is_null() {
-                        return Err(AudioError::Platform(anyhow::anyhow!(
+                        return Err(AudioError::platform(anyhow::anyhow!(
                             "WASAPI returned null audio buffer pointer"
                         )));
                     }
@@ -390,7 +388,8 @@ fn init_runtime(
     let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
         .map_err(|err| map_hresult(err.code(), "IMMDevice::Activate(IAudioClient)"))?;
 
-    let (selected_format, native_format) = select_stream_format(&audio_client, config.output_format)?;
+    let (selected_format, native_format) =
+        select_stream_format(&audio_client, config.output_format)?;
 
     let duration_hns = duration_to_hns(config.packet_duration)?;
     let mut stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
@@ -422,7 +421,8 @@ fn init_runtime(
     let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService() }
         .map_err(|err| map_hresult(err.code(), "IAudioClient::GetService(IAudioCaptureClient)"))?;
 
-    unsafe { audio_client.Start() }.map_err(|err| map_hresult(err.code(), "IAudioClient::Start"))?;
+    unsafe { audio_client.Start() }
+        .map_err(|err| map_hresult(err.code(), "IAudioClient::Start"))?;
 
     let converter = AudioConverter::new(native_format, config.output_format)?;
 
@@ -439,9 +439,7 @@ fn init_runtime(
 
 fn duration_to_hns(duration: std::time::Duration) -> AudioResult<i64> {
     let nanos = duration.as_nanos();
-    let hns = nanos
-        .checked_div(100)
-        .ok_or(AudioError::BufferOverflow)?;
+    let hns = nanos.checked_div(100).ok_or(AudioError::BufferOverflow)?;
 
     if hns > i64::MAX as u128 {
         return Err(AudioError::BufferOverflow);
@@ -463,7 +461,11 @@ fn select_stream_format(
 
     let mut closest_ptr: *mut WAVEFORMATEX = ptr::null_mut();
     let support_hr = unsafe {
-        audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, requested_ptr, Some(&mut closest_ptr))
+        audio_client.IsFormatSupported(
+            AUDCLNT_SHAREMODE_SHARED,
+            requested_ptr,
+            Some(&mut closest_ptr),
+        )
     };
 
     let selected = if support_hr == S_OK {
@@ -481,10 +483,7 @@ fn select_stream_format(
         unsafe {
             CoTaskMemFree(Some(mix_ptr as *const _));
         }
-        return Err(map_hresult(
-            support_hr,
-            "IAudioClient::IsFormatSupported",
-        ));
+        return Err(map_hresult(support_hr, "IAudioClient::IsFormatSupported"));
     };
 
     if !closest_ptr.is_null() {
@@ -604,8 +603,7 @@ fn parse_native_format(ptr: *const WAVEFORMATEX) -> AudioResult<NativeAudioForma
             NativeSampleFormat::F32
         }
         tag if tag == WAVE_FORMAT_EXTENSIBLE => {
-            if (cb_size as usize)
-                < (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>())
+            if (cb_size as usize) < (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>())
             {
                 return Err(AudioError::UnsupportedFormat(
                     "malformed WAVE_FORMAT_EXTENSIBLE format".into(),
@@ -613,8 +611,7 @@ fn parse_native_format(ptr: *const WAVEFORMATEX) -> AudioResult<NativeAudioForma
             }
 
             let extensible = unsafe { (ptr as *const WAVEFORMATEXTENSIBLE).read_unaligned() };
-            let subformat =
-                unsafe { std::ptr::addr_of!(extensible.SubFormat).read_unaligned() };
+            let subformat = unsafe { std::ptr::addr_of!(extensible.SubFormat).read_unaligned() };
 
             if subformat == KSDATAFORMAT_SUBTYPE_PCM {
                 match bits_per_sample {

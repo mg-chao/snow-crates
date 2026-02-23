@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 
 #[cfg(not(target_os = "windows"))]
 use crate::backend::MonitorCapturer;
@@ -17,7 +17,7 @@ pub(crate) mod windows;
 
 #[cfg(not(target_os = "windows"))]
 fn unsupported_error() -> CaptureError {
-    CaptureError::Platform(anyhow::anyhow!(
+    CaptureError::platform(anyhow::anyhow!(
         "screen capture is only supported on Windows"
     ))
 }

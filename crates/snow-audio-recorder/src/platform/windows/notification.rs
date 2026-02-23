@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Media::Audio::{
@@ -15,7 +15,7 @@ fn platform_err<E>(err: E) -> AudioError
 where
     E: Into<anyhow::Error>,
 {
-    AudioError::Platform(err.into())
+    AudioError::platform(err)
 }
 
 #[derive(Default)]
@@ -90,7 +90,11 @@ struct NotificationClient {
 
 #[allow(non_snake_case)]
 impl IMMNotificationClient_Impl for NotificationClient_Impl {
-    fn OnDeviceStateChanged(&self, _pwstrdeviceid: &PCWSTR, _dwnewstate: DEVICE_STATE) -> windows::core::Result<()> {
+    fn OnDeviceStateChanged(
+        &self,
+        _pwstrdeviceid: &PCWSTR,
+        _dwnewstate: DEVICE_STATE,
+    ) -> windows::core::Result<()> {
         self.state.topology_changed.store(true, Ordering::Release);
         let _ = self.control_event.set();
         Ok(())
@@ -115,12 +119,20 @@ impl IMMNotificationClient_Impl for NotificationClient_Impl {
         _pwstrdefaultdeviceid: &PCWSTR,
     ) -> windows::core::Result<()> {
         if flow == eRender {
-            self.state.render_default_changed.store(true, Ordering::Release);
+            self.state
+                .render_default_changed
+                .store(true, Ordering::Release);
         } else if flow == eCapture {
-            self.state.capture_default_changed.store(true, Ordering::Release);
+            self.state
+                .capture_default_changed
+                .store(true, Ordering::Release);
         } else {
-            self.state.render_default_changed.store(true, Ordering::Release);
-            self.state.capture_default_changed.store(true, Ordering::Release);
+            self.state
+                .render_default_changed
+                .store(true, Ordering::Release);
+            self.state
+                .capture_default_changed
+                .store(true, Ordering::Release);
         }
 
         let _ = self.control_event.set();
@@ -130,7 +142,7 @@ impl IMMNotificationClient_Impl for NotificationClient_Impl {
     fn OnPropertyValueChanged(
         &self,
         _pwstrdeviceid: &PCWSTR,
-        _key: &windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY,
+        _key: &windows::Win32::Foundation::PROPERTYKEY,
     ) -> windows::core::Result<()> {
         self.state.topology_changed.store(true, Ordering::Release);
         let _ = self.control_event.set();

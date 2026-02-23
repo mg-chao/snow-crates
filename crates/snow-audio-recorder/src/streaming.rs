@@ -1,12 +1,11 @@
-﻿use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::backend::{AudioRecorderEngine, EngineEvent};
-use crate::error::{AudioError, AudioResult};
+use crate::error::{AudioError, AudioResult, RecvError, RecvTimeoutError, TryRecvError};
+use crate::event_queue::EventQueue;
 use crate::packet::{AudioEvent, AudioPacket};
 use crate::session::AudioStreamConfig;
 
@@ -64,128 +63,6 @@ impl AudioStreamStats {
     }
 }
 
-struct QueueState {
-    closed: bool,
-    events: VecDeque<AudioEvent>,
-}
-
-struct PushOutcome {
-    dropped: Option<AudioEvent>,
-    len: usize,
-}
-
-struct EventQueue {
-    depth: usize,
-    state: Mutex<QueueState>,
-    cv: Condvar,
-}
-
-impl EventQueue {
-    fn new(depth: usize) -> Self {
-        Self {
-            depth: depth.max(1),
-            state: Mutex::new(QueueState {
-                closed: false,
-                events: VecDeque::with_capacity(depth.max(1)),
-            }),
-            cv: Condvar::new(),
-        }
-    }
-
-    fn push(&self, event: AudioEvent) -> PushOutcome {
-        let mut guard = self.state.lock().unwrap();
-        if guard.closed {
-            return PushOutcome {
-                dropped: Some(event),
-                len: guard.events.len(),
-            };
-        }
-
-        let dropped = if guard.events.len() >= self.depth {
-            guard.events.pop_front()
-        } else {
-            None
-        };
-
-        guard.events.push_back(event);
-        let len = guard.events.len();
-        self.cv.notify_one();
-        PushOutcome { dropped, len }
-    }
-
-    fn recv(&self) -> Result<(AudioEvent, usize), std::sync::mpsc::RecvError> {
-        let mut guard = self.state.lock().unwrap();
-        loop {
-            if let Some(event) = guard.events.pop_front() {
-                return Ok((event, guard.events.len()));
-            }
-            if guard.closed {
-                return Err(std::sync::mpsc::RecvError);
-            }
-            guard = self.cv.wait(guard).unwrap();
-        }
-    }
-
-    fn try_recv(&self) -> Result<(AudioEvent, usize), std::sync::mpsc::TryRecvError> {
-        let mut guard = self.state.lock().unwrap();
-        if let Some(event) = guard.events.pop_front() {
-            return Ok((event, guard.events.len()));
-        }
-        if guard.closed {
-            return Err(std::sync::mpsc::TryRecvError::Disconnected);
-        }
-        Err(std::sync::mpsc::TryRecvError::Empty)
-    }
-
-    fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<(AudioEvent, usize), std::sync::mpsc::RecvTimeoutError> {
-        let mut guard = self.state.lock().unwrap();
-        if let Some(event) = guard.events.pop_front() {
-            return Ok((event, guard.events.len()));
-        }
-
-        if guard.closed {
-            return Err(std::sync::mpsc::RecvTimeoutError::Disconnected);
-        }
-
-        let (mut guard, wait_result) = self
-            .cv
-            .wait_timeout_while(guard, timeout, |state| !state.closed && state.events.is_empty())
-            .unwrap();
-
-        if let Some(event) = guard.events.pop_front() {
-            return Ok((event, guard.events.len()));
-        }
-
-        if guard.closed {
-            return Err(std::sync::mpsc::RecvTimeoutError::Disconnected);
-        }
-
-        if wait_result.timed_out() {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        } else {
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-        }
-    }
-
-    fn close(&self) {
-        let mut guard = self.state.lock().unwrap();
-        guard.closed = true;
-        self.cv.notify_all();
-    }
-
-    fn drain(&self) -> Vec<AudioEvent> {
-        let mut guard = self.state.lock().unwrap();
-        let mut drained = Vec::with_capacity(guard.events.len());
-        while let Some(event) = guard.events.pop_front() {
-            drained.push(event);
-        }
-        drained
-    }
-}
-
 pub struct AudioStreamHandle {
     queue: Arc<EventQueue>,
     stop_flag: Arc<AtomicBool>,
@@ -225,7 +102,7 @@ impl AudioStreamHandle {
                 );
             })
             .map_err(|err| {
-                AudioError::Platform(anyhow::anyhow!(
+                AudioError::platform(anyhow::anyhow!(
                     "failed to spawn audio stream thread: {err}"
                 ))
             })?;
@@ -240,22 +117,19 @@ impl AudioStreamHandle {
         })
     }
 
-    pub fn recv(&self) -> Result<AudioEvent, std::sync::mpsc::RecvError> {
+    pub fn recv(&self) -> Result<AudioEvent, RecvError> {
         let (event, len) = self.queue.recv()?;
         self.stats.buffer_fill.store(len as u64, Ordering::Release);
         Ok(event)
     }
 
-    pub fn try_recv(&self) -> Result<AudioEvent, std::sync::mpsc::TryRecvError> {
+    pub fn try_recv(&self) -> Result<AudioEvent, TryRecvError> {
         let (event, len) = self.queue.try_recv()?;
         self.stats.buffer_fill.store(len as u64, Ordering::Release);
         Ok(event)
     }
 
-    pub fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<AudioEvent, std::sync::mpsc::RecvTimeoutError> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<AudioEvent, RecvTimeoutError> {
         let (event, len) = self.queue.recv_timeout(timeout)?;
         self.stats.buffer_fill.store(len as u64, Ordering::Release);
         Ok(event)
@@ -329,6 +203,8 @@ fn stream_loop(
     let mut packet_counter: u64 = 0;
     let mut packet_epoch = Instant::now();
 
+    let mut bp = BackpressureState::new(config.backpressure_threshold, config.event_buffer_depth);
+
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -338,7 +214,7 @@ fn stream_loop(
             if !was_paused {
                 let now = Instant::now();
                 pause_started = Some(now);
-                push_event_with_drop_notice(queue, stats, AudioEvent::Paused { at: now });
+                push_event_with_drop_notice(queue, stats, AudioEvent::Paused { at: now }, &mut bp);
                 was_paused = true;
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -352,7 +228,12 @@ fn stream_loop(
             let gap = pause_started
                 .map(|started| now.saturating_duration_since(started))
                 .unwrap_or(Duration::ZERO);
-            push_event_with_drop_notice(queue, stats, AudioEvent::Resumed { at: now, gap });
+            push_event_with_drop_notice(
+                queue,
+                stats,
+                AudioEvent::Resumed { at: now, gap },
+                &mut bp,
+            );
             was_paused = false;
             pause_started = None;
         }
@@ -375,21 +256,26 @@ fn stream_loop(
                         }
                         _ => {}
                     }
-                    push_event_with_drop_notice(queue, stats, event);
+                    push_event_with_drop_notice(queue, stats, event, &mut bp);
                 }
             }
             Err(err) if err.is_retryable() => {
                 consecutive_errors += 1;
                 stats.errors_recovered.fetch_add(1, Ordering::Relaxed);
                 if consecutive_errors >= config.max_consecutive_errors {
-                    push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.to_sendable()));
+                    push_event_with_drop_notice(
+                        queue,
+                        stats,
+                        AudioEvent::Error(err.clone()),
+                        &mut bp,
+                    );
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(16));
                 continue;
             }
             Err(err) => {
-                push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.to_sendable()));
+                push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.clone()), &mut bp);
                 break;
             }
         }
@@ -405,13 +291,69 @@ fn stream_loop(
         }
     }
 
-    push_event_with_drop_notice(queue, stats, AudioEvent::StreamEnded);
+    push_event_with_drop_notice(queue, stats, AudioEvent::StreamEnded, &mut bp);
     queue.close();
 }
 
-fn push_event_with_drop_notice(queue: &EventQueue, stats: &AudioStreamStats, event: AudioEvent) {
+/// Tracks whether we've already emitted a `BufferPressure` event for the
+/// current high-pressure episode, so we don't spam the control lane.
+/// Resets once the fill ratio drops back below the threshold.
+struct BackpressureState {
+    threshold: f64,
+    buffer_depth: usize,
+    /// `true` while we're above the threshold and have already emitted.
+    signalled: bool,
+}
+
+impl BackpressureState {
+    fn new(threshold: f64, buffer_depth: usize) -> Self {
+        Self {
+            threshold,
+            buffer_depth,
+            signalled: false,
+        }
+    }
+
+    /// Check the current fill level and return a `BufferPressure` event if
+    /// we just crossed the threshold upward. Returns `None` if we're below
+    /// the threshold or have already signalled for this episode.
+    fn check(&mut self, data_len: usize) -> Option<AudioEvent> {
+        if self.buffer_depth == 0 {
+            return None;
+        }
+        let fill_ratio = (data_len as f64 / self.buffer_depth as f64).min(1.0);
+        if fill_ratio >= self.threshold {
+            if !self.signalled {
+                self.signalled = true;
+                return Some(AudioEvent::BufferPressure {
+                    fill_ratio,
+                    buffer_depth: self.buffer_depth,
+                });
+            }
+        } else {
+            // Dropped back below threshold — arm for the next crossing.
+            self.signalled = false;
+        }
+        None
+    }
+}
+
+fn push_event_with_drop_notice(
+    queue: &EventQueue,
+    stats: &AudioStreamStats,
+    event: AudioEvent,
+    bp: &mut BackpressureState,
+) {
     let outcome = queue.push(event);
-    stats.buffer_fill.store(outcome.len as u64, Ordering::Release);
+    stats
+        .buffer_fill
+        .store(outcome.len as u64, Ordering::Release);
+
+    // Check backpressure *before* handling drops — this is the proactive signal.
+    if let Some(pressure_event) = bp.check(outcome.len) {
+        // BufferPressure is a control event, so it goes into the unbounded lane.
+        let _ = queue.push(pressure_event);
+    }
 
     if let Some(dropped) = outcome.dropped {
         if let Some((source, dropped_frames)) = dropped_packet_info(&dropped) {
@@ -427,8 +369,6 @@ fn push_event_with_drop_notice(queue: &EventQueue, stats: &AudioStreamStats, eve
                 if let Some((_, secondary_dropped_frames)) =
                     dropped_packet_info(&dropped_notice_target)
                 {
-                    // Best effort: account for the secondary drop, but avoid recursive
-                    // drop-notification storms when the queue is saturated.
                     record_dropped_packet(stats, secondary_dropped_frames);
                 }
             }
@@ -456,7 +396,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use crate::backend::EngineEvent;
-    use crate::error::AudioResult;
+    use crate::error::{AudioError, AudioResult};
     use crate::format::{AudioFormat, AudioSampleFormat};
     use crate::packet::{AudioPacket, AudioPacketMetadata, AudioSourceKind};
 
@@ -481,7 +421,7 @@ mod tests {
                 match ev {
                     EngineEvent::Idle => Ok(EngineEvent::Idle),
                     EngineEvent::Events(events) => {
-                        let cloned = events.iter().map(clone_event).collect();
+                        let cloned = events.iter().map(|e| e.clone()).collect();
                         Ok(EngineEvent::Events(cloned))
                     }
                 }
@@ -489,34 +429,6 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 Ok(EngineEvent::Idle)
             }
-        }
-    }
-
-    fn clone_event(event: &AudioEvent) -> AudioEvent {
-        match event {
-            AudioEvent::Packet(packet) => AudioEvent::Packet(packet.clone()),
-            AudioEvent::PacketDropped {
-                source,
-                dropped_frames,
-            } => AudioEvent::PacketDropped {
-                source: *source,
-                dropped_frames: *dropped_frames,
-            },
-            AudioEvent::SourceRestarted {
-                source,
-                old_device_id,
-                new_device_id,
-                downtime,
-            } => AudioEvent::SourceRestarted {
-                source: *source,
-                old_device_id: old_device_id.clone(),
-                new_device_id: new_device_id.clone(),
-                downtime: *downtime,
-            },
-            AudioEvent::Paused { at } => AudioEvent::Paused { at: *at },
-            AudioEvent::Resumed { at, gap } => AudioEvent::Resumed { at: *at, gap: *gap },
-            AudioEvent::StreamEnded => AudioEvent::StreamEnded,
-            AudioEvent::Error(err) => AudioEvent::Error(err.to_sendable()),
         }
     }
 
@@ -534,35 +446,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_queue_drops_oldest_packet() {
-        let queue = EventQueue::new(2);
-        let stats = AudioStreamStats::default();
-
-        push_event_with_drop_notice(&queue, &stats, AudioEvent::Packet(packet(1)));
-        push_event_with_drop_notice(&queue, &stats, AudioEvent::Packet(packet(2)));
-        push_event_with_drop_notice(&queue, &stats, AudioEvent::Packet(packet(3)));
-
-        let first = queue.recv().unwrap().0;
-        let second = queue.recv().unwrap().0;
-
-        match first {
-            AudioEvent::Packet(pkt) => assert_eq!(pkt.metadata.sequence, 3),
-            _ => panic!("expected packet event"),
-        }
-
-        match second {
-            AudioEvent::PacketDropped {
-                source,
-                dropped_frames,
-            } => {
-                assert_eq!(source, AudioSourceKind::System);
-                assert_eq!(dropped_frames, 480);
-            }
-            _ => panic!("expected packet dropped event"),
-        }
-    }
-
-    #[test]
     fn stop_and_drain_returns_tail_events() {
         let engine = Box::new(ScriptedEngine::new(vec![EngineEvent::Events(vec![
             AudioEvent::Packet(packet(1)),
@@ -576,8 +459,86 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let tail = handle.stop_and_drain();
 
-        assert!(tail
-            .iter()
-            .any(|event| matches!(event, AudioEvent::Packet(_))));
+        assert!(
+            tail.iter()
+                .any(|event| matches!(event, AudioEvent::Packet(_)))
+        );
+    }
+
+    #[test]
+    fn backpressure_state_fires_once_per_episode() {
+        let mut bp = BackpressureState::new(0.5, 4);
+
+        // Below threshold — no signal.
+        assert!(bp.check(1).is_none());
+
+        // Cross threshold — should fire.
+        let event = bp.check(2);
+        assert!(
+            matches!(event, Some(AudioEvent::BufferPressure { fill_ratio, buffer_depth })
+                if (fill_ratio - 0.5).abs() < f64::EPSILON && buffer_depth == 4),
+            "should emit BufferPressure on first crossing"
+        );
+
+        // Still above — should NOT fire again.
+        assert!(bp.check(3).is_none());
+        assert!(bp.check(4).is_none());
+
+        // Drop below threshold — resets.
+        assert!(bp.check(1).is_none());
+
+        // Cross again — should fire again.
+        let event = bp.check(3);
+        assert!(
+            matches!(event, Some(AudioEvent::BufferPressure { .. })),
+            "should re-arm after dropping below threshold"
+        );
+    }
+
+    #[test]
+    fn backpressure_disabled_at_threshold_1() {
+        let mut bp = BackpressureState::new(1.0, 4);
+
+        // Only fires when completely full.
+        assert!(bp.check(3).is_none());
+        assert!(bp.check(4).is_some());
+        assert!(bp.check(4).is_none()); // already signalled
+    }
+
+    #[test]
+    fn control_events_do_not_trigger_backpressure_or_buffer_fill() {
+        let queue = EventQueue::new(4);
+        let stats = AudioStreamStats::default();
+        let mut bp = BackpressureState::new(0.5, 4);
+
+        push_event_with_drop_notice(
+            &queue,
+            &stats,
+            AudioEvent::Error(AudioError::DeviceLost),
+            &mut bp,
+        );
+        push_event_with_drop_notice(
+            &queue,
+            &stats,
+            AudioEvent::Error(AudioError::WorkerDead),
+            &mut bp,
+        );
+
+        let mut saw_buffer_pressure = false;
+        while let Ok((event, _)) = queue.try_recv() {
+            if matches!(event, AudioEvent::BufferPressure { .. }) {
+                saw_buffer_pressure = true;
+            }
+        }
+
+        assert!(
+            !saw_buffer_pressure,
+            "control-lane activity should not trigger BufferPressure"
+        );
+        assert_eq!(
+            stats.buffer_fill.load(Ordering::Relaxed),
+            0,
+            "buffer_fill should track data-lane occupancy only"
+        );
     }
 }

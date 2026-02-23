@@ -1,6 +1,8 @@
-﻿use anyhow::Context;
+use anyhow::Context;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, RPC_E_CHANGED_MODE};
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
+use windows::Win32::System::Com::{
+    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+};
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
 
 use crate::error::{AudioError, AudioResult};
@@ -9,7 +11,7 @@ fn platform_err<E>(err: E) -> AudioError
 where
     E: Into<anyhow::Error>,
 {
-    AudioError::Platform(err.into())
+    AudioError::platform(err)
 }
 
 pub(crate) struct CoInitGuard {
@@ -27,7 +29,7 @@ impl CoInitGuard {
 
         hr.ok()
             .context("failed to initialize COM with CoInitializeEx(COINIT_MULTITHREADED)")
-            .map_err(AudioError::Platform)?;
+            .map_err(AudioError::platform)?;
 
         Ok(Self {
             should_uninit: true,
@@ -55,14 +57,14 @@ unsafe impl Sync for EventHandle {}
 
 impl EventHandle {
     pub fn new_manual_reset(initial_state: bool) -> AudioResult<Self> {
-        let handle = unsafe { CreateEventW(None, true, initial_state, None) }
-            .map_err(platform_err)?;
+        let handle =
+            unsafe { CreateEventW(None, true, initial_state, None) }.map_err(platform_err)?;
         Ok(Self { raw: handle })
     }
 
     pub fn new_auto_reset(initial_state: bool) -> AudioResult<Self> {
-        let handle = unsafe { CreateEventW(None, false, initial_state, None) }
-            .map_err(platform_err)?;
+        let handle =
+            unsafe { CreateEventW(None, false, initial_state, None) }.map_err(platform_err)?;
         Ok(Self { raw: handle })
     }
 
@@ -89,7 +91,7 @@ impl Drop for EventHandle {
 
 pub(crate) fn pwstr_to_string_and_free(value: windows::core::PWSTR) -> AudioResult<String> {
     if value.is_null() {
-        return Err(AudioError::Platform(anyhow::anyhow!(
+        return Err(AudioError::platform(anyhow::anyhow!(
             "received null PWSTR from COM"
         )));
     }

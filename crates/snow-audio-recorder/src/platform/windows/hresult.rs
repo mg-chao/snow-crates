@@ -1,8 +1,7 @@
-﻿use windows::Win32::Foundation::E_ACCESSDENIED;
+use windows::Win32::Foundation::E_ACCESSDENIED;
 use windows::Win32::Media::Audio::{
     AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_ENDPOINT_CREATE_FAILED,
-    AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING,
-    AUDCLNT_E_UNSUPPORTED_FORMAT,
+    AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_E_UNSUPPORTED_FORMAT,
 };
 
 use crate::error::AudioError;
@@ -25,10 +24,12 @@ pub(crate) fn map_hresult(hr: windows::core::HRESULT, context: &str) -> AudioErr
     }
 
     if hr == AUDCLNT_E_SERVICE_NOT_RUNNING {
-        return AudioError::DeviceUnavailable(format!("{context}: Windows Audio service is not running"));
+        return AudioError::DeviceUnavailable(format!(
+            "{context}: Windows Audio service is not running"
+        ));
     }
 
-    AudioError::Platform(anyhow::anyhow!("{context}: HRESULT 0x{:08x}", hr.0 as u32))
+    AudioError::platform(anyhow::anyhow!("{context}: HRESULT 0x{:08x}", hr.0 as u32))
 }
 
 #[cfg(test)]

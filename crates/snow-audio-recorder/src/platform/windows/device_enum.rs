@@ -1,4 +1,3 @@
-﻿use windows::core::{HSTRING, PROPVARIANT};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
     DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT,
@@ -7,9 +6,10 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::STGM_READ;
 use windows::Win32::System::Com::StructuredStorage::{
-    PropVariantClear, PropVariantToStringAlloc,
+    PROPVARIANT, PropVariantClear, PropVariantToStringAlloc,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+use windows::core::HSTRING;
 
 use crate::device::{AudioDeviceInfo, DeviceFlow, DeviceSelector};
 use crate::error::{AudioError, AudioResult};
@@ -20,12 +20,12 @@ fn platform_err<E>(err: E) -> AudioError
 where
     E: Into<anyhow::Error>,
 {
-    AudioError::Platform(err.into())
+    AudioError::platform(err)
 }
 
 pub(crate) fn create_device_enumerator() -> AudioResult<IMMDeviceEnumerator> {
-    let enumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
-        .map_err(platform_err)?;
+    let enumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(platform_err)?;
     Ok(enumerator)
 }
 
@@ -43,8 +43,8 @@ pub(crate) fn enumerate_devices(
             | DEVICE_STATE_UNPLUGGED.0,
     );
 
-    let collection = unsafe { enumerator.EnumAudioEndpoints(flow_native, state_mask) }
-        .map_err(platform_err)?;
+    let collection =
+        unsafe { enumerator.EnumAudioEndpoints(flow_native, state_mask) }.map_err(platform_err)?;
 
     collect_device_infos(&collection, flow, default_id.as_deref())
 }
@@ -69,8 +69,7 @@ pub(crate) fn resolve_device(
                     "DefaultCapture selector used with render flow".into(),
                 ));
             }
-            unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) }
-                .map_err(platform_err)
+            unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) }.map_err(platform_err)
         }
         DeviceSelector::Id(id) => {
             let id_h = HSTRING::from(id);
@@ -88,7 +87,8 @@ pub(crate) fn default_device_id(
     enumerator: &IMMDeviceEnumerator,
     flow: EDataFlow,
 ) -> AudioResult<String> {
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }.map_err(platform_err)?;
+    let device =
+        unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }.map_err(platform_err)?;
     device_id(&device)
 }
 
@@ -137,8 +137,8 @@ fn friendly_name_or_id(device: &IMMDevice, fallback_id: &str) -> String {
 fn friendly_name(device: &IMMDevice) -> AudioResult<String> {
     let store = unsafe { device.OpenPropertyStore(STGM_READ) }.map_err(platform_err)?;
 
-    let mut value: PROPVARIANT = unsafe { store.GetValue(&PKEY_Device_FriendlyName) }
-        .map_err(platform_err)?;
+    let mut value: PROPVARIANT =
+        unsafe { store.GetValue(&PKEY_Device_FriendlyName) }.map_err(platform_err)?;
 
     let result = (|| {
         let pwstr = unsafe { PropVariantToStringAlloc(&value) }.map_err(platform_err)?;

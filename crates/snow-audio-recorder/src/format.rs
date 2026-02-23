@@ -1,4 +1,11 @@
-﻿use crate::error::{AudioError, AudioResult};
+use crate::error::{AudioError, AudioResult};
+
+/// Maximum number of audio channels supported by this crate.
+///
+/// This constant is used both for validation in [`AudioFormat::validate`] and
+/// as the upper bound for stack-allocated channel buffers in the conversion
+/// pipeline. Changing it here automatically updates both limits.
+pub const MAX_CHANNELS: u16 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioSampleFormat {
@@ -42,10 +49,10 @@ impl AudioFormat {
                 "channel count must be greater than zero".into(),
             ));
         }
-        if self.channels > 32 {
-            return Err(AudioError::InvalidConfig(
-                "channel count above 32 is not supported".into(),
-            ));
+        if self.channels > MAX_CHANNELS {
+            return Err(AudioError::InvalidConfig(format!(
+                "channel count above {MAX_CHANNELS} is not supported"
+            )));
         }
         Ok(())
     }
@@ -82,13 +89,21 @@ mod tests {
 
     #[test]
     fn validation_rejects_invalid_inputs() {
-        assert!(AudioFormat::new(0, 2, AudioSampleFormat::F32).validate().is_err());
-        assert!(AudioFormat::new(48_000, 0, AudioSampleFormat::F32)
-            .validate()
-            .is_err());
-        assert!(AudioFormat::new(48_000, 64, AudioSampleFormat::F32)
-            .validate()
-            .is_err());
+        assert!(
+            AudioFormat::new(0, 2, AudioSampleFormat::F32)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            AudioFormat::new(48_000, 0, AudioSampleFormat::F32)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            AudioFormat::new(48_000, 64, AudioSampleFormat::F32)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

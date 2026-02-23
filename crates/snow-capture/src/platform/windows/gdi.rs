@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+﻿use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ fn geometry_from_handle(handle: HMONITOR) -> CaptureResult<MonitorGeometry> {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     if width <= 0 || height <= 0 {
-        return Err(CaptureError::Platform(anyhow::anyhow!(
+        return Err(CaptureError::platform(anyhow::anyhow!(
             "monitor geometry is invalid ({width}x{height})"
         )));
     }
@@ -1089,19 +1089,19 @@ struct GdiResources {
 
 impl GdiResources {
     fn new() -> CaptureResult<Self> {
-        let screen_dc = unsafe { GetDC(HWND(null_mut())) };
+        let screen_dc = unsafe { GetDC(None) };
         if screen_dc.0.is_null() {
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "GetDC(NULL) returned null"
             )));
         }
 
-        let mem_dc = unsafe { CreateCompatibleDC(screen_dc) };
+        let mem_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
         if mem_dc.0.is_null() {
             unsafe {
-                let _ = ReleaseDC(HWND(null_mut()), screen_dc);
+                let _ = ReleaseDC(None, screen_dc);
             }
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "CreateCompatibleDC failed"
             )));
         }
@@ -1139,14 +1139,14 @@ impl GdiResources {
         // Release the old DC first.
         if !self.screen_dc.0.is_null() {
             unsafe {
-                let _ = ReleaseDC(HWND(null_mut()), self.screen_dc);
+                let _ = ReleaseDC(None, self.screen_dc);
             }
         }
 
-        let new_dc = unsafe { GetDC(HWND(null_mut())) };
+        let new_dc = unsafe { GetDC(None) };
         if new_dc.0.is_null() {
             self.screen_dc = HDC(null_mut());
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "GetDC(NULL) returned null during refresh"
             )));
         }
@@ -1162,10 +1162,10 @@ impl GdiResources {
             }
         }
 
-        let new_mem_dc = unsafe { CreateCompatibleDC(self.screen_dc) };
+        let new_mem_dc = unsafe { CreateCompatibleDC(Some(self.screen_dc)) };
         if new_mem_dc.0.is_null() {
             self.mem_dc = HDC(null_mut());
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "CreateCompatibleDC failed during refresh"
             )));
         }
@@ -1178,7 +1178,7 @@ impl GdiResources {
             && !window_dc.0.is_null()
         {
             unsafe {
-                let _ = ReleaseDC(owner, window_dc);
+                let _ = ReleaseDC(Some(owner), window_dc);
             }
         }
     }
@@ -1193,9 +1193,9 @@ impl GdiResources {
 
         self.release_window_dc();
 
-        let window_dc = unsafe { GetWindowDC(hwnd) };
+        let window_dc = unsafe { GetWindowDC(Some(hwnd)) };
         if window_dc.0.is_null() {
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "GetWindowDC returned null during GDI window capture"
             )));
         }
@@ -1218,21 +1218,21 @@ impl GdiResources {
         let mut bits: *mut c_void = null_mut();
         let bitmap = unsafe {
             CreateDIBSection(
-                self.mem_dc,
+                Some(self.mem_dc),
                 &info,
                 DIB_RGB_COLORS,
                 &mut bits,
-                HANDLE::default(),
+                Some(HANDLE::default()),
                 0,
             )
         }
         .context("CreateDIBSection failed")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
         if bits.is_null() {
             unsafe {
-                let _ = DeleteObject(bitmap);
+                let _ = DeleteObject(bitmap.into());
             }
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "CreateDIBSection returned a null pixel buffer"
             )));
         }
@@ -1267,17 +1267,17 @@ impl GdiResources {
             return Ok(());
         }
 
-        let selected = unsafe { SelectObject(self.mem_dc, next_bitmap) };
+        let selected = unsafe { SelectObject(self.mem_dc, next_bitmap.into()) };
         if selected.0.is_null() {
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "SelectObject failed during gdi history surface swap"
             )));
         }
         if selected.0 != current_bitmap.0 {
             unsafe {
-                let _ = SelectObject(self.mem_dc, current_bitmap);
+                let _ = SelectObject(self.mem_dc, current_bitmap.into());
             }
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "unexpected object selected during gdi history surface swap"
             )));
         }
@@ -1291,7 +1291,7 @@ impl GdiResources {
 
     fn ensure_surface(&mut self, width: i32, height: i32) -> CaptureResult<()> {
         if width <= 0 || height <= 0 {
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "invalid gdi surface size {width}x{height}"
             )));
         }
@@ -1304,12 +1304,12 @@ impl GdiResources {
 
         let (bitmap, bits) = self.create_dib_bitmap(width, height)?;
 
-        let selected = unsafe { SelectObject(self.mem_dc, bitmap) };
+        let selected = unsafe { SelectObject(self.mem_dc, bitmap.into()) };
         if selected.0.is_null() {
             unsafe {
-                let _ = DeleteObject(bitmap);
+                let _ = DeleteObject(bitmap.into());
             }
-            return Err(CaptureError::Platform(anyhow::anyhow!(
+            return Err(CaptureError::platform(anyhow::anyhow!(
                 "SelectObject failed for gdi capture bitmap"
             )));
         }
@@ -1891,10 +1891,10 @@ impl GdiResources {
     /// Capture the monitor region and return an RGBA frame.
     ///
     /// The strategy is to BitBlt into the DIB section, then perform an
-    /// in-place BGRA→RGBA swizzle directly in that buffer, and finally
+    /// in-place BGRA鈫扲GBA swizzle directly in that buffer, and finally
     /// bulk-copy the result into the `Frame`.  When `src == dst` the
     /// SIMD kernels read and write the same cache lines, cutting memory
-    /// bandwidth roughly in half compared to a separate src→dst copy.
+    /// bandwidth roughly in half compared to a separate src鈫抎st copy.
     fn read_surface_to_rgba(
         &mut self,
         width: i32,
@@ -1972,7 +1972,7 @@ impl GdiResources {
             }
         }
 
-        // Single-pass: read from DIB section, swizzle BGRA→RGBA, and
+        // Single-pass: read from DIB section, swizzle BGRA鈫扲GBA, and
         // write directly into the Frame to avoid an extra memcpy.
         unsafe {
             match mode {
@@ -2014,14 +2014,14 @@ impl GdiResources {
                 0,
                 geometry.width,
                 geometry.height,
-                self.screen_dc,
+                Some(self.screen_dc),
                 geometry.left,
                 geometry.top,
                 SRCCOPY,
             )
         }
         .context("BitBlt failed during GDI monitor capture")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
         self.read_surface_to_rgba(
             geometry.width,
             geometry.height,
@@ -2072,14 +2072,14 @@ impl GdiResources {
                 0,
                 copy_w_i32,
                 copy_h_i32,
-                self.screen_dc,
+                Some(self.screen_dc),
                 source_x,
                 source_y,
                 SRCCOPY,
             )
         }
         .context("BitBlt failed during GDI region capture")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
 
         let copy_w = usize::try_from(copy_width).map_err(|_| CaptureError::BufferOverflow)?;
         let copy_h = usize::try_from(copy_height).map_err(|_| CaptureError::BufferOverflow)?;
@@ -2317,7 +2317,7 @@ impl GdiResources {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            CaptureError::Platform(anyhow::anyhow!("all GDI window capture strategies failed"))
+            CaptureError::platform(anyhow::anyhow!("all GDI window capture strategies failed"))
         }))
     }
 
@@ -2331,9 +2331,9 @@ impl GdiResources {
         match path {
             WindowCapturePath::WindowDcBitBlt => {
                 let window_dc = self.acquire_window_dc(hwnd)?;
-                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY) }
+                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, Some(window_dc), 0, 0, SRCCOPY) }
                     .context("BitBlt failed during GDI window capture")
-                    .map_err(CaptureError::Platform)?;
+                    .map_err(CaptureError::platform)?;
                 Ok(())
             }
             WindowCapturePath::PrintWindow(flags) => {
@@ -2342,7 +2342,7 @@ impl GdiResources {
                     return Ok(());
                 }
 
-                Err(CaptureError::Platform(anyhow::anyhow!(
+                Err(CaptureError::platform(anyhow::anyhow!(
                     "PrintWindow failed for flags {:#x}",
                     flags.0
                 )))
@@ -2358,12 +2358,12 @@ impl GdiResources {
         }
         if let Some(capture_bitmap) = self.capture_bitmap.take() {
             unsafe {
-                let _ = DeleteObject(capture_bitmap);
+                let _ = DeleteObject(capture_bitmap.into());
             }
         }
         if let Some(history_bitmap) = self.history_bitmap.take() {
             unsafe {
-                let _ = DeleteObject(history_bitmap);
+                let _ = DeleteObject(history_bitmap.into());
             }
         }
         self.bits = null_mut();
@@ -2387,7 +2387,7 @@ impl GdiResources {
     fn trim_incremental_history_for_screenshot(&mut self) {
         if let Some(history_bitmap) = self.history_bitmap.take() {
             unsafe {
-                let _ = DeleteObject(history_bitmap);
+                let _ = DeleteObject(history_bitmap.into());
             }
         }
         self.history_bits = null_mut();
@@ -2421,7 +2421,7 @@ impl Drop for GdiResources {
         }
         if !self.screen_dc.0.is_null() {
             unsafe {
-                let _ = ReleaseDC(HWND(null_mut()), self.screen_dc);
+                let _ = ReleaseDC(None, self.screen_dc);
             }
         }
     }
@@ -2446,7 +2446,7 @@ unsafe impl Send for WindowsMonitorCapturer {}
 
 impl WindowsMonitorCapturer {
     pub(crate) fn new(monitor: &MonitorId, resolver: Arc<MonitorResolver>) -> CaptureResult<Self> {
-        let com = CoInitGuard::init_multithreaded().map_err(CaptureError::Platform)?;
+        let com = CoInitGuard::init_multithreaded().map_err(CaptureError::platform)?;
         let geometry = resolve_geometry(&resolver, monitor)?;
         let mut resources = GdiResources::new()?;
         resources.ensure_surface(geometry.width, geometry.height)?;
@@ -2468,7 +2468,7 @@ impl WindowsMonitorCapturer {
         let current_gen = self.resolver.display_generation();
 
         // When backed by the event-driven DisplayInfoCache, skip the
-        // refresh entirely if the generation hasn't changed — no
+        // refresh entirely if the generation hasn't changed 鈥?no
         // WM_DISPLAYCHANGE has fired since our last check.
         if let (Some(current), Some(last)) = (current_gen, self.last_display_generation)
             && current == last
@@ -2478,7 +2478,7 @@ impl WindowsMonitorCapturer {
 
         self.last_display_generation = current_gen;
 
-        // Display config changed — refresh the screen DC so we don't
+        // Display config changed 鈥?refresh the screen DC so we don't
         // capture from a stale device context after resolution /
         // composition changes.
         self.resources.refresh_screen_dc()?;
@@ -2607,7 +2607,7 @@ unsafe impl Send for WindowsWindowCapturer {}
 
 impl WindowsWindowCapturer {
     pub(crate) fn new(window: &WindowId) -> CaptureResult<Self> {
-        let com = CoInitGuard::init_multithreaded().map_err(CaptureError::Platform)?;
+        let com = CoInitGuard::init_multithreaded().map_err(CaptureError::platform)?;
         let hwnd = HWND(window.raw_handle() as *mut std::ffi::c_void);
         if hwnd.0.is_null() {
             return Err(CaptureError::InvalidTarget(format!(
@@ -2615,7 +2615,7 @@ impl WindowsWindowCapturer {
                 window.stable_id()
             )));
         }
-        if !unsafe { IsWindow(hwnd) }.as_bool() {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(CaptureError::InvalidTarget(format!(
                 "window handle is not valid: {}",
                 window.stable_id()
@@ -2642,7 +2642,7 @@ impl WindowsWindowCapturer {
         unsafe { GetWindowRect(self.hwnd, &mut rect) }
             .ok()
             .context("GetWindowRect failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         let width = rect.right.saturating_sub(rect.left);
         let height = rect.bottom.saturating_sub(rect.top);
@@ -2690,7 +2690,7 @@ impl MonitorCapturer for WindowsWindowCapturer {
         reuse: Option<Frame>,
         destination_has_history: bool,
     ) -> CaptureResult<Frame> {
-        if !unsafe { IsWindow(self.hwnd) }.as_bool() {
+        if !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
             return Err(CaptureError::InvalidTarget(
                 "window no longer exists".into(),
             ));

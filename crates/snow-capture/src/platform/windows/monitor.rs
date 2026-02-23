@@ -1,4 +1,4 @@
-use std::mem;
+﻿use std::mem;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -127,7 +127,7 @@ impl MonitorResolver {
     fn current_monitors(&self, force_refresh: bool) -> CaptureResult<Vec<MonitorId>> {
         {
             let cache = self.cache.lock().map_err(|_| {
-                CaptureError::Platform(anyhow::anyhow!("windows monitor cache mutex was poisoned"))
+                CaptureError::platform(anyhow::anyhow!("windows monitor cache mutex was poisoned"))
             })?;
             let should_refresh = force_refresh
                 || cache.monitors.is_empty()
@@ -150,7 +150,7 @@ impl MonitorResolver {
     ) -> CaptureResult<Vec<MonitorId>> {
         let monitors = to_monitor_ids(resolved);
         let mut cache = self.cache.lock().map_err(|_| {
-            CaptureError::Platform(anyhow::anyhow!("windows monitor cache mutex was poisoned"))
+            CaptureError::platform(anyhow::anyhow!("windows monitor cache mutex was poisoned"))
         })?;
         cache.monitors = monitors.clone();
         cache.refreshed_at = Some(Instant::now());
@@ -320,7 +320,7 @@ pub(crate) fn enumerate_resolved() -> CaptureResult<Vec<ResolvedMonitor>> {
 
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
         .context("CreateDXGIFactory1 failed")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
 
     let mut monitors = Vec::new();
     let mut adapter_idx = 0u32;
@@ -330,20 +330,20 @@ pub(crate) fn enumerate_resolved() -> CaptureResult<Vec<ResolvedMonitor>> {
             Ok(a) => a,
             Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
             Err(e) => {
-                return Err(CaptureError::Platform(
+                return Err(CaptureError::platform(
                     anyhow::Error::from(e).context(format!("EnumAdapters1({adapter_idx}) failed")),
                 ));
             }
         };
         let adapter_desc = unsafe { adapter1.GetDesc1() }
             .context("IDXGIAdapter1::GetDesc1 failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let adapter_luid = luid_to_u64(adapter_desc.AdapterLuid);
 
         let adapter: IDXGIAdapter = adapter1
             .cast()
             .context("failed to cast IDXGIAdapter1 to IDXGIAdapter")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         let mut output_idx = 0u32;
         loop {
@@ -351,7 +351,7 @@ pub(crate) fn enumerate_resolved() -> CaptureResult<Vec<ResolvedMonitor>> {
                 Ok(o) => o,
                 Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
                 Err(e) => {
-                    return Err(CaptureError::Platform(anyhow::Error::from(e).context(
+                    return Err(CaptureError::platform(anyhow::Error::from(e).context(
                         format!("EnumOutputs({output_idx}) on adapter {adapter_idx} failed"),
                     )));
                 }
@@ -359,7 +359,7 @@ pub(crate) fn enumerate_resolved() -> CaptureResult<Vec<ResolvedMonitor>> {
 
             let desc = unsafe { output.GetDesc() }
                 .context("GetDesc failed")
-                .map_err(CaptureError::Platform)?;
+                .map_err(CaptureError::platform)?;
 
             if desc.AttachedToDesktop.as_bool() {
                 let name = utf16z_to_string(&desc.DeviceName);

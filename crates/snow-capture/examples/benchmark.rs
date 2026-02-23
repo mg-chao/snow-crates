@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use rustc_hash::FxHashMap;
 use snow_capture::backend::CaptureBackendKind;
 use snow_capture::frame::Frame;
 use snow_capture::{
@@ -731,7 +731,7 @@ fn save_baseline(path: &PathBuf, results: &[BenchResult]) -> Result<()> {
         .with_context(|| format!("failed to write baseline file {}", path.display()))
 }
 
-fn load_baseline(path: &PathBuf) -> Result<HashMap<String, BaselineEntry>> {
+fn load_baseline(path: &PathBuf) -> Result<FxHashMap<String, BaselineEntry>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read baseline file {}", path.display()))?;
     let mut lines = text.lines();
@@ -756,7 +756,7 @@ fn load_baseline(path: &PathBuf) -> Result<HashMap<String, BaselineEntry>> {
         column_index("p95_ms").context("baseline header is missing required `p95_ms` column")?;
     let p99_idx = column_index("p99_ms");
 
-    let mut out = HashMap::new();
+    let mut out = FxHashMap::default();
     for (line_offset, line) in lines.enumerate() {
         let line_number = line_offset + 2;
         let trimmed = line.trim();
@@ -820,7 +820,7 @@ fn load_baseline(path: &PathBuf) -> Result<HashMap<String, BaselineEntry>> {
 }
 
 fn check_regression(
-    baseline: &HashMap<String, BaselineEntry>,
+    baseline: &FxHashMap<String, BaselineEntry>,
     current: &[BenchResult],
     max_regression_pct: f64,
     metric: RegressionMetric,

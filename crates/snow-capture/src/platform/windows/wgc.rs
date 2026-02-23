@@ -1,10 +1,10 @@
-use std::cell::RefCell;
+﻿use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode,
     GraphicsCaptureItem, GraphicsCaptureSession,
@@ -772,7 +772,7 @@ struct FrameSignal {
 }
 
 fn poisoned_lock_error() -> CaptureError {
-    CaptureError::Platform(anyhow::anyhow!(
+    CaptureError::platform(anyhow::anyhow!(
         "wgc frame synchronization mutex was poisoned"
     ))
 }
@@ -781,21 +781,21 @@ fn map_platform_error(error: windows::core::Error, context: &str) -> CaptureErro
     if error.code() == DXGI_ERROR_ACCESS_LOST {
         return CaptureError::AccessLost;
     }
-    CaptureError::Platform(anyhow::Error::from(error).context(context.to_string()))
+    CaptureError::platform(anyhow::Error::from(error).context(context.to_string()))
 }
 
 fn create_winrt_device(device: &ID3D11Device) -> CaptureResult<IDirect3DDevice> {
     let dxgi_device: IDXGIDevice = device
         .cast()
         .context("failed to cast ID3D11Device to IDXGIDevice")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
         .context("CreateDirect3D11DeviceFromDXGIDevice failed")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     inspectable
         .cast()
         .context("failed to cast IInspectable to IDirect3DDevice")
-        .map_err(CaptureError::Platform)
+        .map_err(CaptureError::platform)
 }
 
 fn create_monitor_capture_item(
@@ -803,25 +803,25 @@ fn create_monitor_capture_item(
 ) -> CaptureResult<GraphicsCaptureItem> {
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
         .context("failed to get IGraphicsCaptureItemInterop factory")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     unsafe { interop.CreateForMonitor(monitor) }
         .context("IGraphicsCaptureItemInterop::CreateForMonitor failed")
-        .map_err(CaptureError::Platform)
+        .map_err(CaptureError::platform)
 }
 
 fn create_window_capture_item(window: HWND) -> CaptureResult<GraphicsCaptureItem> {
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
         .context("failed to get IGraphicsCaptureItemInterop factory")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     unsafe { interop.CreateForWindow(window) }
         .context("IGraphicsCaptureItemInterop::CreateForWindow failed")
-        .map_err(CaptureError::Platform)
+        .map_err(CaptureError::platform)
 }
 
 pub(crate) fn validate_support() -> CaptureResult<()> {
     let supported = GraphicsCaptureSession::IsSupported()
         .context("GraphicsCaptureSession::IsSupported failed")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     if supported {
         Ok(())
     } else {
@@ -839,8 +839,8 @@ struct WindowsGraphicsCaptureCapturer {
     item: GraphicsCaptureItem,
     frame_pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
-    frame_arrived_token: EventRegistrationToken,
-    closed_token: EventRegistrationToken,
+    frame_arrived_token: i64,
+    closed_token: i64,
     signal: Arc<FrameSignal>,
     last_sequence: u64,
     pool_size: SizeInt32,
@@ -893,7 +893,7 @@ impl WindowsGraphicsCaptureCapturer {
         let pool_size = item
             .Size()
             .context("GraphicsCaptureItem::Size failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         let hdr_to_sdr = hdr_metadata.and_then(hdr_to_sdr_params);
         let is_hdr = hdr_to_sdr.is_some();
@@ -913,11 +913,11 @@ impl WindowsGraphicsCaptureCapturer {
             pool_size,
         )
         .context("Direct3D11CaptureFramePool::CreateFreeThreaded failed")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
         let session = frame_pool
             .CreateCaptureSession(&item)
             .context("Direct3D11CaptureFramePool::CreateCaptureSession failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let cursor_config = CursorCaptureConfig::default();
         // Best-effort session tuning:
         // - Disable cursor composition unless explicitly requested.
@@ -932,38 +932,38 @@ impl WindowsGraphicsCaptureCapturer {
             .FrameArrived(
                 &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
                     move |sender, _| {
-                        if let Some(pool) = sender {
-                            let mut newest: Option<Direct3D11CaptureFrame> = None;
+                        let mut newest: Option<Direct3D11CaptureFrame> = None;
+                        if let Some(pool) = sender.as_ref() {
                             while let Ok(frame) = pool.TryGetNextFrame() {
                                 if let Some(previous) = newest.replace(frame) {
                                     let _ = previous.Close();
                                 }
                             }
-                            if let Some(next_frame) = newest
-                                && let Ok(mut state) = signal_for_frames.state.lock()
-                            {
-                                if let Some(previous) = state.latest.take() {
-                                    let _ = previous.Close();
-                                }
-                                let time_ticks = next_frame
-                                    .SystemRelativeTime()
-                                    .map(|t| t.Duration)
-                                    .unwrap_or(0);
-                                state.latest_time_ticks = time_ticks;
-                                state.latest = Some(next_frame);
-                                state.sequence = state.sequence.wrapping_add(1);
-                                signal_for_frames
-                                    .sequence_hint
-                                    .store(state.sequence, Ordering::Release);
-                                signal_for_frames.cv.notify_one();
+                        }
+                        if let Some(next_frame) = newest
+                            && let Ok(mut state) = signal_for_frames.state.lock()
+                        {
+                            if let Some(previous) = state.latest.take() {
+                                let _ = previous.Close();
                             }
+                            let time_ticks = next_frame
+                                .SystemRelativeTime()
+                                .map(|t| t.Duration)
+                                .unwrap_or(0);
+                            state.latest_time_ticks = time_ticks;
+                            state.latest = Some(next_frame);
+                            state.sequence = state.sequence.wrapping_add(1);
+                            signal_for_frames
+                                .sequence_hint
+                                .store(state.sequence, Ordering::Release);
+                            signal_for_frames.cv.notify_one();
                         }
                         Ok(())
                     },
                 ),
             )
             .context("Direct3D11CaptureFramePool::FrameArrived registration failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         let signal_for_closed = signal.clone();
         let closed_token = item
@@ -978,12 +978,12 @@ impl WindowsGraphicsCaptureCapturer {
                 }),
             )
             .context("GraphicsCaptureItem::Closed registration failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         session
             .StartCapture()
             .context("GraphicsCaptureSession::StartCapture failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         let gpu_tonemapper = if is_hdr {
             Some(GpuTonemapper::new(&device)?)
@@ -1331,7 +1331,7 @@ impl WindowsGraphicsCaptureCapturer {
                 staging
                     .cast()
                     .context("failed to cast WGC staging texture to ID3D11Resource")
-                    .map_err(CaptureError::Platform)?,
+                    .map_err(CaptureError::platform)?,
             );
             slot.source_desc = Some(*desc);
             slot.populated = false;
@@ -1355,7 +1355,7 @@ impl WindowsGraphicsCaptureCapturer {
             let mut query: Option<ID3D11Query> = None;
             unsafe { self.device.CreateQuery(&query_desc, Some(&mut query)) }
                 .context("CreateQuery for WGC staging slot failed")
-                .map_err(CaptureError::Platform)?;
+                .map_err(CaptureError::platform)?;
             slot.query = query;
         }
         Ok(())
@@ -1426,7 +1426,7 @@ impl WindowsGraphicsCaptureCapturer {
         {
             let slot = &self.staging_slots[slot_idx];
             let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
-                CaptureError::Platform(anyhow::anyhow!(
+                CaptureError::platform(anyhow::anyhow!(
                     "failed to resolve WGC staging resource for slot {}",
                     slot_idx
                 ))
@@ -1562,7 +1562,7 @@ impl WindowsGraphicsCaptureCapturer {
 
         let slot = &self.region.slots[slot_idx];
         let source_desc = slot.source_desc.ok_or_else(|| {
-            CaptureError::Platform(anyhow::anyhow!(
+            CaptureError::platform(anyhow::anyhow!(
                 "WGC region slot is populated but missing source descriptor"
             ))
         })?;
@@ -1594,12 +1594,12 @@ impl WindowsGraphicsCaptureCapturer {
         let map_result = (|| -> CaptureResult<()> {
             let slot = &self.region.slots[slot_idx];
             let staging = slot.staging.as_ref().ok_or_else(|| {
-                CaptureError::Platform(anyhow::anyhow!(
+                CaptureError::platform(anyhow::anyhow!(
                     "WGC region slot is populated but missing staging texture"
                 ))
             })?;
             let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
-                CaptureError::Platform(anyhow::anyhow!(
+                CaptureError::platform(anyhow::anyhow!(
                     "WGC region slot is populated but missing staging resource"
                 ))
             })?;
@@ -1794,7 +1794,7 @@ impl WindowsGraphicsCaptureCapturer {
 
         let slot = &self.staging_slots[slot_idx];
         let source_desc = slot.source_desc.ok_or_else(|| {
-            CaptureError::Platform(anyhow::anyhow!(
+            CaptureError::platform(anyhow::anyhow!(
                 "WGC staging slot is populated but missing source descriptor"
             ))
         })?;
@@ -1830,12 +1830,12 @@ impl WindowsGraphicsCaptureCapturer {
         let map_result = (|| -> CaptureResult<()> {
             let slot = &self.staging_slots[slot_idx];
             let staging = slot.staging.as_ref().ok_or_else(|| {
-                CaptureError::Platform(anyhow::anyhow!(
+                CaptureError::platform(anyhow::anyhow!(
                     "WGC staging slot is populated but missing staging texture"
                 ))
             })?;
             let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
-                CaptureError::Platform(anyhow::anyhow!(
+                CaptureError::platform(anyhow::anyhow!(
                     "WGC staging slot is populated but missing staging resource"
                 ))
             })?;
@@ -1984,7 +1984,7 @@ impl WindowsGraphicsCaptureCapturer {
             let frame_dxgi_interface: IDirect3DDxgiInterfaceAccess = frame_surface
                 .cast()
                 .context("failed to cast frame surface to IDirect3DDxgiInterfaceAccess")
-                .map_err(CaptureError::Platform)?;
+                .map_err(CaptureError::platform)?;
             let frame_texture: ID3D11Texture2D = unsafe { frame_dxgi_interface.GetInterface() }
                 .map_err(|error| {
                     map_platform_error(error, "IDirect3DDxgiInterfaceAccess::GetInterface failed")
@@ -2051,7 +2051,7 @@ impl WindowsGraphicsCaptureCapturer {
                 {
                     let slot = &self.region.slots[write_slot];
                     let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
-                        CaptureError::Platform(anyhow::anyhow!(
+                        CaptureError::platform(anyhow::anyhow!(
                             "failed to resolve WGC region staging resource for screenshot fast path"
                         ))
                     })?;
@@ -2086,7 +2086,7 @@ impl WindowsGraphicsCaptureCapturer {
                 {
                     let slot = &self.region.slots[write_slot];
                     let staging = slot.staging.as_ref().ok_or_else(|| {
-                        CaptureError::Platform(anyhow::anyhow!(
+                        CaptureError::platform(anyhow::anyhow!(
                             "failed to resolve WGC region staging texture for screenshot fast path"
                         ))
                     })?;
@@ -2334,7 +2334,7 @@ impl WindowsGraphicsCaptureCapturer {
             let frame_dxgi_interface: IDirect3DDxgiInterfaceAccess = frame_surface
                 .cast()
                 .context("failed to cast frame surface to IDirect3DDxgiInterfaceAccess")
-                .map_err(CaptureError::Platform)?;
+                .map_err(CaptureError::platform)?;
             let frame_texture: ID3D11Texture2D = unsafe { frame_dxgi_interface.GetInterface() }
                 .map_err(|error| {
                     map_platform_error(error, "IDirect3DDxgiInterfaceAccess::GetInterface failed")
@@ -2392,7 +2392,7 @@ impl WindowsGraphicsCaptureCapturer {
                 {
                     let slot = &self.staging_slots[write_slot];
                     let staging_resource = slot.staging_resource.as_ref().ok_or_else(|| {
-                        CaptureError::Platform(anyhow::anyhow!(
+                        CaptureError::platform(anyhow::anyhow!(
                             "failed to resolve WGC staging resource for screenshot fast path"
                         ))
                     })?;
@@ -2410,7 +2410,7 @@ impl WindowsGraphicsCaptureCapturer {
                 {
                     let slot = &self.staging_slots[write_slot];
                     let staging = slot.staging.as_ref().ok_or_else(|| {
-                        CaptureError::Platform(anyhow::anyhow!(
+                        CaptureError::platform(anyhow::anyhow!(
                             "failed to resolve WGC staging texture for screenshot fast path"
                         ))
                     })?;
@@ -2635,10 +2635,10 @@ pub(crate) struct WindowsMonitorCapturer {
 impl WindowsMonitorCapturer {
     pub(crate) fn new(monitor: &MonitorId, resolver: Arc<MonitorResolver>) -> CaptureResult<Self> {
         validate_support()?;
-        let com = CoInitGuard::init_multithreaded().map_err(CaptureError::Platform)?;
+        let com = CoInitGuard::init_multithreaded().map_err(CaptureError::platform)?;
         let resolved = resolver.resolve_monitor(monitor)?;
         let (device, context) = d3d11::create_d3d11_device_for_adapter(&resolved.adapter, false)
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let item = create_monitor_capture_item(resolved.handle)?;
         let inner = WindowsGraphicsCaptureCapturer::new(
             com,
@@ -2683,7 +2683,7 @@ pub(crate) struct WindowsWindowCapturer {
 impl WindowsWindowCapturer {
     pub(crate) fn new(window: &WindowId) -> CaptureResult<Self> {
         validate_support()?;
-        let com = CoInitGuard::init_multithreaded().map_err(CaptureError::Platform)?;
+        let com = CoInitGuard::init_multithreaded().map_err(CaptureError::platform)?;
         let hwnd = HWND(window.raw_handle() as *mut std::ffi::c_void);
         if hwnd.0.is_null() {
             return Err(CaptureError::InvalidTarget(format!(
@@ -2692,7 +2692,7 @@ impl WindowsWindowCapturer {
             )));
         }
         let (device, context) =
-            d3d11::create_d3d11_device_default(false).map_err(CaptureError::Platform)?;
+            d3d11::create_d3d11_device_default(false).map_err(CaptureError::platform)?;
         let item = create_window_capture_item(hwnd)?;
         let inner = WindowsGraphicsCaptureCapturer::new(com, device, context, item, None)?;
         Ok(Self { inner })

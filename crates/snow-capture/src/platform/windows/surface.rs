@@ -151,7 +151,7 @@ fn map_resource_read_with_spin(
     mapped = D3D11_MAPPED_SUBRESOURCE::default();
     unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
         .context(map_context)
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     Ok(mapped)
 }
 
@@ -164,7 +164,7 @@ fn map_resource_read_blocking(
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
         .context(map_context)
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     Ok(mapped)
 }
 
@@ -595,7 +595,7 @@ pub(crate) fn ensure_staging_texture<'a>(
         let mut texture: Option<ID3D11Texture2D> = None;
         unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
             .context(create_context)
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         *staging = texture;
     }
 
@@ -616,7 +616,6 @@ pub(crate) fn region_desc_for_blit(
     region_desc.SampleDesc.Quality = 0;
     region_desc
 }
-
 
 pub(crate) fn copy_mapped_surface_to_frame(
     frame: &mut Frame,
@@ -684,7 +683,7 @@ fn map_staging_to_frame_internal(
             owned_resource = staging
                 .cast::<ID3D11Resource>()
                 .context("failed to cast staging texture to ID3D11Resource")
-                .map_err(CaptureError::Platform)?;
+                .map_err(CaptureError::platform)?;
             &owned_resource
         }
     };
@@ -801,7 +800,7 @@ pub(crate) fn map_staging_rect_to_frame(
             owned_resource = staging
                 .cast::<ID3D11Resource>()
                 .context("failed to cast staging texture to ID3D11Resource")
-                .map_err(CaptureError::Platform)?;
+                .map_err(CaptureError::platform)?;
             &owned_resource
         }
     };
@@ -952,7 +951,7 @@ pub(crate) fn map_staging_dirty_rects_to_frame_with_offset(
             owned_resource = staging
                 .cast::<ID3D11Resource>()
                 .context("failed to cast staging texture to ID3D11Resource")
-                .map_err(CaptureError::Platform)?;
+                .map_err(CaptureError::platform)?;
             &owned_resource
         }
     };

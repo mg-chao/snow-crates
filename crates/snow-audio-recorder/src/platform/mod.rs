@@ -21,7 +21,7 @@ impl AudioBackend for UnsupportedBackend {
         &self,
         _flow: crate::device::DeviceFlow,
     ) -> AudioResult<Vec<AudioDeviceInfo>> {
-        Err(AudioError::Platform(anyhow::anyhow!(
+        Err(AudioError::platform(anyhow::anyhow!(
             "audio capture is only supported on Windows"
         )))
     }
@@ -30,7 +30,7 @@ impl AudioBackend for UnsupportedBackend {
         &self,
         _config: AudioStreamConfig,
     ) -> AudioResult<Box<dyn crate::backend::AudioRecorderEngine>> {
-        Err(AudioError::Platform(anyhow::anyhow!(
+        Err(AudioError::platform(anyhow::anyhow!(
             "audio capture is only supported on Windows"
         )))
     }

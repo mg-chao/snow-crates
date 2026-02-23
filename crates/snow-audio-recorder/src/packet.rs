@@ -28,7 +28,7 @@ pub struct AudioPacket {
     pub metadata: AudioPacketMetadata,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum AudioEvent {
     Packet(AudioPacket),
     PacketDropped {
@@ -47,6 +47,15 @@ pub enum AudioEvent {
     Resumed {
         at: Instant,
         gap: Duration,
+    },
+    /// Proactive backpressure signal emitted when the data-lane fill ratio
+    /// crosses the configured threshold. Lets consumers adapt (reduce
+    /// processing, log warnings) before drops actually happen.
+    BufferPressure {
+        /// Current fill ratio in `0.0..=1.0`.
+        fill_ratio: f64,
+        /// Configured capacity of the data-event lane.
+        buffer_depth: usize,
     },
     StreamEnded,
     Error(AudioError),

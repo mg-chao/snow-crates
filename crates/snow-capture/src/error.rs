@@ -1,6 +1,7 @@
 use std::fmt;
+use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum CaptureError {
     InvalidTarget(String),
 
@@ -29,7 +30,7 @@ pub enum CaptureError {
     /// deliver a `CaptureEvent::ResolutionChanged` event.
     ResolutionChanged(u32, u32),
 
-    Platform(anyhow::Error),
+    Platform(Arc<anyhow::Error>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +42,13 @@ pub enum CaptureErrorClass {
 }
 
 impl CaptureError {
+    /// Wrap an `anyhow::Error` (or anything convertible to one) in the
+    /// `Platform` variant. The inner error is stored behind an `Arc` so
+    /// that `CaptureError` remains `Clone`.
+    pub fn platform(err: impl Into<anyhow::Error>) -> Self {
+        Self::Platform(Arc::new(err.into()))
+    }
+
     pub fn class(&self) -> CaptureErrorClass {
         match self {
             Self::InvalidTarget(_) | Self::NoPrimaryMonitor | Self::InvalidConfig(_) => {
@@ -68,27 +76,6 @@ impl CaptureError {
             self,
             Self::MonitorLost | Self::AccessLost | Self::WorkerDead
         )
-    }
-
-    /// Create a string-based copy of this error suitable for sending
-    /// through channels. The `Platform` variant loses its inner
-    /// `anyhow::Error` chain and becomes a formatted string.
-    pub fn to_sendable(&self) -> Self {
-        match self {
-            Self::InvalidTarget(s) => Self::InvalidTarget(s.clone()),
-            Self::MonitorLost => Self::MonitorLost,
-            Self::NoPrimaryMonitor => Self::NoPrimaryMonitor,
-            Self::AccessLost => Self::AccessLost,
-            Self::Timeout => Self::Timeout,
-            Self::UnsupportedFormat(s) => Self::UnsupportedFormat(s.clone()),
-            Self::BufferOverflow => Self::BufferOverflow,
-            Self::InvalidConfig(s) => Self::InvalidConfig(s.clone()),
-            Self::WorkerDead => Self::WorkerDead,
-            Self::BackendUnavailable(s) => Self::BackendUnavailable(s.clone()),
-            Self::Canceled => Self::Canceled,
-            Self::ResolutionChanged(w, h) => Self::ResolutionChanged(*w, *h),
-            Self::Platform(inner) => Self::Platform(anyhow::anyhow!("{inner:#}")),
-        }
     }
 }
 
@@ -124,7 +111,7 @@ impl fmt::Display for CaptureError {
 impl std::error::Error for CaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Platform(inner) => Some(inner.as_ref()),
+            Self::Platform(inner) => Some(inner.as_ref().as_ref()),
             _ => None,
         }
     }
