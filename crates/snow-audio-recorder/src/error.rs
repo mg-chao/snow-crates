@@ -3,15 +3,36 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum AudioError {
+    /// The supplied configuration is invalid (e.g. zero sample rate).
+    /// Class: `InvalidInput` — not retryable; the caller must fix the config.
     InvalidConfig(String),
+    /// The requested device could not be found or is not usable.
+    /// Class: `InvalidInput` — the caller should pick a different device.
     DeviceUnavailable(String),
+    /// The device was disconnected or invalidated while in use.
+    /// Class: `Transient` — the engine will attempt automatic recovery.
     DeviceLost,
+    /// The OS denied access to the audio device (e.g. privacy settings).
+    /// Class: `Fatal` — typically requires user intervention in system
+    /// settings before the operation can succeed.
     AccessDenied,
+    /// The requested audio format is not supported by the device or backend.
+    /// Class: `Unsupported` — not retryable; choose a different format.
     UnsupportedFormat(String),
+    /// An internal buffer size computation overflowed.
+    /// Class: `Fatal` — indicates a programming error or absurd parameters.
     BufferOverflow,
+    /// The background worker thread is no longer running.
+    /// Class: `Transient` — the engine may attempt to restart the worker.
     WorkerDead,
+    /// The operation was canceled (e.g. stream stopped while initializing).
+    /// Class: `Transient` — a new operation can be started.
     Canceled,
+    /// The requested audio backend is not available on this platform.
+    /// Class: `Unsupported` — not retryable.
     BackendUnavailable(String),
+    /// A platform-specific error that doesn't map to a more specific variant.
+    /// Class: `Fatal` — the inner `anyhow::Error` carries the details.
     Platform(Arc<anyhow::Error>),
 }
 

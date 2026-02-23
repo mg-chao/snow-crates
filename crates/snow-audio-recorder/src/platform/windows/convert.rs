@@ -1,5 +1,5 @@
 ﻿use crate::error::{AudioError, AudioResult};
-use crate::format::{AudioFormat, AudioSampleFormat};
+use crate::format::{AudioFormat, AudioSampleFormat, MAX_CHANNELS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeSampleFormat {
@@ -72,6 +72,7 @@ pub(crate) struct AudioConverter {
     decode_buffer: Vec<f32>,
     channel_buffer: Vec<f32>,
     resample_buffer: Vec<f32>,
+    encode_buffer: Vec<u8>,
     resampler: Option<ResamplerKind>,
 }
 
@@ -91,6 +92,16 @@ impl AudioConverter {
         Self::build(input, output, resampler)
     }
 
+    /// Create a converter with an explicit resampler. Pass `None` to disable
+    /// resampling (the caller is responsible for ensuring rates match).
+    pub fn with_resampler(
+        input: NativeAudioFormat,
+        output: AudioFormat,
+        resampler: Option<ResamplerKind>,
+    ) -> AudioResult<Self> {
+        Self::build(input, output, resampler)
+    }
+
     fn build(
         input: NativeAudioFormat,
         output: AudioFormat,
@@ -103,6 +114,7 @@ impl AudioConverter {
             decode_buffer: Vec::new(),
             channel_buffer: Vec::new(),
             resample_buffer: Vec::new(),
+            encode_buffer: Vec::new(),
             resampler,
         })
     }
@@ -135,7 +147,8 @@ impl AudioConverter {
             &self.channel_buffer
         };
 
-        encode_from_f32(output_samples, self.output.sample_format)
+        encode_from_f32_into(output_samples, self.output.sample_format, &mut self.encode_buffer)?;
+        Ok(std::mem::take(&mut self.encode_buffer))
     }
 }
 
@@ -264,9 +277,10 @@ fn convert_channels(input: &[f32], in_channels: u16, out_channels: u16, output: 
         // Each output channel accumulates the input channels that map to it
         // and divides by the count, preserving overall energy.
         if out_ch < in_ch {
-            // Accumulate into a small stack buffer.
-            let mut accum = [0.0f32; 32];
-            let mut count = [0u32; 32];
+            // Accumulate into a small stack buffer sized to the crate-wide
+            // channel limit so it stays in sync with validation.
+            let mut accum = [0.0f32; MAX_CHANNELS as usize];
+            let mut count = [0u32; MAX_CHANNELS as usize];
             for (idx, &sample) in frame.iter().enumerate() {
                 let dest = idx % out_ch;
                 accum[dest] += sample;
@@ -290,10 +304,11 @@ fn convert_channels(input: &[f32], in_channels: u16, out_channels: u16, output: 
     }
 }
 
-fn encode_from_f32(samples: &[f32], format: AudioSampleFormat) -> AudioResult<Vec<u8>> {
+fn encode_from_f32_into(samples: &[f32], format: AudioSampleFormat, out: &mut Vec<u8>) -> AudioResult<()> {
+    out.clear();
     match format {
         AudioSampleFormat::F32 => {
-            let mut out = Vec::with_capacity(
+            out.reserve(
                 samples
                     .len()
                     .checked_mul(4)
@@ -302,10 +317,9 @@ fn encode_from_f32(samples: &[f32], format: AudioSampleFormat) -> AudioResult<Ve
             for sample in samples {
                 out.extend_from_slice(&sample.to_le_bytes());
             }
-            Ok(out)
         }
         AudioSampleFormat::I16 => {
-            let mut out = Vec::with_capacity(
+            out.reserve(
                 samples
                     .len()
                     .checked_mul(2)
@@ -316,9 +330,9 @@ fn encode_from_f32(samples: &[f32], format: AudioSampleFormat) -> AudioResult<Ve
                 let scaled = (clamped * i16::MAX as f32) as i16;
                 out.extend_from_slice(&scaled.to_le_bytes());
             }
-            Ok(out)
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

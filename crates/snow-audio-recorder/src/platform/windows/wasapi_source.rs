@@ -119,12 +119,11 @@ impl PacketAccumulator {
                 .bytes_per_frame
                 .checked_mul(self.target_frames as usize)
                 .ok_or(AudioError::BufferOverflow)?;
-            let mut data = Vec::with_capacity(packet_byte_count);
-            for _ in 0..packet_byte_count {
-                if let Some(byte) = self.buffer.pop_front() {
-                    data.push(byte);
-                }
-            }
+
+            // Ensure the deque's internal storage is contiguous so we can
+            // drain efficiently instead of popping byte-by-byte.
+            self.buffer.make_contiguous();
+            let data: Vec<u8> = self.buffer.drain(..packet_byte_count).collect();
 
             if data.len() != packet_byte_count {
                 return Err(AudioError::BufferOverflow);
