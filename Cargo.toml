@@ -1,6 +1,15 @@
-[package]
-name = "snow-recorder"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "crates/screen-capture",
+    "crates/audio-recorder",
+    "crates/screen-recorder",
+]
+resolver = "3"
 
-[dependencies]
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[profile.dev]
+incremental = false

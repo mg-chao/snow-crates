@@ -1,0 +1,8 @@
+[package]
+name = "snow-recorder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+snow-capture = { path = "../screen-capture" }
+snow-audio-recorder = { path = "../audio-recorder" }
