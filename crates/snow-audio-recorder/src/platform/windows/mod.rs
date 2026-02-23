@@ -5,6 +5,7 @@ pub(crate) mod hresult;
 pub(crate) mod notification;
 pub(crate) mod wasapi_source;
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,37 +50,41 @@ impl AudioBackend for WasapiBackend {
     }
 }
 
-struct WasapiEngine {
-    config: AudioStreamConfig,
-    initialized: bool,
-    _coinit: Option<CoInitGuard>,
-    enumerator: Option<windows::Win32::Media::Audio::IMMDeviceEnumerator>,
-    control_event: Option<Arc<EventHandle>>,
-    notification: Option<NotificationClientGuard>,
+/// Holds all COM state. `!Send` and `!Sync` by construction via `PhantomData<*const ()>`,
+/// so the compiler prevents this state from being independently sent across threads.
+struct ComState {
+    _coinit: CoInitGuard,
+    enumerator: windows::Win32::Media::Audio::IMMDeviceEnumerator,
+    control_event: Arc<EventHandle>,
+    notification: NotificationClientGuard,
     system_source: Option<WasapiSource>,
     microphone_source: Option<WasapiSource>,
+    /// Ensures `ComState` is `!Send + !Sync` without relying on the inner types' traits.
+    _not_send: PhantomData<*const ()>,
+}
+
+struct WasapiEngine {
+    config: AudioStreamConfig,
+    com: Option<ComState>,
 }
 
 // SAFETY: WasapiEngine is moved into and used by a single dedicated worker thread.
 // All COM interfaces are initialized in MTA on that thread and never shared.
+// The inner `ComState` is `!Send` by construction, so it cannot be independently
+// sent across threads — only the outer engine (which owns it) crosses the thread
+// boundary via this impl.
 unsafe impl Send for WasapiEngine {}
 
 impl WasapiEngine {
     fn new(config: AudioStreamConfig) -> Self {
         Self {
             config,
-            initialized: false,
-            _coinit: None,
-            enumerator: None,
-            control_event: None,
-            notification: None,
-            system_source: None,
-            microphone_source: None,
+            com: None,
         }
     }
 
     fn ensure_initialized(&mut self) -> AudioResult<()> {
-        if self.initialized {
+        if self.com.is_some() {
             return Ok(());
         }
 
@@ -88,71 +93,64 @@ impl WasapiEngine {
         let control_event = Arc::new(EventHandle::new_manual_reset(false)?);
         let notification = NotificationClientGuard::register(&enumerator, Arc::clone(&control_event))?;
 
-        self._coinit = Some(coinit);
-        self.enumerator = Some(enumerator.clone());
-        self.control_event = Some(control_event);
-        self.notification = Some(notification);
-
+        let mut system_source = None;
         if self.config.system.enabled {
             match WasapiSource::new(AudioSourceKind::System, self.config.system.clone(), enumerator.clone()) {
-                Ok(source) => self.system_source = Some(source),
+                Ok(source) => system_source = Some(source),
                 Err(err) if self.config.system.required => return Err(err),
-                Err(_) => self.system_source = None,
+                Err(_) => {}
             }
         }
 
+        let mut microphone_source = None;
         if self.config.microphone.enabled {
             match WasapiSource::new(
                 AudioSourceKind::Microphone,
                 self.config.microphone.clone(),
-                enumerator,
+                enumerator.clone(),
             ) {
-                Ok(source) => self.microphone_source = Some(source),
+                Ok(source) => microphone_source = Some(source),
                 Err(err) if self.config.microphone.required => return Err(err),
-                Err(_) => self.microphone_source = None,
+                Err(_) => {}
             }
         }
 
-        if self.system_source.is_none() && self.microphone_source.is_none() {
+        if system_source.is_none() && microphone_source.is_none() {
             return Err(AudioError::DeviceUnavailable(
                 "no enabled audio source could be initialized".into(),
             ));
         }
 
-        self.initialized = true;
-        Ok(())
-    }
+        self.com = Some(ComState {
+            _coinit: coinit,
+            enumerator,
+            control_event,
+            notification,
+            system_source,
+            microphone_source,
+            _not_send: PhantomData,
+        });
 
-    fn control_handle(&self) -> AudioResult<windows::Win32::Foundation::HANDLE> {
-        self.control_event
-            .as_ref()
-            .map(|ev| ev.raw())
-            .ok_or_else(|| AudioError::WorkerDead)
+        Ok(())
     }
 
     fn process_control_notifications(&mut self) -> AudioResult<Vec<AudioEvent>> {
         let mut events = Vec::new();
 
+        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
+
         if !self.config.restart_policy.auto_rebind_on_default_change {
-            if let Some(notification) = &self.notification {
-                let state = notification.state();
-                let _ = state.take_render_default_changed();
-                let _ = state.take_capture_default_changed();
-                let _ = state.take_topology_changed();
-            }
+            let state = com.notification.state();
+            let _ = state.take_render_default_changed();
+            let _ = state.take_capture_default_changed();
+            let _ = state.take_topology_changed();
             return Ok(events);
         }
 
-        let (render_changed, capture_changed, topology_changed) = if let Some(notification) = &self.notification {
-            let state = notification.state();
-            (
-                state.take_render_default_changed(),
-                state.take_capture_default_changed(),
-                state.take_topology_changed(),
-            )
-        } else {
-            (false, false, false)
-        };
+        let state = com.notification.state();
+        let render_changed = state.take_render_default_changed();
+        let capture_changed = state.take_capture_default_changed();
+        let topology_changed = state.take_topology_changed();
 
         if render_changed && self.config.system.enabled {
             if matches!(self.config.system.device, crate::device::DeviceSelector::DefaultRender) {
@@ -174,15 +172,22 @@ impl WasapiEngine {
         }
 
         if topology_changed {
-            if self.system_source.is_none() && self.config.system.enabled && !self.config.system.required {
+            let needs_system = {
+                let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
+                com.system_source.is_none() && self.config.system.enabled && !self.config.system.required
+            };
+            if needs_system {
                 if let Some(event) = self.restart_system_source()? {
                     events.push(event);
                 }
             }
-            if self.microphone_source.is_none()
-                && self.config.microphone.enabled
-                && !self.config.microphone.required
-            {
+            let needs_mic = {
+                let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
+                com.microphone_source.is_none()
+                    && self.config.microphone.enabled
+                    && !self.config.microphone.required
+            };
+            if needs_mic {
                 if let Some(event) = self.restart_microphone_source()? {
                     events.push(event);
                 }
@@ -193,14 +198,13 @@ impl WasapiEngine {
     }
 
     fn restart_system_source(&mut self) -> AudioResult<Option<AudioEvent>> {
+        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
+        let enumerator = com.enumerator.clone();
         restart_source_with_policy(
-            &mut self.system_source,
+            &mut com.system_source,
             &self.config.system,
             AudioSourceKind::System,
-            self.enumerator
-                .as_ref()
-                .cloned()
-                .ok_or(AudioError::WorkerDead)?,
+            enumerator,
             self.config.restart_policy.max_attempts,
             self.config.restart_policy.initial_backoff,
             self.config.restart_policy.max_backoff,
@@ -208,14 +212,13 @@ impl WasapiEngine {
     }
 
     fn restart_microphone_source(&mut self) -> AudioResult<Option<AudioEvent>> {
+        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
+        let enumerator = com.enumerator.clone();
         restart_source_with_policy(
-            &mut self.microphone_source,
+            &mut com.microphone_source,
             &self.config.microphone,
             AudioSourceKind::Microphone,
-            self.enumerator
-                .as_ref()
-                .cloned()
-                .ok_or(AudioError::WorkerDead)?,
+            enumerator,
             self.config.restart_policy.max_attempts,
             self.config.restart_policy.initial_backoff,
             self.config.restart_policy.max_backoff,
@@ -223,11 +226,12 @@ impl WasapiEngine {
     }
 
     fn drain_system(&mut self, out: &mut Vec<AudioEvent>) -> AudioResult<()> {
-        if self.system_source.is_none() {
+        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
+        if com.system_source.is_none() {
             return Ok(());
         }
 
-        let result = self
+        let result = com
             .system_source
             .as_mut()
             .unwrap()
@@ -253,11 +257,12 @@ impl WasapiEngine {
     }
 
     fn drain_microphone(&mut self, out: &mut Vec<AudioEvent>) -> AudioResult<()> {
-        if self.microphone_source.is_none() {
+        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
+        if com.microphone_source.is_none() {
             return Ok(());
         }
 
-        let result = self
+        let result = com
             .microphone_source
             .as_mut()
             .unwrap()
@@ -287,11 +292,12 @@ impl AudioRecorderEngine for WasapiEngine {
     fn poll(&mut self, timeout: Duration) -> AudioResult<EngineEvent> {
         self.ensure_initialized()?;
 
-        let mut handles = vec![self.control_handle()?];
-        if let Some(source) = &self.system_source {
+        let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
+        let mut handles = vec![com.control_event.raw()];
+        if let Some(source) = &com.system_source {
             handles.push(source.event_handle());
         }
-        if let Some(source) = &self.microphone_source {
+        if let Some(source) = &com.microphone_source {
             handles.push(source.event_handle());
         }
 
@@ -315,9 +321,8 @@ impl AudioRecorderEngine for WasapiEngine {
         let mut events = Vec::new();
 
         if wait_result == WAIT_OBJECT_0 {
-            if let Some(control) = &self.control_event {
-                let _ = control.reset();
-            }
+            let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
+            let _ = com.control_event.reset();
             events.extend(self.process_control_notifications()?);
         }
 
