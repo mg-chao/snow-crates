@@ -9,18 +9,34 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::WaitForMultipleObjects;
 
 use crate::backend::{AudioBackend, AudioBackendKind, AudioRecorderEngine, EngineEvent};
 use crate::device::{AudioDeviceInfo, DeviceFlow};
 use crate::error::{AudioError, AudioResult};
 use crate::packet::{AudioEvent, AudioSourceKind};
-use crate::session::{AudioStreamConfig, SourceConfig};
+use crate::session::AudioStreamConfig;
 
 use self::com::{CoInitGuard, EventHandle};
 use self::notification::NotificationClientGuard;
 use self::wasapi_source::WasapiSource;
+
+/// Per-source deferred retry state. Instead of blocking the worker thread with
+/// `thread::sleep`, we record when the next attempt is allowed and let `poll()`
+/// keep servicing the healthy source in the meantime.
+struct SourceRetryState {
+    /// When the retry sequence started (used to report total downtime).
+    started: Instant,
+    /// How many attempts have been made so far.
+    attempts: u32,
+    /// Current backoff duration (doubles each attempt, capped at max_backoff).
+    current_backoff: Duration,
+    /// The earliest `Instant` at which the next attempt is permitted.
+    next_attempt_at: Instant,
+    /// The last error seen (used when giving up on a required source).
+    last_error: Option<AudioError>,
+}
 
 pub(crate) struct WasapiBackend {
     kind: AudioBackendKind,
@@ -66,6 +82,11 @@ struct ComState {
 struct WasapiEngine {
     config: AudioStreamConfig,
     com: Option<ComState>,
+    /// Deferred retry state for the system audio source. `Some` while a
+    /// non-blocking retry sequence is in progress.
+    system_retry: Option<SourceRetryState>,
+    /// Deferred retry state for the microphone source.
+    microphone_retry: Option<SourceRetryState>,
 }
 
 // SAFETY: WasapiEngine is moved into and used by a single dedicated worker thread.
@@ -75,11 +96,44 @@ struct WasapiEngine {
 // boundary via this impl.
 unsafe impl Send for WasapiEngine {}
 
+impl SourceRetryState {
+    fn new(initial_backoff: Duration, last_error: Option<AudioError>) -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            attempts: 0,
+            current_backoff: initial_backoff,
+            // First attempt is immediate — no initial delay.
+            next_attempt_at: now,
+            last_error,
+        }
+    }
+
+    /// Returns `true` if the backoff deadline has passed and an attempt is due.
+    fn is_ready(&self) -> bool {
+        Instant::now() >= self.next_attempt_at
+    }
+
+    /// Advance backoff state after a failed attempt.
+    fn record_failure(&mut self, err: AudioError, max_backoff: Duration) {
+        self.attempts += 1;
+        self.last_error = Some(err);
+        self.next_attempt_at = Instant::now() + self.current_backoff;
+        self.current_backoff = self.current_backoff.saturating_mul(2).min(max_backoff);
+    }
+
+    fn downtime(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
 impl WasapiEngine {
     fn new(config: AudioStreamConfig) -> Self {
         Self {
             config,
             com: None,
+            system_retry: None,
+            microphone_retry: None,
         }
     }
 
@@ -154,9 +208,7 @@ impl WasapiEngine {
 
         if render_changed && self.config.system.enabled {
             if matches!(self.config.system.device, crate::device::DeviceSelector::DefaultRender) {
-                if let Some(event) = self.restart_system_source()? {
-                    events.push(event);
-                }
+                self.begin_system_retry(None);
             }
         }
 
@@ -165,77 +217,185 @@ impl WasapiEngine {
                 self.config.microphone.device,
                 crate::device::DeviceSelector::DefaultCapture
             ) {
-                if let Some(event) = self.restart_microphone_source()? {
-                    events.push(event);
-                }
+                self.begin_microphone_retry(None);
             }
         }
 
         if topology_changed {
-            let needs_system = {
-                let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
-                com.system_source.is_none() && self.config.system.enabled && !self.config.system.required
-            };
+            let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
+            let needs_system = com.system_source.is_none()
+                && self.config.system.enabled
+                && !self.config.system.required
+                && self.system_retry.is_none();
+            let needs_mic = com.microphone_source.is_none()
+                && self.config.microphone.enabled
+                && !self.config.microphone.required
+                && self.microphone_retry.is_none();
+
             if needs_system {
-                if let Some(event) = self.restart_system_source()? {
-                    events.push(event);
-                }
+                self.begin_system_retry(None);
             }
-            let needs_mic = {
-                let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
-                com.microphone_source.is_none()
-                    && self.config.microphone.enabled
-                    && !self.config.microphone.required
-            };
             if needs_mic {
-                if let Some(event) = self.restart_microphone_source()? {
-                    events.push(event);
-                }
+                self.begin_microphone_retry(None);
             }
         }
+
+        // Run one tick of any pending retries immediately so the first
+        // attempt (which has no delay) can succeed within this poll cycle.
+        self.tick_retries(&mut events)?;
 
         Ok(events)
     }
 
-    fn restart_system_source(&mut self) -> AudioResult<Option<AudioEvent>> {
-        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
-        let enumerator = com.enumerator.clone();
-        restart_source_with_policy(
-            &mut com.system_source,
-            &self.config.system,
-            AudioSourceKind::System,
-            enumerator,
-            self.config.restart_policy.max_attempts,
+    /// Start a deferred retry sequence for the system source. If a retry is
+    /// already in progress it is reset (e.g. a new device-change notification
+    /// arrived while we were still retrying).
+    fn begin_system_retry(&mut self, last_error: Option<AudioError>) {
+        // Drop the broken source so the retry creates a fresh one.
+        if let Some(com) = self.com.as_mut() {
+            com.system_source = None;
+        }
+        self.system_retry = Some(SourceRetryState::new(
             self.config.restart_policy.initial_backoff,
-            self.config.restart_policy.max_backoff,
-        )
+            last_error,
+        ));
     }
 
-    fn restart_microphone_source(&mut self) -> AudioResult<Option<AudioEvent>> {
+    fn begin_microphone_retry(&mut self, last_error: Option<AudioError>) {
+        if let Some(com) = self.com.as_mut() {
+            com.microphone_source = None;
+        }
+        self.microphone_retry = Some(SourceRetryState::new(
+            self.config.restart_policy.initial_backoff,
+            last_error,
+        ));
+    }
+
+    /// Non-blocking: attempt one retry tick for each source that has a pending
+    /// retry and whose backoff deadline has elapsed. Returns immediately if the
+    /// deadline hasn't passed yet, allowing the other source to keep flowing.
+    fn tick_retries(&mut self, out: &mut Vec<AudioEvent>) -> AudioResult<()> {
+        self.tick_source_retry(AudioSourceKind::System, out)?;
+        self.tick_source_retry(AudioSourceKind::Microphone, out)?;
+        Ok(())
+    }
+
+    fn tick_source_retry(
+        &mut self,
+        kind: AudioSourceKind,
+        out: &mut Vec<AudioEvent>,
+    ) -> AudioResult<()> {
+        // Check whether a retry is pending and ready — using a short-lived
+        // borrow so we don't hold `&mut self` across the attempt.
+        let is_ready = match kind {
+            AudioSourceKind::System => self.system_retry.as_ref().is_some_and(|r| r.is_ready()),
+            AudioSourceKind::Microphone => self.microphone_retry.as_ref().is_some_and(|r| r.is_ready()),
+        };
+        if !is_ready {
+            return Ok(());
+        }
+
         let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
         let enumerator = com.enumerator.clone();
-        restart_source_with_policy(
-            &mut com.microphone_source,
-            &self.config.microphone,
-            AudioSourceKind::Microphone,
-            enumerator,
-            self.config.restart_policy.max_attempts,
-            self.config.restart_policy.initial_backoff,
-            self.config.restart_policy.max_backoff,
-        )
+
+        let (slot, source_config) = match kind {
+            AudioSourceKind::System => (&mut com.system_source, self.config.system.clone()),
+            AudioSourceKind::Microphone => (&mut com.microphone_source, self.config.microphone.clone()),
+        };
+
+        let max_attempts = self.config.restart_policy.max_attempts.max(1);
+        let max_backoff = self.config.restart_policy.max_backoff;
+
+        // Attempt a single restart.
+        let result = if let Some(source) = slot.as_mut() {
+            source.restart()
+        } else {
+            match WasapiSource::new(kind, source_config.clone(), enumerator) {
+                Ok(source) => {
+                    let new_id = source.current_device_id().to_string();
+                    *slot = Some(source);
+                    Ok((None, new_id))
+                }
+                Err(err) => Err(err),
+            }
+        };
+
+        match result {
+            Ok((old_device_id, new_device_id)) => {
+                let retry_state = match kind {
+                    AudioSourceKind::System => self.system_retry.as_ref(),
+                    AudioSourceKind::Microphone => self.microphone_retry.as_ref(),
+                };
+                let downtime = retry_state.map_or(Duration::ZERO, |r| r.downtime());
+
+                // Clear retry state — source is healthy again.
+                match kind {
+                    AudioSourceKind::System => self.system_retry = None,
+                    AudioSourceKind::Microphone => self.microphone_retry = None,
+                }
+                out.push(AudioEvent::SourceRestarted {
+                    source: kind,
+                    old_device_id,
+                    new_device_id,
+                    downtime,
+                });
+            }
+            Err(err) => {
+                let retry_state = match kind {
+                    AudioSourceKind::System => self.system_retry.as_mut(),
+                    AudioSourceKind::Microphone => self.microphone_retry.as_mut(),
+                };
+
+                if let Some(state) = retry_state {
+                    state.record_failure(err.clone(), max_backoff);
+
+                    if state.attempts >= max_attempts {
+                        // Exhausted all attempts.
+                        let last_err = state
+                            .last_error
+                            .take()
+                            .unwrap_or_else(|| err.clone());
+                        let required = source_config.required;
+
+                        // Clear retry state and source slot.
+                        match kind {
+                            AudioSourceKind::System => {
+                                self.system_retry = None;
+                                if let Some(com) = self.com.as_mut() {
+                                    com.system_source = None;
+                                }
+                            }
+                            AudioSourceKind::Microphone => {
+                                self.microphone_retry = None;
+                                if let Some(com) = self.com.as_mut() {
+                                    com.microphone_source = None;
+                                }
+                            }
+                        }
+
+                        if required {
+                            return Err(last_err);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn drain_system(&mut self, out: &mut Vec<AudioEvent>) -> AudioResult<()> {
+        // Skip draining while a retry is in progress — the source is down.
+        if self.system_retry.is_some() {
+            return Ok(());
+        }
+
         let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
         if com.system_source.is_none() {
             return Ok(());
         }
 
-        let result = com
-            .system_source
-            .as_mut()
-            .unwrap()
-            .drain_packets();
+        let result = com.system_source.as_mut().unwrap().drain_packets();
 
         match result {
             Ok(packets) => {
@@ -243,10 +403,15 @@ impl WasapiEngine {
                 Ok(())
             }
             Err(err) if err.is_retryable() || err.requires_worker_reset() => {
-                if let Some(event) = self.restart_system_source()? {
-                    out.push(event);
+                self.begin_system_retry(Some(err.clone()));
+                // Immediately tick so the first (no-delay) attempt runs now.
+                self.tick_source_retry(AudioSourceKind::System, out)?;
+                if self.system_retry.is_some() {
+                    // Still retrying — not recovered yet, but not fatal.
                     Ok(())
-                } else if self.config.system.required {
+                } else if self.com.as_ref().map_or(true, |c| c.system_source.is_none())
+                    && self.config.system.required
+                {
                     Err(err)
                 } else {
                     Ok(())
@@ -257,16 +422,16 @@ impl WasapiEngine {
     }
 
     fn drain_microphone(&mut self, out: &mut Vec<AudioEvent>) -> AudioResult<()> {
+        if self.microphone_retry.is_some() {
+            return Ok(());
+        }
+
         let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
         if com.microphone_source.is_none() {
             return Ok(());
         }
 
-        let result = com
-            .microphone_source
-            .as_mut()
-            .unwrap()
-            .drain_packets();
+        let result = com.microphone_source.as_mut().unwrap().drain_packets();
 
         match result {
             Ok(packets) => {
@@ -274,10 +439,13 @@ impl WasapiEngine {
                 Ok(())
             }
             Err(err) if err.is_retryable() || err.requires_worker_reset() => {
-                if let Some(event) = self.restart_microphone_source()? {
-                    out.push(event);
+                self.begin_microphone_retry(Some(err.clone()));
+                self.tick_source_retry(AudioSourceKind::Microphone, out)?;
+                if self.microphone_retry.is_some() {
                     Ok(())
-                } else if self.config.microphone.required {
+                } else if self.com.as_ref().map_or(true, |c| c.microphone_source.is_none())
+                    && self.config.microphone.required
+                {
                     Err(err)
                 } else {
                     Ok(())
@@ -301,33 +469,54 @@ impl AudioRecorderEngine for WasapiEngine {
             handles.push(source.event_handle());
         }
 
-        if handles.is_empty() {
+        // If any source has a pending retry, use a short timeout so we come
+        // back quickly to tick the retry without starving the healthy source.
+        let has_pending_retry = self.system_retry.is_some() || self.microphone_retry.is_some();
+        let effective_timeout = if has_pending_retry {
+            // Use the minimum of the requested timeout and the nearest retry
+            // deadline so we wake up in time for the next attempt.
+            let nearest = [&self.system_retry, &self.microphone_retry]
+                .iter()
+                .filter_map(|r| r.as_ref())
+                .map(|r| r.next_attempt_at.saturating_duration_since(Instant::now()))
+                .min()
+                .unwrap_or(Duration::ZERO);
+            timeout.min(nearest.max(Duration::from_millis(1)))
+        } else {
+            timeout
+        };
+
+        if handles.is_empty() && !has_pending_retry {
             return Ok(EngineEvent::Idle);
-        }
-
-        let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-        let wait_result = unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) };
-
-        if wait_result == WAIT_TIMEOUT {
-            return Ok(EngineEvent::Idle);
-        }
-
-        if wait_result == WAIT_FAILED {
-            return Err(AudioError::platform(anyhow::anyhow!(
-                "WaitForMultipleObjects failed"
-            )));
         }
 
         let mut events = Vec::new();
 
-        if wait_result == WAIT_OBJECT_0 {
-            let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
-            let _ = com.control_event.reset();
-            events.extend(self.process_control_notifications()?);
+        if !handles.is_empty() {
+            let timeout_ms = effective_timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+            let wait_result = unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) };
+
+            if wait_result == WAIT_FAILED {
+                return Err(AudioError::platform(anyhow::anyhow!(
+                    "WaitForMultipleObjects failed"
+                )));
+            }
+
+            if wait_result == WAIT_OBJECT_0 {
+                let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
+                let _ = com.control_event.reset();
+                events.extend(self.process_control_notifications()?);
+            }
+
+            // Even on WAIT_TIMEOUT we still drain and tick retries below.
         }
 
         self.drain_system(&mut events)?;
         self.drain_microphone(&mut events)?;
+
+        // Tick any pending retries (the drain methods may have started new ones,
+        // or existing ones may have reached their backoff deadline).
+        self.tick_retries(&mut events)?;
 
         if events.is_empty() {
             Ok(EngineEvent::Idle)
@@ -335,67 +524,4 @@ impl AudioRecorderEngine for WasapiEngine {
             Ok(EngineEvent::Events(events))
         }
     }
-}
-
-fn restart_source_with_policy(
-    slot: &mut Option<WasapiSource>,
-    config: &SourceConfig,
-    source_kind: AudioSourceKind,
-    enumerator: windows::Win32::Media::Audio::IMMDeviceEnumerator,
-    max_attempts: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
-) -> AudioResult<Option<AudioEvent>> {
-    if !config.enabled {
-        *slot = None;
-        return Ok(None);
-    }
-
-    let start = Instant::now();
-    let mut backoff = initial_backoff;
-    let attempts = max_attempts.max(1);
-
-    for attempt_idx in 0..attempts {
-        let result = if let Some(source) = slot.as_mut() {
-            source.restart()
-        } else {
-            match WasapiSource::new(source_kind, config.clone(), enumerator.clone()) {
-                Ok(source) => {
-                    let new_id = source.current_device_id().to_string();
-                    *slot = Some(source);
-                    Ok((None, new_id))
-                }
-                Err(err) => Err(err),
-            }
-        };
-
-        match result {
-            Ok((old_device_id, new_device_id)) => {
-                return Ok(Some(AudioEvent::SourceRestarted {
-                    source: source_kind,
-                    old_device_id,
-                    new_device_id,
-                    downtime: start.elapsed(),
-                }));
-            }
-            Err(err) => {
-                if attempt_idx + 1 >= attempts {
-                    if config.required {
-                        return Err(err);
-                    }
-                    *slot = None;
-                    return Ok(None);
-                }
-
-                std::thread::sleep(backoff);
-                backoff = next_backoff(backoff, max_backoff);
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-fn next_backoff(current: Duration, max_backoff: Duration) -> Duration {
-    current.saturating_mul(2).min(max_backoff)
 }

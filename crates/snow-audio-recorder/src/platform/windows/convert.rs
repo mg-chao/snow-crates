@@ -91,17 +91,6 @@ impl AudioConverter {
         Self::build(input, output, resampler)
     }
 
-    /// Create a converter with an explicit resampler choice.
-    ///
-    /// Pass `None` when the input and output sample rates are identical.
-    pub fn with_resampler(
-        input: NativeAudioFormat,
-        output: AudioFormat,
-        resampler: Option<ResamplerKind>,
-    ) -> AudioResult<Self> {
-        Self::build(input, output, resampler)
-    }
-
     fn build(
         input: NativeAudioFormat,
         output: AudioFormat,
