@@ -1,6 +1,7 @@
 ﻿pub mod backend;
 pub mod device;
 pub mod error;
+pub(crate) mod event_queue;
 pub mod format;
 pub mod packet;
 pub mod session;
