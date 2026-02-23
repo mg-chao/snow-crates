@@ -263,7 +263,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "snow-recorder"
+name = "snow-screen-recorder"
 version = "0.1.0"
 dependencies = [
  "snow-audio-recorder",

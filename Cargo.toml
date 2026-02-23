@@ -2,7 +2,7 @@
 members = [
     "crates/snow-capture",
     "crates/snow-audio-recorder",
-    "crates/snow-recorder",
+    "crates/snow-screen-recorder",
 ]
 resolver = "3"
 
