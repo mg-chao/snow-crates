@@ -197,7 +197,7 @@ impl AudioSession {
         self.backend.enumerate_devices(DeviceFlow::Capture)
     }
 
-    pub fn start_streaming(self, config: AudioStreamConfig) -> AudioResult<AudioStreamHandle> {
+    pub fn start_streaming(&self, config: AudioStreamConfig) -> AudioResult<AudioStreamHandle> {
         config.validate()?;
         let engine = self.backend.create_engine(config.clone())?;
         AudioStreamHandle::start(engine, config)
