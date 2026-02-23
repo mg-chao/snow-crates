@@ -31,29 +31,83 @@ impl NativeAudioFormat {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pluggable resampler
+// ---------------------------------------------------------------------------
+
+/// Trait for sample-rate conversion implementations.
+///
+/// Implementations must be stateful to handle continuity across chunk
+/// boundaries (the resampler may buffer trailing samples from one call and
+/// prepend them to the next).
+pub(crate) trait Resampler {
+    /// Resample interleaved `f32` samples from `input` and append the result
+    /// to `out`. The number of channels is fixed at construction time.
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>);
+}
+
+/// Selects which resampler implementation to use.
+///
+/// Using an enum rather than `Box<dyn Resampler>` keeps the hot path
+/// monomorphised and avoids a heap allocation for the trait object.
+pub(crate) enum ResamplerKind {
+    Linear(LinearResampler),
+}
+
+impl Resampler for ResamplerKind {
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        match self {
+            Self::Linear(inner) => inner.process(input, out),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AudioConverter
+// ---------------------------------------------------------------------------
+
 pub(crate) struct AudioConverter {
     input: NativeAudioFormat,
     output: AudioFormat,
     decode_buffer: Vec<f32>,
     channel_buffer: Vec<f32>,
     resample_buffer: Vec<f32>,
-    resampler: Option<LinearResampler>,
+    resampler: Option<ResamplerKind>,
 }
 
 impl AudioConverter {
+    /// Create a converter that uses the default [`LinearResampler`] when the
+    /// input and output sample rates differ.
     pub fn new(input: NativeAudioFormat, output: AudioFormat) -> AudioResult<Self> {
-        output.validate()?;
-
         let resampler = if input.sample_rate == output.sample_rate {
             None
         } else {
-            Some(LinearResampler::new(
+            Some(ResamplerKind::Linear(LinearResampler::new(
                 input.sample_rate,
                 output.sample_rate,
                 output.channels,
-            ))
+            )))
         };
+        Self::build(input, output, resampler)
+    }
 
+    /// Create a converter with an explicit resampler choice.
+    ///
+    /// Pass `None` when the input and output sample rates are identical.
+    pub fn with_resampler(
+        input: NativeAudioFormat,
+        output: AudioFormat,
+        resampler: Option<ResamplerKind>,
+    ) -> AudioResult<Self> {
+        Self::build(input, output, resampler)
+    }
+
+    fn build(
+        input: NativeAudioFormat,
+        output: AudioFormat,
+        resampler: Option<ResamplerKind>,
+    ) -> AudioResult<Self> {
+        output.validate()?;
         Ok(Self {
             input,
             output,
@@ -95,6 +149,10 @@ impl AudioConverter {
         encode_from_f32(output_samples, self.output.sample_format)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sample format decoding / encoding
+// ---------------------------------------------------------------------------
 
 fn decode_interleaved_to_f32(
     input: &[u8],
@@ -153,6 +211,32 @@ fn decode_interleaved_to_f32(
     Ok(())
 }
 
+/// Map channels between different channel counts.
+///
+/// The following conversions are well-defined:
+///
+/// - **Same count** (`in == out`): pass-through.
+/// - **Downmix to mono** (`out == 1`): average all input channels.
+/// - **Upmix from mono** (`in == 1`): duplicate to every output channel.
+///
+/// # Limitations – arbitrary surround layouts
+///
+/// For all other combinations the function applies a *naïve* strategy that
+/// does **not** consult speaker-position masks:
+///
+/// - **Downmix** (`out < in`): each output channel is the average of the
+///   input channels that map to it via round-robin (`idx % out_channels`).
+///   This preserves energy better than simple truncation but does not
+///   implement ITU / Dolby fold-down coefficients, so spatial information
+///   from surround layouts (e.g. 5.1 → stereo) will be mixed incorrectly.
+///
+/// - **Upmix** (`out > in`): extra output channels are filled by cycling
+///   through the input channels (`idx % in_channels`). This is essentially
+///   channel duplication and will not produce correct surround placement.
+///
+/// If accurate surround-to-stereo (or vice-versa) conversion is required,
+/// a dedicated channel mapping stage with proper fold-down coefficients
+/// should be used instead of this function.
 fn convert_channels(input: &[f32], in_channels: u16, out_channels: u16, output: &mut Vec<f32>) {
     output.clear();
 
@@ -161,37 +245,57 @@ fn convert_channels(input: &[f32], in_channels: u16, out_channels: u16, output: 
         return;
     }
 
-    let in_channels = usize::from(in_channels);
-    let out_channels = usize::from(out_channels);
+    let in_ch = usize::from(in_channels);
+    let out_ch = usize::from(out_channels);
 
-    if in_channels == 0 || out_channels == 0 {
+    if in_ch == 0 || out_ch == 0 {
         return;
     }
 
-    let frame_count = input.len() / in_channels;
-    output.reserve(frame_count * out_channels);
+    let frame_count = input.len() / in_ch;
+    output.reserve(frame_count * out_ch);
 
-    for frame in input.chunks_exact(in_channels) {
-        if out_channels == 1 {
+    for frame in input.chunks_exact(in_ch) {
+        // Downmix to mono – average all input channels.
+        if out_ch == 1 {
             let sum: f32 = frame.iter().copied().sum();
-            output.push(sum / in_channels as f32);
+            output.push(sum / in_ch as f32);
             continue;
         }
 
-        if in_channels == 1 {
-            for _ in 0..out_channels {
+        // Upmix from mono – duplicate to every output channel.
+        if in_ch == 1 {
+            for _ in 0..out_ch {
                 output.push(frame[0]);
             }
             continue;
         }
 
-        if out_channels <= in_channels {
-            output.extend_from_slice(&frame[..out_channels]);
+        // Arbitrary downmix (out < in): round-robin average.
+        // Each output channel accumulates the input channels that map to it
+        // and divides by the count, preserving overall energy.
+        if out_ch < in_ch {
+            // Accumulate into a small stack buffer.
+            let mut accum = [0.0f32; 32];
+            let mut count = [0u32; 32];
+            for (idx, &sample) in frame.iter().enumerate() {
+                let dest = idx % out_ch;
+                accum[dest] += sample;
+                count[dest] += 1;
+            }
+            for ch in 0..out_ch {
+                output.push(if count[ch] > 0 {
+                    accum[ch] / count[ch] as f32
+                } else {
+                    0.0
+                });
+            }
             continue;
         }
 
-        for idx in 0..out_channels {
-            let src = frame[idx % in_channels];
+        // Arbitrary upmix (out > in): cycle through input channels.
+        for idx in 0..out_ch {
+            let src = frame[idx % in_ch];
             output.push(src);
         }
     }
@@ -228,7 +332,20 @@ fn encode_from_f32(samples: &[f32], format: AudioSampleFormat) -> AudioResult<Ve
     }
 }
 
-struct LinearResampler {
+// ---------------------------------------------------------------------------
+// LinearResampler
+// ---------------------------------------------------------------------------
+
+/// A simple linear-interpolation resampler.
+///
+/// This is the cheapest possible sample-rate converter: it walks through the
+/// input at a fractional step and linearly interpolates between adjacent
+/// samples. It introduces audible aliasing at large rate ratios and should
+/// be considered a baseline implementation.
+///
+/// For higher quality, implement the [`Resampler`] trait with a windowed-sinc
+/// or polyphase filter and pass it via [`AudioConverter::with_resampler`].
+pub(crate) struct LinearResampler {
     in_rate: u32,
     out_rate: u32,
     channels: u16,
@@ -238,7 +355,7 @@ struct LinearResampler {
 }
 
 impl LinearResampler {
-    fn new(in_rate: u32, out_rate: u32, channels: u16) -> Self {
+    pub fn new(in_rate: u32, out_rate: u32, channels: u16) -> Self {
         Self {
             in_rate,
             out_rate,
@@ -248,7 +365,9 @@ impl LinearResampler {
             input_buffer: Vec::new(),
         }
     }
+}
 
+impl Resampler for LinearResampler {
     fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
         let channels = usize::from(self.channels);
         if channels == 0 {
@@ -288,6 +407,10 @@ impl LinearResampler {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -372,6 +495,20 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_downmix_averages_round_robin() {
+        // 4-channel frame: [FL=1.0, FR=2.0, RL=3.0, RR=4.0]
+        // Downmix to 2 channels:
+        //   ch0 gets idx 0 (FL=1.0) and idx 2 (RL=3.0) → avg = 2.0
+        //   ch1 gets idx 1 (FR=2.0) and idx 3 (RR=4.0) → avg = 3.0
+        let input = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut out = Vec::new();
+        convert_channels(&input, 4, 2, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 2.0).abs() < 1e-6);
+        assert!((out[1] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn linear_resampler_preserves_continuity_across_calls() {
         let input = NativeAudioFormat {
             sample_rate: 48_000,
@@ -403,5 +540,25 @@ mod tests {
             .collect();
         assert!(!second_samples.is_empty());
         assert!(second_samples[0] >= first_samples.last().copied().unwrap_or(0.0));
+    }
+
+    #[test]
+    fn with_resampler_accepts_explicit_resampler() {
+        let input = NativeAudioFormat {
+            sample_rate: 44_100,
+            channels: 1,
+            sample_format: NativeSampleFormat::F32,
+        };
+        let output = AudioFormat::new(48_000, 1, AudioSampleFormat::F32);
+        let resampler = ResamplerKind::Linear(LinearResampler::new(44_100, 48_000, 1));
+        let mut converter =
+            AudioConverter::with_resampler(input, output, Some(resampler)).unwrap();
+
+        let mut src = Vec::new();
+        for s in [0.0f32, 0.5, 1.0, 0.5] {
+            src.extend_from_slice(&s.to_le_bytes());
+        }
+        let out = converter.convert_chunk(&src, 4).unwrap();
+        assert!(!out.is_empty());
     }
 }
