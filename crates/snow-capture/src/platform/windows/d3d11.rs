@@ -1,4 +1,4 @@
-﻿use anyhow::{Context, Result};
+use anyhow::{Context, Result};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
 };
@@ -91,4 +91,3 @@ pub(crate) fn with_texture_resource<T>(
         .map_err(CaptureError::platform)?;
     f(&owned_resource)
 }
-

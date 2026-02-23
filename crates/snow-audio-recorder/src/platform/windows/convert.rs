@@ -1,4 +1,4 @@
-﻿use crate::error::{AudioError, AudioResult};
+use crate::error::{AudioError, AudioResult};
 use crate::format::{AudioFormat, AudioSampleFormat, MAX_CHANNELS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,7 +147,11 @@ impl AudioConverter {
             &self.channel_buffer
         };
 
-        encode_from_f32_into(output_samples, self.output.sample_format, &mut self.encode_buffer)?;
+        encode_from_f32_into(
+            output_samples,
+            self.output.sample_format,
+            &mut self.encode_buffer,
+        )?;
         Ok(std::mem::take(&mut self.encode_buffer))
     }
 }
@@ -304,7 +308,11 @@ fn convert_channels(input: &[f32], in_channels: u16, out_channels: u16, output: 
     }
 }
 
-fn encode_from_f32_into(samples: &[f32], format: AudioSampleFormat, out: &mut Vec<u8>) -> AudioResult<()> {
+fn encode_from_f32_into(
+    samples: &[f32],
+    format: AudioSampleFormat,
+    out: &mut Vec<u8>,
+) -> AudioResult<()> {
     out.clear();
     match format {
         AudioSampleFormat::F32 => {
@@ -554,8 +562,7 @@ mod tests {
         };
         let output = AudioFormat::new(48_000, 1, AudioSampleFormat::F32);
         let resampler = ResamplerKind::Linear(LinearResampler::new(44_100, 48_000, 1));
-        let mut converter =
-            AudioConverter::with_resampler(input, output, Some(resampler)).unwrap();
+        let mut converter = AudioConverter::with_resampler(input, output, Some(resampler)).unwrap();
 
         let mut src = Vec::new();
         for s in [0.0f32, 0.5, 1.0, 0.5] {

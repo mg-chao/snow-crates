@@ -1,4 +1,4 @@
-﻿use crate::error::{AudioError, AudioResult};
+use crate::error::{AudioError, AudioResult};
 
 /// Maximum number of audio channels supported by this crate.
 ///
@@ -50,9 +50,9 @@ impl AudioFormat {
             ));
         }
         if self.channels > MAX_CHANNELS {
-            return Err(AudioError::InvalidConfig(
-                format!("channel count above {MAX_CHANNELS} is not supported"),
-            ));
+            return Err(AudioError::InvalidConfig(format!(
+                "channel count above {MAX_CHANNELS} is not supported"
+            )));
         }
         Ok(())
     }
@@ -89,13 +89,21 @@ mod tests {
 
     #[test]
     fn validation_rejects_invalid_inputs() {
-        assert!(AudioFormat::new(0, 2, AudioSampleFormat::F32).validate().is_err());
-        assert!(AudioFormat::new(48_000, 0, AudioSampleFormat::F32)
-            .validate()
-            .is_err());
-        assert!(AudioFormat::new(48_000, 64, AudioSampleFormat::F32)
-            .validate()
-            .is_err());
+        assert!(
+            AudioFormat::new(0, 2, AudioSampleFormat::F32)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            AudioFormat::new(48_000, 0, AudioSampleFormat::F32)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            AudioFormat::new(48_000, 64, AudioSampleFormat::F32)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

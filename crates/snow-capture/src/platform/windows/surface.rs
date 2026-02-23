@@ -1,4 +1,4 @@
-﻿use anyhow::Context;
+use anyhow::Context;
 use std::cell::{Cell, RefCell};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
@@ -616,7 +616,6 @@ pub(crate) fn region_desc_for_blit(
     region_desc.SampleDesc.Quality = 0;
     region_desc
 }
-
 
 pub(crate) fn copy_mapped_surface_to_frame(
     frame: &mut Frame,

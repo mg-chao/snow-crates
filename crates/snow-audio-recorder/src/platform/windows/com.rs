@@ -1,6 +1,8 @@
-﻿use anyhow::Context;
+use anyhow::Context;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, RPC_E_CHANGED_MODE};
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
+use windows::Win32::System::Com::{
+    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+};
 use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
 
 use crate::error::{AudioError, AudioResult};
@@ -55,14 +57,14 @@ unsafe impl Sync for EventHandle {}
 
 impl EventHandle {
     pub fn new_manual_reset(initial_state: bool) -> AudioResult<Self> {
-        let handle = unsafe { CreateEventW(None, true, initial_state, None) }
-            .map_err(platform_err)?;
+        let handle =
+            unsafe { CreateEventW(None, true, initial_state, None) }.map_err(platform_err)?;
         Ok(Self { raw: handle })
     }
 
     pub fn new_auto_reset(initial_state: bool) -> AudioResult<Self> {
-        let handle = unsafe { CreateEventW(None, false, initial_state, None) }
-            .map_err(platform_err)?;
+        let handle =
+            unsafe { CreateEventW(None, false, initial_state, None) }.map_err(platform_err)?;
         Ok(Self { raw: handle })
     }
 

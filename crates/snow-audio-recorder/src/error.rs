@@ -1,4 +1,4 @@
-﻿use std::fmt;
+use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -55,7 +55,9 @@ impl AudioError {
     pub fn class(&self) -> AudioErrorClass {
         match self {
             Self::InvalidConfig(_) | Self::DeviceUnavailable(_) => AudioErrorClass::InvalidInput,
-            Self::UnsupportedFormat(_) | Self::BackendUnavailable(_) => AudioErrorClass::Unsupported,
+            Self::UnsupportedFormat(_) | Self::BackendUnavailable(_) => {
+                AudioErrorClass::Unsupported
+            }
             Self::DeviceLost | Self::Canceled | Self::WorkerDead => AudioErrorClass::Transient,
             Self::AccessDenied | Self::BufferOverflow | Self::Platform(_) => AudioErrorClass::Fatal,
         }

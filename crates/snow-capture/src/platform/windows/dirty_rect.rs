@@ -484,4 +484,3 @@ pub(crate) fn normalize_dirty_rects_reference_in_place(
         rects.insert(insert_at, candidate);
     }
 }
-

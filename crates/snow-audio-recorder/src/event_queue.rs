@@ -12,7 +12,7 @@ use crate::packet::AudioEvent;
 pub(crate) fn is_control_event(event: &AudioEvent) -> bool {
     !matches!(
         event,
-        AudioEvent::Packet(_) | AudioEvent::PacketDropped { .. }
+        AudioEvent::Packet(_) | AudioEvent::PacketDropped { .. } | AudioEvent::StreamEnded
     )
 }
 
@@ -37,6 +37,10 @@ impl QueueState {
             .or_else(|| self.data_events.pop_front())
     }
 
+    fn data_len(&self) -> usize {
+        self.data_events.len()
+    }
+
     /// Total number of pending events across both lanes.
     fn total_len(&self) -> usize {
         self.control_events.len() + self.data_events.len()
@@ -45,6 +49,7 @@ impl QueueState {
 
 pub(crate) struct PushOutcome {
     pub dropped: Option<AudioEvent>,
+    /// Number of buffered events in the bounded data lane.
     pub len: usize,
 }
 
@@ -74,14 +79,14 @@ impl EventQueue {
         if guard.closed {
             return PushOutcome {
                 dropped: Some(event),
-                len: guard.total_len(),
+                len: guard.data_len(),
             };
         }
 
         if is_control_event(&event) {
             // Control events go into the unbounded lane — never dropped.
             guard.control_events.push_back(event);
-            let len = guard.total_len();
+            let len = guard.data_len();
             self.cv.notify_one();
             return PushOutcome { dropped: None, len };
         }
@@ -94,7 +99,7 @@ impl EventQueue {
         };
 
         guard.data_events.push_back(event);
-        let len = guard.total_len();
+        let len = guard.data_len();
         self.cv.notify_one();
         PushOutcome { dropped, len }
     }
@@ -103,7 +108,7 @@ impl EventQueue {
         let mut guard = self.state.lock().unwrap();
         loop {
             if let Some(event) = guard.pop_next() {
-                return Ok((event, guard.total_len()));
+                return Ok((event, guard.data_len()));
             }
             if guard.closed {
                 return Err(RecvError);
@@ -115,7 +120,7 @@ impl EventQueue {
     pub fn try_recv(&self) -> Result<(AudioEvent, usize), TryRecvError> {
         let mut guard = self.state.lock().unwrap();
         if let Some(event) = guard.pop_next() {
-            return Ok((event, guard.total_len()));
+            return Ok((event, guard.data_len()));
         }
         if guard.closed {
             return Err(TryRecvError::Closed);
@@ -123,13 +128,10 @@ impl EventQueue {
         Err(TryRecvError::Empty)
     }
 
-    pub fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<(AudioEvent, usize), RecvTimeoutError> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<(AudioEvent, usize), RecvTimeoutError> {
         let mut guard = self.state.lock().unwrap();
         if let Some(event) = guard.pop_next() {
-            return Ok((event, guard.total_len()));
+            return Ok((event, guard.data_len()));
         }
 
         if guard.closed {
@@ -142,7 +144,7 @@ impl EventQueue {
             .unwrap();
 
         if let Some(event) = guard.pop_next() {
-            return Ok((event, guard.total_len()));
+            return Ok((event, guard.data_len()));
         }
 
         if guard.closed {
@@ -199,23 +201,35 @@ mod tests {
         }
     }
 
-    fn push_event_with_drop_notice(queue: &EventQueue, stats: &AudioStreamStats, event: AudioEvent) {
+    fn push_event_with_drop_notice(
+        queue: &EventQueue,
+        stats: &AudioStreamStats,
+        event: AudioEvent,
+    ) {
         let outcome = queue.push(event);
-        stats.buffer_fill.store(outcome.len as u64, Ordering::Release);
+        stats
+            .buffer_fill
+            .store(outcome.len as u64, Ordering::Release);
 
         if let Some(dropped) = outcome.dropped {
             if let AudioEvent::Packet(AudioPacket { source, frames, .. }) = &dropped {
                 let dropped_frames = *frames as u64;
                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                stats.frames_dropped.fetch_add(dropped_frames, Ordering::Relaxed);
+                stats
+                    .frames_dropped
+                    .fetch_add(dropped_frames, Ordering::Relaxed);
                 let notice_outcome = queue.push(AudioEvent::PacketDropped {
                     source: *source,
                     dropped_frames,
                 });
-                stats.buffer_fill.store(notice_outcome.len as u64, Ordering::Release);
+                stats
+                    .buffer_fill
+                    .store(notice_outcome.len as u64, Ordering::Release);
                 if let Some(AudioEvent::Packet(pkt)) = notice_outcome.dropped {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                    stats.frames_dropped.fetch_add(pkt.frames as u64, Ordering::Relaxed);
+                    stats
+                        .frames_dropped
+                        .fetch_add(pkt.frames as u64, Ordering::Relaxed);
                 }
             }
         }
@@ -257,11 +271,7 @@ mod tests {
 
         push_event_with_drop_notice(&queue, &stats, AudioEvent::Packet(packet(1)));
         push_event_with_drop_notice(&queue, &stats, AudioEvent::Packet(packet(2)));
-        push_event_with_drop_notice(
-            &queue,
-            &stats,
-            AudioEvent::Error(AudioError::DeviceLost),
-        );
+        push_event_with_drop_notice(&queue, &stats, AudioEvent::Error(AudioError::DeviceLost));
         push_event_with_drop_notice(&queue, &stats, AudioEvent::Packet(packet(3)));
         push_event_with_drop_notice(&queue, &stats, AudioEvent::Packet(packet(4)));
 
@@ -319,5 +329,47 @@ mod tests {
             matches!(first, AudioEvent::BufferPressure { .. }),
             "BufferPressure should be delivered before data events"
         );
+    }
+
+    #[test]
+    fn stream_ended_stays_behind_buffered_packets() {
+        let queue = EventQueue::new(2);
+        queue.push(AudioEvent::Packet(packet(1)));
+        queue.push(AudioEvent::StreamEnded);
+
+        let first = queue.recv().unwrap().0;
+        let second = queue.recv().unwrap().0;
+
+        assert!(
+            matches!(first, AudioEvent::Packet(_)),
+            "StreamEnded must not overtake queued packet data"
+        );
+        assert!(
+            matches!(second, AudioEvent::StreamEnded),
+            "StreamEnded should follow queued packet data"
+        );
+    }
+
+    #[test]
+    fn reported_len_tracks_data_lane_only() {
+        let queue = EventQueue::new(2);
+        let first = queue.push(AudioEvent::Packet(packet(1)));
+        assert_eq!(first.len, 1);
+
+        let control = queue.push(AudioEvent::Error(AudioError::DeviceLost));
+        assert_eq!(
+            control.len, 1,
+            "control events should not inflate data-lane occupancy"
+        );
+
+        let (control_event, len_after_control_pop) = queue.recv().unwrap();
+        assert!(matches!(control_event, AudioEvent::Error(_)));
+        assert_eq!(
+            len_after_control_pop, 1,
+            "consuming control event should not change data-lane occupancy"
+        );
+
+        let (_, len_after_packet_pop) = queue.recv().unwrap();
+        assert_eq!(len_after_packet_pop, 0);
     }
 }

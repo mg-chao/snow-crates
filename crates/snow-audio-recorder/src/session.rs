@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend::{self, AudioBackend, AudioBackendKind};
@@ -124,7 +124,8 @@ impl AudioStreamConfig {
             ));
         }
 
-        if self.restart_policy.initial_backoff.is_zero() || self.restart_policy.max_backoff.is_zero()
+        if self.restart_policy.initial_backoff.is_zero()
+            || self.restart_policy.max_backoff.is_zero()
         {
             return Err(crate::error::AudioError::InvalidConfig(
                 "restart backoff durations must be greater than zero".into(),

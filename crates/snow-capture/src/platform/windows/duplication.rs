@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -764,12 +764,12 @@ fn with_monitor_context<T>(
     action: &'static str,
 ) -> CaptureResult<T> {
     result.map_err(|error| match error {
-        CaptureError::Platform(inner) => CaptureError::platform(
-            anyhow::anyhow!("{inner:#}").context(format!(
+        CaptureError::Platform(inner) => {
+            CaptureError::platform(anyhow::anyhow!("{inner:#}").context(format!(
                 "failed to {action} capturer for {}",
                 monitor.name()
-            )),
-        ),
+            )))
+        }
         other => other,
     })
 }

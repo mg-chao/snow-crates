@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::device::{AudioDeviceInfo, DeviceFlow};
@@ -32,7 +32,8 @@ pub trait AudioRecorderEngine: Send {
 
 pub trait AudioBackend: Send + Sync {
     fn enumerate_devices(&self, flow: DeviceFlow) -> AudioResult<Vec<AudioDeviceInfo>>;
-    fn create_engine(&self, config: AudioStreamConfig) -> AudioResult<Box<dyn AudioRecorderEngine>>;
+    fn create_engine(&self, config: AudioStreamConfig)
+    -> AudioResult<Box<dyn AudioRecorderEngine>>;
 }
 
 pub fn backend_for_kind(kind: AudioBackendKind) -> AudioResult<Arc<dyn AudioBackend>> {
