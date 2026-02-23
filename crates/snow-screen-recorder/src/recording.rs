@@ -12,8 +12,8 @@ use snow_capture::{CaptureEvent, CaptureMode, CaptureSession, CaptureTarget, Str
 use uuid::Uuid;
 
 use crate::artifact::{RecordingArtifact, SessionManifest};
-use crate::audio::mp3_writer::Mp3FileWriter;
-use crate::config::{RecordingAudioFormat, RecordingConfig, RecordingTarget, RecordingVideoFormat};
+use crate::audio::audio_writer::{AudioFileWriter, AudioWriterConfig};
+use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat};
 use crate::error::{Result, ScreenRecorderError};
 use crate::mouse::start_mouse_worker;
 use crate::temp::TempLayout;
@@ -88,12 +88,6 @@ impl RecordingSession {
             .validate()
             .map_err(ScreenRecorderError::InvalidConfig)?;
 
-        if matches!(config.audio.format, RecordingAudioFormat::Aac) {
-            return Err(ScreenRecorderError::UnsupportedFeature(
-                "AAC is not supported in pure-Rust v1".to_string(),
-            ));
-        }
-
         if !matches!(config.video_format, RecordingVideoFormat::H264Lossless) {
             return Err(ScreenRecorderError::UnsupportedFeature(
                 "only H264Lossless is supported in v1".to_string(),
@@ -133,7 +127,13 @@ impl RecordingSession {
             .capture_mode(CaptureMode::ScreenRecording)
             .capture_cursor(false)
             .build()?;
-        let capture_stream = capture_session.start_streaming(
+        // Video-priority strategy:
+        // 1) start audio first to guarantee full coverage,
+        // 2) then start capture,
+        // 3) trim against video timeline during export.
+        let started_at = Instant::now();
+        let mut audio_stream = start_audio_stream_if_enabled(&self.config)?;
+        let capture_stream = match capture_session.start_streaming(
             capture_target,
             StreamConfig {
                 target_fps: self.config.fps,
@@ -143,11 +143,17 @@ impl RecordingSession {
                 min_fps: 10,
                 pause_on_resolution_change: false,
             },
-        )?;
-
-        let audio_stream = start_audio_stream_if_enabled(&self.config)?;
+        ) {
+            Ok(stream) => stream,
+            Err(err) => {
+                if let Some(audio) = audio_stream.take() {
+                    audio.stop();
+                    let _ = audio.stop_and_drain();
+                }
+                return Err(ScreenRecorderError::Capture(err));
+            }
+        };
         let (control_tx, control_rx) = crossbeam_channel::unbounded::<WorkerCommand>();
-        let started_at = Instant::now();
 
         let layout = self.layout.clone();
         let config = self.config.clone();
@@ -424,14 +430,16 @@ struct WorkerContext {
     frame_interval_ms: u32,
     video_writer: H264LosslessFileWriter,
     frame_cache: FrameCacheWriter,
-    system_mp3: Option<Mp3FileWriter>,
-    mic_mp3: Option<Mp3FileWriter>,
+    system_audio_writer: Option<AudioFileWriter>,
+    mic_audio_writer: Option<AudioFileWriter>,
+    audio_channels: u16,
     timeline: PauseTimeline,
     width: u32,
     height: u32,
     prev_rgba: Option<Vec<u8>>,
     pending_block: Option<FrameBlock>,
     last_keyframe_ts_ms: u64,
+    last_observed_ts_ms: Option<u64>,
     capture_ended: bool,
     audio_ended: bool,
     recorded_system_audio: bool,
@@ -442,24 +450,26 @@ impl WorkerContext {
     fn new(config: &RecordingConfig, layout: &TempLayout, started_at: Instant) -> Result<Self> {
         let frame_interval_ms = ((1000.0 / config.fps.max(1) as f32).round() as u32).max(1);
 
-        let system_mp3 = if config.audio.system_audio_enabled {
-            Some(Mp3FileWriter::create(
-                &layout.audio_system_path,
-                config.audio.sample_rate_hz,
-                config.audio.channels.channels(),
-                config.audio.bitrate_kbps,
-            )?)
+        let system_audio_writer = if config.audio.system_audio_enabled {
+            Some(AudioFileWriter::create(AudioWriterConfig {
+                output_path: layout.audio_system_path.clone(),
+                format: config.audio.format,
+                sample_rate_hz: config.audio.sample_rate_hz,
+                channels: config.audio.channels.channels(),
+                bitrate_kbps: config.audio.bitrate_kbps,
+            })?)
         } else {
             None
         };
 
-        let mic_mp3 = if config.audio.microphone_enabled {
-            Some(Mp3FileWriter::create(
-                &layout.audio_mic_path,
-                config.audio.sample_rate_hz,
-                config.audio.channels.channels(),
-                config.audio.bitrate_kbps,
-            )?)
+        let mic_audio_writer = if config.audio.microphone_enabled {
+            Some(AudioFileWriter::create(AudioWriterConfig {
+                output_path: layout.audio_mic_path.clone(),
+                format: config.audio.format,
+                sample_rate_hz: config.audio.sample_rate_hz,
+                channels: config.audio.channels.channels(),
+                bitrate_kbps: config.audio.bitrate_kbps,
+            })?)
         } else {
             None
         };
@@ -468,14 +478,16 @@ impl WorkerContext {
             frame_interval_ms,
             video_writer: H264LosslessFileWriter::create(&layout.video_temp_path)?,
             frame_cache: FrameCacheWriter::create(&layout.frame_cache_path)?,
-            system_mp3,
-            mic_mp3,
+            system_audio_writer,
+            mic_audio_writer,
+            audio_channels: config.audio.channels.channels(),
             timeline: PauseTimeline::new(started_at),
             width: 0,
             height: 0,
             prev_rgba: None,
             pending_block: None,
             last_keyframe_ts_ms: 0,
+            last_observed_ts_ms: None,
             capture_ended: false,
             audio_ended: false,
             recorded_system_audio: false,
@@ -484,6 +496,8 @@ impl WorkerContext {
     }
 
     fn pause(&mut self, at: Instant) {
+        let ts = self.timeline.active_elapsed_ms(at);
+        self.settle_pending_block_duration(ts);
         self.timeline.mark_pause(at);
     }
 
@@ -495,17 +509,18 @@ impl WorkerContext {
         match event {
             CaptureEvent::Frame(frame) => self.handle_frame(frame),
             CaptureEvent::FrameDropped { .. } => {
-                if let Some(block) = self.pending_block.as_mut() {
-                    block.duration_ms = block.duration_ms.saturating_add(self.frame_interval_ms);
+                if let Some(last_ts) = self.last_observed_ts_ms {
+                    let inferred_ts = last_ts.saturating_add(u64::from(self.frame_interval_ms));
+                    self.settle_pending_block_duration(inferred_ts);
                 }
                 Ok(())
             }
             CaptureEvent::Paused { at } => {
-                self.timeline.mark_pause(at);
+                self.pause(at);
                 Ok(())
             }
             CaptureEvent::Resumed { at, .. } => {
-                self.timeline.mark_resume(at);
+                self.resume(at);
                 Ok(())
             }
             CaptureEvent::ResolutionChanged { .. } => Err(ScreenRecorderError::Encode(
@@ -536,12 +551,10 @@ impl WorkerContext {
         let ts = self
             .timeline
             .active_elapsed_ms(frame.metadata.capture_time.unwrap_or_else(Instant::now));
+        self.settle_pending_block_duration(ts);
 
         let is_duplicate = frame.metadata.is_duplicate;
         if is_duplicate {
-            if let Some(block) = self.pending_block.as_mut() {
-                block.duration_ms = block.duration_ms.saturating_add(self.frame_interval_ms);
-            }
             return Ok(());
         }
 
@@ -580,23 +593,53 @@ impl WorkerContext {
         Ok(())
     }
 
+    fn settle_pending_block_duration(&mut self, ts: u64) {
+        self.last_observed_ts_ms = Some(ts);
+        let Some(block) = self.pending_block.as_mut() else {
+            return;
+        };
+
+        block.duration_ms =
+            duration_between_timestamps_ms(block.timestamp_ms, ts, self.frame_interval_ms.max(1));
+    }
+
     fn handle_audio_event(&mut self, event: AudioEvent) -> Result<()> {
         match event {
             AudioEvent::Packet(packet) => {
                 let bytes = audio_packet_to_i16_le_bytes(&packet)?;
                 match packet.source {
                     AudioSourceKind::System => {
-                        if let Some(writer) = self.system_mp3.as_mut() {
+                        if let Some(writer) = self.system_audio_writer.as_mut() {
                             writer.append_i16_le_bytes(&bytes)?;
                             self.recorded_system_audio =
                                 self.recorded_system_audio || !bytes.is_empty();
                         }
                     }
                     AudioSourceKind::Microphone => {
-                        if let Some(writer) = self.mic_mp3.as_mut() {
+                        if let Some(writer) = self.mic_audio_writer.as_mut() {
                             writer.append_i16_le_bytes(&bytes)?;
                             self.recorded_microphone_audio =
                                 self.recorded_microphone_audio || !bytes.is_empty();
+                        }
+                    }
+                }
+                Ok(())
+            }
+            AudioEvent::PacketDropped {
+                source,
+                dropped_frames,
+            } => {
+                match source {
+                    AudioSourceKind::System => {
+                        if let Some(writer) = self.system_audio_writer.as_mut() {
+                            append_silence_i16_frames(writer, dropped_frames, self.audio_channels)?;
+                            self.recorded_system_audio = true;
+                        }
+                    }
+                    AudioSourceKind::Microphone => {
+                        if let Some(writer) = self.mic_audio_writer.as_mut() {
+                            append_silence_i16_frames(writer, dropped_frames, self.audio_channels)?;
+                            self.recorded_microphone_audio = true;
                         }
                     }
                 }
@@ -613,6 +656,8 @@ impl WorkerContext {
 
     fn finalize(mut self, at: Instant) -> Result<WorkerOutcome> {
         self.timeline.finalize(at);
+        let final_ts = self.timeline.active_elapsed_ms(at);
+        self.settle_pending_block_duration(final_ts);
 
         if let Some(block) = self.pending_block.take() {
             self.frame_cache.write_block(&block)?;
@@ -621,10 +666,10 @@ impl WorkerContext {
 
         self.video_writer.flush()?;
 
-        if let Some(writer) = self.system_mp3.take() {
+        if let Some(writer) = self.system_audio_writer.take() {
             writer.finish()?;
         }
-        if let Some(writer) = self.mic_mp3.take() {
+        if let Some(writer) = self.mic_audio_writer.take() {
             writer.finish()?;
         }
 
@@ -654,6 +699,7 @@ fn recording_worker(
 ) -> Result<WorkerOutcome> {
     let mut ctx = WorkerContext::new(&config, &layout, started_at)?;
     let mut stopping = false;
+    let mut stop_requested_at = None::<Instant>;
 
     while !stopping {
         while let Ok(cmd) = control_rx.try_recv() {
@@ -673,6 +719,7 @@ fn recording_worker(
                     ctx.resume(Instant::now());
                 }
                 WorkerCommand::Stop => {
+                    stop_requested_at = Some(Instant::now());
                     stopping = true;
                     break;
                 }
@@ -707,19 +754,25 @@ fn recording_worker(
         }
 
         if ctx.capture_ended && (audio_stream.is_none() || ctx.audio_ended) {
+            if stop_requested_at.is_none() {
+                stop_requested_at = Some(Instant::now());
+            }
             break;
         }
     }
 
+    // Stop order for video-priority export:
+    // 1) stop video first,
+    // 2) then stop audio,
+    // 3) export-stage trimming aligns audio to the video window.
     capture_stream.stop();
-    if let Some(audio) = audio_stream.as_ref() {
-        audio.stop();
-    }
-
     for event in capture_stream.stop_and_drain() {
         ctx.handle_capture_event(event)?;
     }
 
+    if let Some(audio) = audio_stream.as_ref() {
+        audio.stop();
+    }
     if let Some(audio) = audio_stream.take() {
         for event in audio.stop_and_drain() {
             ctx.handle_audio_event(event)?;
@@ -727,7 +780,8 @@ fn recording_worker(
         ctx.audio_ended = true;
     }
 
-    ctx.finalize(Instant::now())
+    let finalize_at = stop_requested_at.unwrap_or_else(Instant::now);
+    ctx.finalize(finalize_at)
 }
 
 fn build_delta_kind(
@@ -777,6 +831,15 @@ fn build_delta_kind(
     Ok(Some(FrameBlockKind::Delta { patches }))
 }
 
+fn duration_between_timestamps_ms(start_ts: u64, end_ts: u64, fallback_ms: u32) -> u32 {
+    let delta = end_ts.saturating_sub(start_ts);
+    if delta == 0 {
+        return fallback_ms.max(1);
+    }
+
+    delta.min(u64::from(u32::MAX)) as u32
+}
+
 fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPacket) -> Result<Vec<u8>> {
     match packet.format.sample_format {
         AudioSampleFormat::I16 => {
@@ -805,6 +868,30 @@ fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPacket) -> Re
     }
 }
 
+fn append_silence_i16_frames(
+    writer: &mut AudioFileWriter,
+    frames: u64,
+    channels: u16,
+) -> Result<()> {
+    if frames == 0 {
+        return Ok(());
+    }
+
+    let channels = usize::from(channels.max(1));
+    const CHUNK_FRAMES: u64 = 4096;
+    let chunk_template = vec![0u8; CHUNK_FRAMES as usize * channels * 2];
+
+    let mut remaining = frames;
+    while remaining > 0 {
+        let take_frames = remaining.min(CHUNK_FRAMES);
+        let take_bytes = take_frames as usize * channels * 2;
+        writer.append_i16_le_bytes(&chunk_template[..take_bytes])?;
+        remaining -= take_frames;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,17 +909,25 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_aac() {
+    fn create_accepts_aac() {
         let mut config = RecordingConfig::default();
-        config.audio.format = RecordingAudioFormat::Aac;
+        config.audio.format = crate::config::RecordingAudioFormat::Aac;
         config.output_dir = std::env::temp_dir().join(format!(
             "snow-screen-recorder-test-{}",
             Uuid::new_v4().simple()
         ));
 
-        match RecordingSession::create(config) {
-            Ok(_) => panic!("AAC should be rejected in v1"),
-            Err(err) => assert!(matches!(err, ScreenRecorderError::UnsupportedFeature(_))),
-        }
+        assert!(RecordingSession::create(config).is_ok());
+    }
+
+    #[test]
+    fn duration_between_timestamps_uses_real_delta() {
+        assert_eq!(duration_between_timestamps_ms(1_000, 1_133, 42), 133);
+    }
+
+    #[test]
+    fn duration_between_timestamps_falls_back_when_delta_is_zero() {
+        assert_eq!(duration_between_timestamps_ms(2_000, 2_000, 42), 42);
+        assert_eq!(duration_between_timestamps_ms(2_000, 1_500, 42), 42);
     }
 }

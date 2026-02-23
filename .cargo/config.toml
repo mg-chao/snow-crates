@@ -1,0 +1,5 @@
+[env]
+VCPKG_ROOT = { value = ".tools/vcpkg", relative = true }
+VCPKGRS_TRIPLET = "x64-windows"
+VCPKGRS_DYNAMIC = "1"
+FFMPEG_DIR = { value = ".tools/vcpkg/installed/x64-windows", relative = true }

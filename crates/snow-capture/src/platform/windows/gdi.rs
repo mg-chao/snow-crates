@@ -1,4 +1,4 @@
-﻿use std::ffi::c_void;
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -2331,9 +2331,21 @@ impl GdiResources {
         match path {
             WindowCapturePath::WindowDcBitBlt => {
                 let window_dc = self.acquire_window_dc(hwnd)?;
-                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, Some(window_dc), 0, 0, SRCCOPY) }
-                    .context("BitBlt failed during GDI window capture")
-                    .map_err(CaptureError::platform)?;
+                unsafe {
+                    BitBlt(
+                        self.mem_dc,
+                        0,
+                        0,
+                        width,
+                        height,
+                        Some(window_dc),
+                        0,
+                        0,
+                        SRCCOPY,
+                    )
+                }
+                .context("BitBlt failed during GDI window capture")
+                .map_err(CaptureError::platform)?;
                 Ok(())
             }
             WindowCapturePath::PrintWindow(flags) => {

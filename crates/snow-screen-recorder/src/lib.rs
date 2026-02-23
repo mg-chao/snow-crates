@@ -8,7 +8,6 @@ pub mod recording;
 pub mod temp;
 
 pub(crate) mod audio;
-pub(crate) mod container;
 pub(crate) mod timeline;
 pub(crate) mod video;
 

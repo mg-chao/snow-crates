@@ -1,7 +1,7 @@
 ﻿use std::fs;
 use std::path::PathBuf;
 
-use crate::config::RecordingConfig;
+use crate::config::{RecordingAudioFormat, RecordingConfig};
 use crate::error::Result;
 
 #[derive(Clone, Debug)]
@@ -25,6 +25,10 @@ impl TempLayout {
 
         let session_dir = root_tmp_dir.join(session_id);
         fs::create_dir_all(&session_dir)?;
+        let audio_ext = match config.audio.format {
+            RecordingAudioFormat::Mp3 => "mp3",
+            RecordingAudioFormat::Aac => "aac",
+        };
 
         let layout = Self {
             output_dir: config.output_dir.clone(),
@@ -33,8 +37,8 @@ impl TempLayout {
             manifest_path: session_dir.join("manifest.json"),
             video_temp_path: session_dir.join("video.mp4"),
             frame_cache_path: session_dir.join("frames.srf"),
-            audio_system_path: session_dir.join("audio_system.mp3"),
-            audio_mic_path: session_dir.join("audio_mic.mp3"),
+            audio_system_path: session_dir.join(format!("audio_system.{audio_ext}")),
+            audio_mic_path: session_dir.join(format!("audio_mic.{audio_ext}")),
             mouse_path: session_dir.join("mouse.bin"),
         };
 

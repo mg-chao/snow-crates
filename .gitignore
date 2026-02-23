@@ -1,1 +1,8 @@
 /target
+<<<<<<< Updated upstream
+/recordings
+/tools
+=======
+/.tools
+/recordings
+>>>>>>> Stashed changes

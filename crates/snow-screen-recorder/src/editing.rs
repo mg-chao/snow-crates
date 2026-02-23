@@ -1,20 +1,15 @@
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 
-use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
-use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
-use mp4e::{Codec as Mp4Codec, Mp4e};
-
 use crate::artifact::{PauseInterval, RecordingArtifact, SessionManifest};
-use crate::audio::mixer::{Mp3SourceInput, encode_pcm_to_mp3, mix_mp3_sources_to_pcm};
-use crate::audio::opus_encoder::OpusEncoderWrapper;
 use crate::config::{EditConfig, ExportFormat, MouseEditConfig};
-use crate::container::avi_writer::{AviAudioTrack, write_avi};
 use crate::error::{Result, ScreenRecorderError};
 use crate::export::ExportResult;
 use crate::mouse::{ClickEventRecord, CursorSampleRecord, MouseRecord, read_mouse_records};
-use crate::video::encoder_h264_lossless::H264LosslessAnnexBEncoder;
+use crate::video::encoder_h264_lossless::{
+    AudioMixTrack, Mp4AudioMixConfig, decode_h264_video_to_frames, export_frames_to_avi,
+    export_frames_to_gif, export_frames_to_mp4_with_audio,
+};
 use crate::video::frame_cache::{ReconstructedFrame, reconstruct_frames};
 
 pub struct EditingSession {
@@ -90,7 +85,7 @@ impl EditingSession {
             }
         }
 
-        let source_frames = reconstruct_frames(&self.manifest.frame_cache_path)?;
+        let source_frames = load_source_frames(&self.manifest)?;
         if source_frames.is_empty() {
             return Err(ScreenRecorderError::Export(
                 "no frames available for export".to_string(),
@@ -139,27 +134,15 @@ impl EditingSession {
             ExportFormat::Mp4 => export_mp4(
                 &self.config.export.output_path,
                 &frames,
-                self.mix_audio_pcm(48_000, 2)?,
-                self.manifest.audio_bitrate_kbps,
-            )?,
-            ExportFormat::Avi => export_avi(
-                &self.config.export.output_path,
-                &frames,
                 params.export_fps,
-                self.mix_audio_pcm(
-                    self.manifest.audio_sample_rate_hz,
-                    self.manifest.audio_channels,
-                )?,
-                self.manifest.audio_sample_rate_hz,
-                self.manifest.audio_channels,
-                self.manifest.audio_bitrate_kbps,
-                self.config.export.quality,
+                build_mp4_audio_mix_config(&self.manifest, &self.config, &source_frames),
             )?,
-            ExportFormat::Gif => export_gif(
-                &self.config.export.output_path,
-                &frames,
-                self.config.export.quality,
-            )?,
+            ExportFormat::Avi => {
+                export_avi(&self.config.export.output_path, &frames, params.export_fps)?
+            }
+            ExportFormat::Gif => {
+                export_gif(&self.config.export.output_path, &frames, params.export_fps)?
+            }
         }
 
         let duration_ms = frames
@@ -173,40 +156,6 @@ impl EditingSession {
             duration_ms,
             format: self.config.export.format,
         })
-    }
-
-    fn mix_audio_pcm(&self, sample_rate_hz: u32, channels: u16) -> Result<Vec<i16>> {
-        if self.config.export.format == ExportFormat::Gif {
-            return Ok(Vec::new());
-        }
-
-        let system_input = self
-            .manifest
-            .audio_system_path
-            .as_ref()
-            .map(|path| Mp3SourceInput {
-                path: path.clone(),
-                enabled: self.config.system_audio.enabled && self.manifest.recorded_system_audio,
-                volume: self.config.system_audio.volume,
-            });
-        let mic_input = self
-            .manifest
-            .audio_mic_path
-            .as_ref()
-            .map(|path| Mp3SourceInput {
-                path: path.clone(),
-                enabled: self.config.microphone_audio.enabled
-                    && self.manifest.recorded_microphone_audio,
-                volume: self.config.microphone_audio.volume,
-            });
-
-        mix_mp3_sources_to_pcm(
-            system_input,
-            mic_input,
-            self.config.playback_speed,
-            sample_rate_hz,
-            channels,
-        )
     }
 }
 
@@ -593,163 +542,112 @@ fn edge(a: (i32, i32), b: (i32, i32), p: (i32, i32)) -> i32 {
 fn export_mp4(
     output_path: &Path,
     frames: &[ReconstructedFrame],
-    pcm_audio: Vec<i16>,
-    audio_bitrate_kbps: u16,
+    export_fps: u32,
+    audio_mix: Option<Mp4AudioMixConfig>,
 ) -> Result<()> {
-    if frames.is_empty() {
-        return Err(ScreenRecorderError::Export(
-            "MP4 export requires at least one frame".to_string(),
-        ));
-    }
+    export_frames_to_mp4_with_audio(output_path, frames, export_fps, audio_mix.as_ref())
+}
 
-    let mut file = File::create(output_path)?;
-    let mut muxer = Mp4e::new(&mut file);
-    muxer.set_video_track(frames[0].width, frames[0].height, Mp4Codec::AVC);
-    if !pcm_audio.is_empty() {
-        muxer.set_audio_track(48_000, 2, Mp4Codec::OPUS);
-    }
+fn export_avi(output_path: &Path, frames: &[ReconstructedFrame], export_fps: u32) -> Result<()> {
+    export_frames_to_avi(output_path, frames, export_fps)
+}
 
-    let mut encoder = H264LosslessAnnexBEncoder::new();
-    for frame in frames {
-        let annex_b = encoder.encode_rgba(frame.width, frame.height, &frame.rgba)?;
-        muxer
-            .encode_video(&annex_b, frame.duration_ms.max(1))
-            .map_err(|e| ScreenRecorderError::Export(format!("failed to mux MP4 video: {e}")))?;
-    }
+fn export_gif(output_path: &Path, frames: &[ReconstructedFrame], export_fps: u32) -> Result<()> {
+    export_frames_to_gif(output_path, frames, export_fps)
+}
 
-    if !pcm_audio.is_empty() {
-        let mut opus = OpusEncoderWrapper::new(48_000, 2, audio_bitrate_kbps)?;
-        let frame_samples = opus.frame_samples_per_channel();
-        let packet_samples = frame_samples * 2;
-        for chunk in pcm_audio.chunks(packet_samples) {
-            let mut packet_pcm = vec![0i16; packet_samples];
-            packet_pcm[..chunk.len()].copy_from_slice(chunk);
-            let encoded = opus.encode_frame(&packet_pcm)?;
-            muxer
-                .encode_audio(&encoded, frame_samples as u32)
-                .map_err(|e| {
-                    ScreenRecorderError::Export(format!("failed to mux MP4 audio: {e}"))
-                })?;
+fn build_mp4_audio_mix_config(
+    manifest: &SessionManifest,
+    config: &EditConfig,
+    source_frames: &[ReconstructedFrame],
+) -> Option<Mp4AudioMixConfig> {
+    let mut tracks = Vec::<AudioMixTrack>::new();
+
+    if config.system_audio.enabled {
+        if let Some(path) = manifest.audio_system_path.as_ref() {
+            tracks.push(AudioMixTrack {
+                path: path.clone(),
+                volume: config.system_audio.volume,
+            });
         }
     }
 
-    muxer
-        .flush()
-        .map_err(|e| ScreenRecorderError::Export(format!("failed to finalize MP4: {e}")))?;
-    file.flush()?;
-    Ok(())
+    if config.microphone_audio.enabled {
+        if let Some(path) = manifest.audio_mic_path.as_ref() {
+            tracks.push(AudioMixTrack {
+                path: path.clone(),
+                volume: config.microphone_audio.volume,
+            });
+        }
+    }
+
+    if tracks.is_empty() {
+        return None;
+    }
+
+    let trim_start_ms = source_frames
+        .first()
+        .map(|frame| frame.timestamp_ms)
+        .unwrap_or(0);
+    let trim_duration_ms = (!source_frames.is_empty()).then(|| {
+        source_frames
+            .iter()
+            .map(|frame| u64::from(frame.duration_ms.max(1)))
+            .sum::<u64>()
+            .max(1)
+    });
+
+    Some(Mp4AudioMixConfig {
+        tracks,
+        sample_rate_hz: manifest.audio_sample_rate_hz.max(1),
+        channels: manifest.audio_channels.max(1),
+        bitrate_kbps: manifest.audio_bitrate_kbps.max(8),
+        playback_speed: config.playback_speed,
+        trim_start_ms,
+        trim_duration_ms,
+    })
 }
 
-fn export_avi(
-    output_path: &Path,
-    frames: &[ReconstructedFrame],
-    export_fps: u32,
-    pcm_audio: Vec<i16>,
-    audio_sample_rate_hz: u32,
-    audio_channels: u16,
-    audio_bitrate_kbps: u16,
-    quality: u8,
-) -> Result<()> {
-    if frames.is_empty() {
-        return Err(ScreenRecorderError::Export(
-            "AVI export requires at least one frame".to_string(),
-        ));
+fn load_source_frames(manifest: &SessionManifest) -> Result<Vec<ReconstructedFrame>> {
+    if manifest.frame_cache_path.is_file() {
+        match reconstruct_frames(&manifest.frame_cache_path) {
+            Ok(frames) if !frames.is_empty() => return Ok(frames),
+            Ok(_) => {}
+            Err(cache_err) => {
+                if manifest.video_temp_path.is_file() {
+                    let decoded = decode_h264_video_to_frames(&manifest.video_temp_path)?;
+                    if !decoded.is_empty() {
+                        return Ok(decoded);
+                    }
+                }
+                return Err(ScreenRecorderError::Decode(format!(
+                    "failed to decode frame cache {}: {cache_err}",
+                    manifest.frame_cache_path.display()
+                )));
+            }
+        }
     }
 
-    let jpeg_quality = quality.max(5);
-    let mut mjpeg_frames = Vec::with_capacity(frames.len());
-    for frame in frames {
-        let mut out = Vec::new();
-        let encoder = JpegEncoder::new(&mut out, jpeg_quality);
-        encoder
-            .encode(
-                &frame.rgba,
-                frame.width as u16,
-                frame.height as u16,
-                JpegColorType::Rgba,
-            )
-            .map_err(|e| ScreenRecorderError::Encode(format!("JPEG encode failed: {e}")))?;
-        mjpeg_frames.push(out);
+    if manifest.video_temp_path.is_file() {
+        return decode_h264_video_to_frames(&manifest.video_temp_path);
     }
 
-    let audio_track = if pcm_audio.is_empty() {
-        None
-    } else {
-        let mp3_data = encode_pcm_to_mp3(
-            &pcm_audio,
-            audio_sample_rate_hz,
-            audio_channels,
-            audio_bitrate_kbps,
-        )?;
-        Some(AviAudioTrack {
-            mp3_data,
-            sample_rate_hz: audio_sample_rate_hz,
-            channels: audio_channels,
-            bitrate_kbps: audio_bitrate_kbps,
-        })
-    };
-
-    write_avi(
-        output_path,
-        frames[0].width,
-        frames[0].height,
-        export_fps.max(1),
-        &mjpeg_frames,
-        audio_track.as_ref(),
-    )
-}
-
-fn export_gif(output_path: &Path, frames: &[ReconstructedFrame], quality: u8) -> Result<()> {
-    if frames.is_empty() {
-        return Err(ScreenRecorderError::Export(
-            "GIF export requires at least one frame".to_string(),
-        ));
-    }
-
-    if frames[0].width > u16::MAX as u32 || frames[0].height > u16::MAX as u32 {
-        return Err(ScreenRecorderError::Export(
-            "GIF export dimensions exceed u16 limits".to_string(),
-        ));
-    }
-
-    let mut file = File::create(output_path)?;
-    let mut encoder = GifEncoder::new(
-        &mut file,
-        frames[0].width as u16,
-        frames[0].height as u16,
-        &[],
-    )
-    .map_err(|e| ScreenRecorderError::Export(format!("failed to create GIF encoder: {e}")))?;
-    encoder
-        .set_repeat(Repeat::Infinite)
-        .map_err(|e| ScreenRecorderError::Export(format!("failed to set GIF repeat: {e}")))?;
-
-    let palette_size = 16 + ((quality as u16 * 240) / 100);
-    let quant_speed = (31 - ((palette_size as i32 * 30) / 256)).clamp(1, 30);
-
-    for frame in frames {
-        let mut rgba = frame.rgba.clone();
-        let mut gif_frame = GifFrame::from_rgba_speed(
-            frame.width as u16,
-            frame.height as u16,
-            &mut rgba,
-            quant_speed,
-        );
-        gif_frame.delay = ((frame.duration_ms as f32) / 10.0).round().max(1.0) as u16;
-        encoder
-            .write_frame(&gif_frame)
-            .map_err(|e| ScreenRecorderError::Export(format!("failed to write GIF frame: {e}")))?;
-    }
-
-    drop(encoder);
-    file.flush()?;
-    Ok(())
+    Err(ScreenRecorderError::Decode(format!(
+        "neither frame cache nor video file exists for session {}",
+        manifest.session_id
+    )))
 }
 
 fn validate_manifest_paths(manifest: &SessionManifest) -> Result<()> {
-    validate_file_exists(&manifest.frame_cache_path)?;
     validate_file_exists(&manifest.mouse_path)?;
-    validate_file_exists(&manifest.video_temp_path)?;
+
+    if !manifest.frame_cache_path.is_file() && !manifest.video_temp_path.is_file() {
+        return Err(ScreenRecorderError::Decode(format!(
+            "both frame cache and video artifacts are missing: {} and {}",
+            manifest.frame_cache_path.display(),
+            manifest.video_temp_path.display()
+        )));
+    }
 
     if manifest.recorded_system_audio {
         if let Some(path) = manifest.audio_system_path.as_ref() {
