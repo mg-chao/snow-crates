@@ -89,7 +89,7 @@ impl AudioConverter {
                 output.channels,
             )))
         };
-        Self::build(input, output, resampler)
+        Self::with_resampler(input, output, resampler)
     }
 
     /// Create a converter with an explicit resampler. Pass `None` to disable

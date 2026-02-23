@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode,
     GraphicsCaptureItem, GraphicsCaptureSession,
@@ -839,8 +839,8 @@ struct WindowsGraphicsCaptureCapturer {
     item: GraphicsCaptureItem,
     frame_pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
-    frame_arrived_token: EventRegistrationToken,
-    closed_token: EventRegistrationToken,
+    frame_arrived_token: i64,
+    closed_token: i64,
     signal: Arc<FrameSignal>,
     last_sequence: u64,
     pool_size: SizeInt32,
@@ -932,31 +932,31 @@ impl WindowsGraphicsCaptureCapturer {
             .FrameArrived(
                 &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
                     move |sender, _| {
-                        if let Some(pool) = sender {
-                            let mut newest: Option<Direct3D11CaptureFrame> = None;
+                        let mut newest: Option<Direct3D11CaptureFrame> = None;
+                        if let Some(pool) = sender.as_ref() {
                             while let Ok(frame) = pool.TryGetNextFrame() {
                                 if let Some(previous) = newest.replace(frame) {
                                     let _ = previous.Close();
                                 }
                             }
-                            if let Some(next_frame) = newest
-                                && let Ok(mut state) = signal_for_frames.state.lock()
-                            {
-                                if let Some(previous) = state.latest.take() {
-                                    let _ = previous.Close();
-                                }
-                                let time_ticks = next_frame
-                                    .SystemRelativeTime()
-                                    .map(|t| t.Duration)
-                                    .unwrap_or(0);
-                                state.latest_time_ticks = time_ticks;
-                                state.latest = Some(next_frame);
-                                state.sequence = state.sequence.wrapping_add(1);
-                                signal_for_frames
-                                    .sequence_hint
-                                    .store(state.sequence, Ordering::Release);
-                                signal_for_frames.cv.notify_one();
+                        }
+                        if let Some(next_frame) = newest
+                            && let Ok(mut state) = signal_for_frames.state.lock()
+                        {
+                            if let Some(previous) = state.latest.take() {
+                                let _ = previous.Close();
                             }
+                            let time_ticks = next_frame
+                                .SystemRelativeTime()
+                                .map(|t| t.Duration)
+                                .unwrap_or(0);
+                            state.latest_time_ticks = time_ticks;
+                            state.latest = Some(next_frame);
+                            state.sequence = state.sequence.wrapping_add(1);
+                            signal_for_frames
+                                .sequence_hint
+                                .store(state.sequence, Ordering::Release);
+                            signal_for_frames.cv.notify_one();
                         }
                         Ok(())
                     },

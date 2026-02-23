@@ -188,7 +188,7 @@ impl DisplayInfoCache {
         if let Some(hwnd) = hwnd {
             // Post our custom quit message to break the GetMessage loop.
             unsafe {
-                let _ = PostMessageW(hwnd, WM_QUIT_LISTENER, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(hwnd), WM_QUIT_LISTENER, WPARAM(0), LPARAM(0));
             }
         }
 
@@ -266,9 +266,9 @@ fn create_listener_window(cache_ptr: usize) -> CaptureResult<HWND> {
             0,
             0,
             0,
-            HWND_MESSAGE,
+            Some(HWND_MESSAGE),
             None,
-            hinstance,
+            Some(hinstance.into()),
             Some(cache_ptr as *const std::ffi::c_void),
         )
     }
@@ -281,7 +281,7 @@ fn create_listener_window(cache_ptr: usize) -> CaptureResult<HWND> {
 fn run_message_loop() {
     let mut msg = MSG::default();
     unsafe {
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_QUIT_LISTENER {
                 break;
             }

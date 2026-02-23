@@ -5,9 +5,11 @@ use windows::Win32::Media::Audio::{
     MMDeviceEnumerator, eCapture, eConsole, eRender,
 };
 use windows::Win32::System::Com::STGM_READ;
-use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
+use windows::Win32::System::Com::StructuredStorage::{
+    PROPVARIANT, PropVariantClear, PropVariantToStringAlloc,
+};
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
-use windows::core::{HSTRING, PROPVARIANT};
+use windows::core::HSTRING;
 
 use crate::device::{AudioDeviceInfo, DeviceFlow, DeviceSelector};
 use crate::error::{AudioError, AudioResult};

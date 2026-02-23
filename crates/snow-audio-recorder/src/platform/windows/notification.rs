@@ -142,7 +142,7 @@ impl IMMNotificationClient_Impl for NotificationClient_Impl {
     fn OnPropertyValueChanged(
         &self,
         _pwstrdeviceid: &PCWSTR,
-        _key: &windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY,
+        _key: &windows::Win32::Foundation::PROPERTYKEY,
     ) -> windows::core::Result<()> {
         self.state.topology_changed.store(true, Ordering::Release);
         let _ = self.control_event.set();

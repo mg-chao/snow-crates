@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
 };
@@ -54,7 +55,7 @@ fn create_d3d11_device(
             } else {
                 D3D_DRIVER_TYPE_HARDWARE
             },
-            None,
+            HMODULE::default(),
             flags,
             Some(&feature_levels),
             D3D11_SDK_VERSION,

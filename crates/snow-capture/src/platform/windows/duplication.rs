@@ -2870,7 +2870,7 @@ impl WindowsDxgiWindowCapturer {
                 window.stable_id()
             )));
         }
-        if !unsafe { IsWindow(hwnd) }.as_bool() {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(CaptureError::InvalidTarget(format!(
                 "window handle is not valid: {}",
                 window.stable_id()
@@ -2978,7 +2978,7 @@ impl WindowsDxgiWindowCapturer {
     ) -> CaptureResult<Frame> {
         let hwnd = self.hwnd.0;
 
-        if !unsafe { IsWindow(hwnd) }.as_bool() {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(CaptureError::InvalidTarget(
                 "window no longer exists".into(),
             ));

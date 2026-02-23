@@ -1089,17 +1089,17 @@ struct GdiResources {
 
 impl GdiResources {
     fn new() -> CaptureResult<Self> {
-        let screen_dc = unsafe { GetDC(HWND(null_mut())) };
+        let screen_dc = unsafe { GetDC(None) };
         if screen_dc.0.is_null() {
             return Err(CaptureError::platform(anyhow::anyhow!(
                 "GetDC(NULL) returned null"
             )));
         }
 
-        let mem_dc = unsafe { CreateCompatibleDC(screen_dc) };
+        let mem_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
         if mem_dc.0.is_null() {
             unsafe {
-                let _ = ReleaseDC(HWND(null_mut()), screen_dc);
+                let _ = ReleaseDC(None, screen_dc);
             }
             return Err(CaptureError::platform(anyhow::anyhow!(
                 "CreateCompatibleDC failed"
@@ -1139,11 +1139,11 @@ impl GdiResources {
         // Release the old DC first.
         if !self.screen_dc.0.is_null() {
             unsafe {
-                let _ = ReleaseDC(HWND(null_mut()), self.screen_dc);
+                let _ = ReleaseDC(None, self.screen_dc);
             }
         }
 
-        let new_dc = unsafe { GetDC(HWND(null_mut())) };
+        let new_dc = unsafe { GetDC(None) };
         if new_dc.0.is_null() {
             self.screen_dc = HDC(null_mut());
             return Err(CaptureError::platform(anyhow::anyhow!(
@@ -1162,7 +1162,7 @@ impl GdiResources {
             }
         }
 
-        let new_mem_dc = unsafe { CreateCompatibleDC(self.screen_dc) };
+        let new_mem_dc = unsafe { CreateCompatibleDC(Some(self.screen_dc)) };
         if new_mem_dc.0.is_null() {
             self.mem_dc = HDC(null_mut());
             return Err(CaptureError::platform(anyhow::anyhow!(
@@ -1178,7 +1178,7 @@ impl GdiResources {
             && !window_dc.0.is_null()
         {
             unsafe {
-                let _ = ReleaseDC(owner, window_dc);
+                let _ = ReleaseDC(Some(owner), window_dc);
             }
         }
     }
@@ -1193,7 +1193,7 @@ impl GdiResources {
 
         self.release_window_dc();
 
-        let window_dc = unsafe { GetWindowDC(hwnd) };
+        let window_dc = unsafe { GetWindowDC(Some(hwnd)) };
         if window_dc.0.is_null() {
             return Err(CaptureError::platform(anyhow::anyhow!(
                 "GetWindowDC returned null during GDI window capture"
@@ -1218,11 +1218,11 @@ impl GdiResources {
         let mut bits: *mut c_void = null_mut();
         let bitmap = unsafe {
             CreateDIBSection(
-                self.mem_dc,
+                Some(self.mem_dc),
                 &info,
                 DIB_RGB_COLORS,
                 &mut bits,
-                HANDLE::default(),
+                Some(HANDLE::default()),
                 0,
             )
         }
@@ -1230,7 +1230,7 @@ impl GdiResources {
         .map_err(CaptureError::platform)?;
         if bits.is_null() {
             unsafe {
-                let _ = DeleteObject(bitmap);
+                let _ = DeleteObject(bitmap.into());
             }
             return Err(CaptureError::platform(anyhow::anyhow!(
                 "CreateDIBSection returned a null pixel buffer"
@@ -1267,7 +1267,7 @@ impl GdiResources {
             return Ok(());
         }
 
-        let selected = unsafe { SelectObject(self.mem_dc, next_bitmap) };
+        let selected = unsafe { SelectObject(self.mem_dc, next_bitmap.into()) };
         if selected.0.is_null() {
             return Err(CaptureError::platform(anyhow::anyhow!(
                 "SelectObject failed during gdi history surface swap"
@@ -1275,7 +1275,7 @@ impl GdiResources {
         }
         if selected.0 != current_bitmap.0 {
             unsafe {
-                let _ = SelectObject(self.mem_dc, current_bitmap);
+                let _ = SelectObject(self.mem_dc, current_bitmap.into());
             }
             return Err(CaptureError::platform(anyhow::anyhow!(
                 "unexpected object selected during gdi history surface swap"
@@ -1304,10 +1304,10 @@ impl GdiResources {
 
         let (bitmap, bits) = self.create_dib_bitmap(width, height)?;
 
-        let selected = unsafe { SelectObject(self.mem_dc, bitmap) };
+        let selected = unsafe { SelectObject(self.mem_dc, bitmap.into()) };
         if selected.0.is_null() {
             unsafe {
-                let _ = DeleteObject(bitmap);
+                let _ = DeleteObject(bitmap.into());
             }
             return Err(CaptureError::platform(anyhow::anyhow!(
                 "SelectObject failed for gdi capture bitmap"
@@ -2014,7 +2014,7 @@ impl GdiResources {
                 0,
                 geometry.width,
                 geometry.height,
-                self.screen_dc,
+                Some(self.screen_dc),
                 geometry.left,
                 geometry.top,
                 SRCCOPY,
@@ -2072,7 +2072,7 @@ impl GdiResources {
                 0,
                 copy_w_i32,
                 copy_h_i32,
-                self.screen_dc,
+                Some(self.screen_dc),
                 source_x,
                 source_y,
                 SRCCOPY,
@@ -2331,7 +2331,7 @@ impl GdiResources {
         match path {
             WindowCapturePath::WindowDcBitBlt => {
                 let window_dc = self.acquire_window_dc(hwnd)?;
-                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY) }
+                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, Some(window_dc), 0, 0, SRCCOPY) }
                     .context("BitBlt failed during GDI window capture")
                     .map_err(CaptureError::platform)?;
                 Ok(())
@@ -2358,12 +2358,12 @@ impl GdiResources {
         }
         if let Some(capture_bitmap) = self.capture_bitmap.take() {
             unsafe {
-                let _ = DeleteObject(capture_bitmap);
+                let _ = DeleteObject(capture_bitmap.into());
             }
         }
         if let Some(history_bitmap) = self.history_bitmap.take() {
             unsafe {
-                let _ = DeleteObject(history_bitmap);
+                let _ = DeleteObject(history_bitmap.into());
             }
         }
         self.bits = null_mut();
@@ -2387,7 +2387,7 @@ impl GdiResources {
     fn trim_incremental_history_for_screenshot(&mut self) {
         if let Some(history_bitmap) = self.history_bitmap.take() {
             unsafe {
-                let _ = DeleteObject(history_bitmap);
+                let _ = DeleteObject(history_bitmap.into());
             }
         }
         self.history_bits = null_mut();
@@ -2421,7 +2421,7 @@ impl Drop for GdiResources {
         }
         if !self.screen_dc.0.is_null() {
             unsafe {
-                let _ = ReleaseDC(HWND(null_mut()), self.screen_dc);
+                let _ = ReleaseDC(None, self.screen_dc);
             }
         }
     }
@@ -2615,7 +2615,7 @@ impl WindowsWindowCapturer {
                 window.stable_id()
             )));
         }
-        if !unsafe { IsWindow(hwnd) }.as_bool() {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return Err(CaptureError::InvalidTarget(format!(
                 "window handle is not valid: {}",
                 window.stable_id()
@@ -2690,7 +2690,7 @@ impl MonitorCapturer for WindowsWindowCapturer {
         reuse: Option<Frame>,
         destination_has_history: bool,
     ) -> CaptureResult<Frame> {
-        if !unsafe { IsWindow(self.hwnd) }.as_bool() {
+        if !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
             return Err(CaptureError::InvalidTarget(
                 "window no longer exists".into(),
             ));

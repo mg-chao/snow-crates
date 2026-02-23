@@ -8,12 +8,12 @@ default = []
 tokio-stream = ["dep:tokio"]
 
 [dependencies]
-anyhow = "1.0.97"
-rustc-hash = "2"
-half = "2.4.1"
-rayon = "1.10.0"
-tokio = { version = "1", features = ["sync", "rt", "macros"], optional = true }
-windows = { version = "0.58.0", features = [
+anyhow.workspace = true
+rustc-hash.workspace = true
+half.workspace = true
+rayon.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"], optional = true }
+windows = { workspace = true, features = [
     "Foundation",
     "Foundation_Collections",
     "Graphics_Capture",
@@ -39,7 +39,7 @@ windows = { version = "0.58.0", features = [
 ] }
 
 [dev-dependencies]
-image = { version = "0.25.6", default-features = false, features = ["png"] }
+image.workspace = true
 
 [[example]]
 name = "capture"
