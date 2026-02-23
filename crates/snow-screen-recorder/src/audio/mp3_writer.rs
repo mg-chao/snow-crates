@@ -4,11 +4,13 @@ use std::path::Path;
 
 use shine_rs::{Mp3Encoder, Mp3EncoderConfig, StereoMode};
 
+use crate::audio::sanitize_samples_for_mp3;
 use crate::error::{Result, ScreenRecorderError};
 
 pub struct Mp3FileWriter {
     encoder: Mp3Encoder,
     writer: BufWriter<File>,
+    channels: usize,
 }
 
 impl Mp3FileWriter {
@@ -34,7 +36,11 @@ impl Mp3FileWriter {
             .map_err(|e| ScreenRecorderError::Encode(format!("failed to init mp3 encoder: {e}")))?;
         let writer = BufWriter::new(File::create(path)?);
 
-        Ok(Self { encoder, writer })
+        Ok(Self {
+            encoder,
+            writer,
+            channels: usize::from(channels),
+        })
     }
 
     pub fn append_i16_le_bytes(&mut self, bytes: &[u8]) -> Result<()> {
@@ -51,6 +57,15 @@ impl Mp3FileWriter {
         let mut samples = Vec::with_capacity(bytes.len() / 2);
         for chunk in bytes.chunks_exact(2) {
             samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        sanitize_samples_for_mp3(&mut samples);
+
+        if samples.len() % self.channels != 0 {
+            return Err(ScreenRecorderError::Encode(format!(
+                "PCM samples are not channel-aligned ({} samples for {} channels)",
+                samples.len(),
+                self.channels
+            )));
         }
 
         let encoded_frames = self
@@ -77,5 +92,34 @@ impl Mp3FileWriter {
 
         self.writer.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn writer_accepts_min_i16_samples() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("snow-mp3-writer-{suffix}.mp3"));
+
+        let mut writer = Mp3FileWriter::create(&path, 48_000, 2, 192).unwrap();
+        let mut pcm = Vec::new();
+        for _ in 0..4_096 {
+            pcm.extend_from_slice(&i16::MIN.to_le_bytes());
+            pcm.extend_from_slice(&i16::MIN.to_le_bytes());
+        }
+        writer.append_i16_le_bytes(&pcm).unwrap();
+        writer.finish().unwrap();
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 0);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use minimp3_fixed::{Decoder, Error as Mp3DecodeError, Frame};
 use shine_rs::{Mp3Encoder, Mp3EncoderConfig, StereoMode};
 
+use crate::audio::sanitize_samples_for_mp3;
 use crate::error::{Result, ScreenRecorderError};
 
 #[derive(Clone, Debug)]
@@ -202,6 +203,20 @@ pub fn encode_pcm_to_mp3(
         return Ok(Vec::new());
     }
 
+    if channels == 0 {
+        return Err(ScreenRecorderError::Encode(
+            "channel count must be greater than zero".to_string(),
+        ));
+    }
+    let channels_usize = usize::from(channels);
+    if pcm_interleaved.len() % channels_usize != 0 {
+        return Err(ScreenRecorderError::Encode(format!(
+            "PCM samples are not channel-aligned ({} samples for {} channels)",
+            pcm_interleaved.len(),
+            channels
+        )));
+    }
+
     let stereo_mode = if channels == 1 {
         StereoMode::Mono
     } else {
@@ -219,9 +234,13 @@ pub fn encode_pcm_to_mp3(
 
     let frame_samples = encoder.samples_per_frame();
     let mut output = Vec::new();
+    let mut sanitized = Vec::with_capacity(frame_samples);
     for chunk in pcm_interleaved.chunks(frame_samples) {
+        sanitized.clear();
+        sanitized.extend_from_slice(chunk);
+        sanitize_samples_for_mp3(&mut sanitized);
         let encoded = encoder
-            .encode_interleaved(chunk)
+            .encode_interleaved(&sanitized)
             .map_err(|e| ScreenRecorderError::Encode(format!("mp3 encode failed: {e}")))?;
         for frame in encoded {
             output.extend_from_slice(&frame);
@@ -233,4 +252,27 @@ pub fn encode_pcm_to_mp3(
         .map_err(|e| ScreenRecorderError::Encode(format!("mp3 finalize failed: {e}")))?;
     output.extend_from_slice(&tail);
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_pcm_handles_min_i16_samples() {
+        let mut pcm = Vec::new();
+        for _ in 0..4_096 {
+            pcm.push(i16::MIN);
+            pcm.push(i16::MIN);
+        }
+
+        let encoded = encode_pcm_to_mp3(&pcm, 48_000, 2, 192).unwrap();
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn encode_pcm_requires_channel_alignment() {
+        let err = encode_pcm_to_mp3(&[1, 2, 3], 48_000, 2, 192).unwrap_err();
+        assert!(matches!(err, ScreenRecorderError::Encode(_)));
+    }
 }
