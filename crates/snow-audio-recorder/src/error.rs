@@ -77,6 +77,58 @@ impl std::error::Error for AudioError {
 
 pub type AudioResult<T> = Result<T, AudioError>;
 
+/// Error returned by [`AudioStreamHandle::recv`] when the stream has closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecvError;
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "audio stream closed")
+    }
+}
+
+impl std::error::Error for RecvError {}
+
+/// Error returned by [`AudioStreamHandle::try_recv`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// No events are available right now.
+    Empty,
+    /// The stream has closed and no further events will arrive.
+    Closed,
+}
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "no audio event available"),
+            Self::Closed => write!(f, "audio stream closed"),
+        }
+    }
+}
+
+impl std::error::Error for TryRecvError {}
+
+/// Error returned by [`AudioStreamHandle::recv_timeout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecvTimeoutError {
+    /// The timeout elapsed before an event arrived.
+    Timeout,
+    /// The stream has closed and no further events will arrive.
+    Closed,
+}
+
+impl fmt::Display for RecvTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "audio recv timed out"),
+            Self::Closed => write!(f, "audio stream closed"),
+        }
+    }
+}
+
+impl std::error::Error for RecvTimeoutError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

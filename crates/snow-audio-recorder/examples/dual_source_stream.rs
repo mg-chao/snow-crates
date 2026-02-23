@@ -1,7 +1,7 @@
 ﻿use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use snow_audio_recorder::{AudioEvent, AudioSession, AudioStreamConfig};
+use snow_audio_recorder::{AudioEvent, AudioSession, AudioStreamConfig, RecvTimeoutError};
 
 fn main() -> Result<()> {
     let session = AudioSession::new()?;
@@ -55,9 +55,18 @@ fn main() -> Result<()> {
                 println!("stream ended");
                 break;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                println!("stream disconnected");
+            Ok(AudioEvent::BufferPressure {
+                fill_ratio,
+                buffer_depth,
+            }) => {
+                println!(
+                    "buffer pressure: {:.0}% full (depth={buffer_depth})",
+                    fill_ratio * 100.0
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Closed) => {
+                println!("stream closed");
                 break;
             }
         }

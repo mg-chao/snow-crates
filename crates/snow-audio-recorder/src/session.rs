@@ -76,6 +76,10 @@ pub struct AudioStreamConfig {
     pub event_buffer_depth: usize,
     pub max_consecutive_errors: usize,
     pub restart_policy: RestartPolicy,
+    /// Fill ratio (`0.0..=1.0`) at which a `BufferPressure` event is emitted.
+    /// Set to `1.0` to disable proactive pressure notifications.
+    /// Defaults to `0.75`.
+    pub backpressure_threshold: f64,
 }
 
 impl Default for AudioStreamConfig {
@@ -86,6 +90,7 @@ impl Default for AudioStreamConfig {
             event_buffer_depth: 128,
             max_consecutive_errors: 30,
             restart_policy: RestartPolicy::default(),
+            backpressure_threshold: 0.75,
         }
     }
 }
@@ -129,6 +134,12 @@ impl AudioStreamConfig {
         if self.restart_policy.initial_backoff > self.restart_policy.max_backoff {
             return Err(crate::error::AudioError::InvalidConfig(
                 "restart initial_backoff must be <= max_backoff".into(),
+            ));
+        }
+
+        if !(0.0..=1.0).contains(&self.backpressure_threshold) {
+            return Err(crate::error::AudioError::InvalidConfig(
+                "backpressure_threshold must be between 0.0 and 1.0".into(),
             ));
         }
 

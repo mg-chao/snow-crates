@@ -2,12 +2,18 @@ use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+use crate::error::{RecvError, RecvTimeoutError, TryRecvError};
 use crate::packet::AudioEvent;
 
 /// Returns `true` for control-plane events that must never be silently dropped.
 /// Data-plane events (`Packet`, `PacketDropped`) are bounded and droppable.
+/// `BufferPressure` is a control event — it rides the unbounded lane so it
+/// is never evicted by the very pressure it reports.
 pub(crate) fn is_control_event(event: &AudioEvent) -> bool {
-    !matches!(event, AudioEvent::Packet(_) | AudioEvent::PacketDropped { .. })
+    !matches!(
+        event,
+        AudioEvent::Packet(_) | AudioEvent::PacketDropped { .. }
+    )
 }
 
 struct QueueState {
@@ -93,41 +99,41 @@ impl EventQueue {
         PushOutcome { dropped, len }
     }
 
-    pub fn recv(&self) -> Result<(AudioEvent, usize), std::sync::mpsc::RecvError> {
+    pub fn recv(&self) -> Result<(AudioEvent, usize), RecvError> {
         let mut guard = self.state.lock().unwrap();
         loop {
             if let Some(event) = guard.pop_next() {
                 return Ok((event, guard.total_len()));
             }
             if guard.closed {
-                return Err(std::sync::mpsc::RecvError);
+                return Err(RecvError);
             }
             guard = self.cv.wait(guard).unwrap();
         }
     }
 
-    pub fn try_recv(&self) -> Result<(AudioEvent, usize), std::sync::mpsc::TryRecvError> {
+    pub fn try_recv(&self) -> Result<(AudioEvent, usize), TryRecvError> {
         let mut guard = self.state.lock().unwrap();
         if let Some(event) = guard.pop_next() {
             return Ok((event, guard.total_len()));
         }
         if guard.closed {
-            return Err(std::sync::mpsc::TryRecvError::Disconnected);
+            return Err(TryRecvError::Closed);
         }
-        Err(std::sync::mpsc::TryRecvError::Empty)
+        Err(TryRecvError::Empty)
     }
 
     pub fn recv_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<(AudioEvent, usize), std::sync::mpsc::RecvTimeoutError> {
+    ) -> Result<(AudioEvent, usize), RecvTimeoutError> {
         let mut guard = self.state.lock().unwrap();
         if let Some(event) = guard.pop_next() {
             return Ok((event, guard.total_len()));
         }
 
         if guard.closed {
-            return Err(std::sync::mpsc::RecvTimeoutError::Disconnected);
+            return Err(RecvTimeoutError::Closed);
         }
 
         let (mut guard, wait_result) = self
@@ -140,13 +146,13 @@ impl EventQueue {
         }
 
         if guard.closed {
-            return Err(std::sync::mpsc::RecvTimeoutError::Disconnected);
+            return Err(RecvTimeoutError::Closed);
         }
 
         if wait_result.timed_out() {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            Err(RecvTimeoutError::Timeout)
         } else {
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            Err(RecvTimeoutError::Closed)
         }
     }
 
@@ -274,6 +280,44 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AudioEvent::Packet(p) if p.metadata.sequence == 4)),
             "latest packet should survive in the data lane"
+        );
+    }
+
+    #[test]
+    fn buffer_pressure_is_control_event() {
+        let event = AudioEvent::BufferPressure {
+            fill_ratio: 0.8,
+            buffer_depth: 128,
+        };
+        assert!(
+            is_control_event(&event),
+            "BufferPressure must be a control event so it is never evicted"
+        );
+    }
+
+    #[test]
+    fn buffer_pressure_survives_full_data_lane() {
+        let queue = EventQueue::new(2);
+
+        // Fill the data lane completely.
+        queue.push(AudioEvent::Packet(packet(1)));
+        queue.push(AudioEvent::Packet(packet(2)));
+
+        // Push a BufferPressure event — it should go into the control lane.
+        let outcome = queue.push(AudioEvent::BufferPressure {
+            fill_ratio: 1.0,
+            buffer_depth: 2,
+        });
+        assert!(
+            outcome.dropped.is_none(),
+            "BufferPressure should not evict anything"
+        );
+
+        // Control events are delivered first.
+        let first = queue.recv().unwrap().0;
+        assert!(
+            matches!(first, AudioEvent::BufferPressure { .. }),
+            "BufferPressure should be delivered before data events"
         );
     }
 }
