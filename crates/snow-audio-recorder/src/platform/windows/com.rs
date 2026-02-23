@@ -9,7 +9,7 @@ fn platform_err<E>(err: E) -> AudioError
 where
     E: Into<anyhow::Error>,
 {
-    AudioError::Platform(err.into())
+    AudioError::platform(err)
 }
 
 pub(crate) struct CoInitGuard {
@@ -27,7 +27,7 @@ impl CoInitGuard {
 
         hr.ok()
             .context("failed to initialize COM with CoInitializeEx(COINIT_MULTITHREADED)")
-            .map_err(AudioError::Platform)?;
+            .map_err(AudioError::platform)?;
 
         Ok(Self {
             should_uninit: true,
@@ -89,7 +89,7 @@ impl Drop for EventHandle {
 
 pub(crate) fn pwstr_to_string_and_free(value: windows::core::PWSTR) -> AudioResult<String> {
     if value.is_null() {
-        return Err(AudioError::Platform(anyhow::anyhow!(
+        return Err(AudioError::platform(anyhow::anyhow!(
             "received null PWSTR from COM"
         )));
     }

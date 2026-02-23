@@ -20,7 +20,7 @@ fn platform_err<E>(err: E) -> AudioError
 where
     E: Into<anyhow::Error>,
 {
-    AudioError::Platform(err.into())
+    AudioError::platform(err)
 }
 
 pub(crate) fn create_device_enumerator() -> AudioResult<IMMDeviceEnumerator> {

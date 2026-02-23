@@ -1,6 +1,7 @@
 ﻿use std::fmt;
+use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum AudioError {
     InvalidConfig(String),
     DeviceUnavailable(String),
@@ -11,7 +12,7 @@ pub enum AudioError {
     WorkerDead,
     Canceled,
     BackendUnavailable(String),
-    Platform(anyhow::Error),
+    Platform(Arc<anyhow::Error>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +24,13 @@ pub enum AudioErrorClass {
 }
 
 impl AudioError {
+    /// Wrap an `anyhow::Error` (or anything convertible to one) in the
+    /// `Platform` variant. The inner error is stored behind an `Arc` so
+    /// that `AudioError` remains `Clone`.
+    pub fn platform(err: impl Into<anyhow::Error>) -> Self {
+        Self::Platform(Arc::new(err.into()))
+    }
+
     pub fn class(&self) -> AudioErrorClass {
         match self {
             Self::InvalidConfig(_) | Self::DeviceUnavailable(_) => AudioErrorClass::InvalidInput,
@@ -38,21 +46,6 @@ impl AudioError {
 
     pub fn requires_worker_reset(&self) -> bool {
         matches!(self, Self::DeviceLost | Self::WorkerDead)
-    }
-
-    pub fn to_sendable(&self) -> Self {
-        match self {
-            Self::InvalidConfig(v) => Self::InvalidConfig(v.clone()),
-            Self::DeviceUnavailable(v) => Self::DeviceUnavailable(v.clone()),
-            Self::DeviceLost => Self::DeviceLost,
-            Self::AccessDenied => Self::AccessDenied,
-            Self::UnsupportedFormat(v) => Self::UnsupportedFormat(v.clone()),
-            Self::BufferOverflow => Self::BufferOverflow,
-            Self::WorkerDead => Self::WorkerDead,
-            Self::Canceled => Self::Canceled,
-            Self::BackendUnavailable(v) => Self::BackendUnavailable(v.clone()),
-            Self::Platform(err) => Self::Platform(anyhow::anyhow!("{err:#}")),
-        }
     }
 }
 
@@ -76,7 +69,7 @@ impl fmt::Display for AudioError {
 impl std::error::Error for AudioError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Platform(inner) => Some(inner.as_ref()),
+            Self::Platform(inner) => Some(inner.as_ref().as_ref()),
             _ => None,
         }
     }
@@ -97,10 +90,10 @@ mod tests {
     }
 
     #[test]
-    fn sendable_platform_error_flattens_chain() {
-        let err = AudioError::Platform(anyhow::anyhow!("root cause"));
-        let sendable = err.to_sendable();
-        let rendered = sendable.to_string();
+    fn platform_error_clone_preserves_message() {
+        let err = AudioError::platform(anyhow::anyhow!("root cause"));
+        let cloned = err.clone();
+        let rendered = cloned.to_string();
         assert!(rendered.contains("root cause"));
     }
 }

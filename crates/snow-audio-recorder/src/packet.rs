@@ -28,7 +28,7 @@ pub struct AudioPacket {
     pub metadata: AudioPacketMetadata,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum AudioEvent {
     Packet(AudioPacket),
     PacketDropped {

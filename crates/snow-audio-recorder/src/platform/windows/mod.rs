@@ -307,7 +307,7 @@ impl AudioRecorderEngine for WasapiEngine {
         }
 
         if wait_result == WAIT_FAILED {
-            return Err(AudioError::Platform(anyhow::anyhow!(
+            return Err(AudioError::platform(anyhow::anyhow!(
                 "WaitForMultipleObjects failed"
             )));
         }

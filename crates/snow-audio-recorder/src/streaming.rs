@@ -269,7 +269,7 @@ impl AudioStreamHandle {
                 );
             })
             .map_err(|err| {
-                AudioError::Platform(anyhow::anyhow!(
+                AudioError::platform(anyhow::anyhow!(
                     "failed to spawn audio stream thread: {err}"
                 ))
             })?;
@@ -426,14 +426,14 @@ fn stream_loop(
                 consecutive_errors += 1;
                 stats.errors_recovered.fetch_add(1, Ordering::Relaxed);
                 if consecutive_errors >= config.max_consecutive_errors {
-                    push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.to_sendable()));
+                    push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.clone()));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(16));
                 continue;
             }
             Err(err) => {
-                push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.to_sendable()));
+                push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.clone()));
                 break;
             }
         }
@@ -525,7 +525,7 @@ mod tests {
                 match ev {
                     EngineEvent::Idle => Ok(EngineEvent::Idle),
                     EngineEvent::Events(events) => {
-                        let cloned = events.iter().map(clone_event).collect();
+                        let cloned = events.iter().map(|e| e.clone()).collect();
                         Ok(EngineEvent::Events(cloned))
                     }
                 }
@@ -533,34 +533,6 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 Ok(EngineEvent::Idle)
             }
-        }
-    }
-
-    fn clone_event(event: &AudioEvent) -> AudioEvent {
-        match event {
-            AudioEvent::Packet(packet) => AudioEvent::Packet(packet.clone()),
-            AudioEvent::PacketDropped {
-                source,
-                dropped_frames,
-            } => AudioEvent::PacketDropped {
-                source: *source,
-                dropped_frames: *dropped_frames,
-            },
-            AudioEvent::SourceRestarted {
-                source,
-                old_device_id,
-                new_device_id,
-                downtime,
-            } => AudioEvent::SourceRestarted {
-                source: *source,
-                old_device_id: old_device_id.clone(),
-                new_device_id: new_device_id.clone(),
-                downtime: *downtime,
-            },
-            AudioEvent::Paused { at } => AudioEvent::Paused { at: *at },
-            AudioEvent::Resumed { at, gap } => AudioEvent::Resumed { at: *at, gap: *gap },
-            AudioEvent::StreamEnded => AudioEvent::StreamEnded,
-            AudioEvent::Error(err) => AudioEvent::Error(err.to_sendable()),
         }
     }
 

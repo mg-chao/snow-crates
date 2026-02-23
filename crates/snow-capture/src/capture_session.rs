@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -874,7 +874,7 @@ mod tests {
         ) -> CaptureResult<Option<CaptureSampleMetadata>> {
             *self.desktop_calls.lock().unwrap() += 1;
             if self.desktop_should_error {
-                return Err(CaptureError::Platform(anyhow::anyhow!(
+                return Err(CaptureError::platform(anyhow::anyhow!(
                     "mock desktop direct failure"
                 )));
             }

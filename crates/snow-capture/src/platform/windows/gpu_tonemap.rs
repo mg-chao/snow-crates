@@ -1,4 +1,4 @@
-use anyhow::Context;
+﻿use anyhow::Context;
 use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC,
@@ -29,11 +29,11 @@ const PRECOMPILED_CSO: &[u8] = include_bytes!(env!("TONEMAP_CSO_PATH"));
 #[cfg(has_precompiled_shader_1d)]
 const PRECOMPILED_1D_CSO: &[u8] = include_bytes!(env!("TONEMAP_1D_CSO_PATH"));
 
-/// Pre-compiled F16→sRGB shader bytecode.
+/// Pre-compiled F16鈫抯RGB shader bytecode.
 #[cfg(has_precompiled_shader_f16)]
 const PRECOMPILED_F16_CSO: &[u8] = include_bytes!(env!("F16_CONVERT_CSO_PATH"));
 
-/// Pre-compiled F16→sRGB 1D shader bytecode.
+/// Pre-compiled F16鈫抯RGB 1D shader bytecode.
 #[cfg(has_precompiled_shader_f16_1d)]
 const PRECOMPILED_F16_1D_CSO: &[u8] = include_bytes!(env!("F16_CONVERT_1D_CSO_PATH"));
 
@@ -74,7 +74,7 @@ fn cached_bytecode_1d() -> &'static CaptureResult<Vec<u8>> {
     })
 }
 
-/// Returns cached F16→sRGB shader bytecode.
+/// Returns cached F16鈫抯RGB shader bytecode.
 fn cached_bytecode_f16() -> &'static CaptureResult<Vec<u8>> {
     static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
     BYTECODE.get_or_init(|| {
@@ -89,7 +89,7 @@ fn cached_bytecode_f16() -> &'static CaptureResult<Vec<u8>> {
     })
 }
 
-/// Returns cached F16→sRGB 1D shader bytecode.
+/// Returns cached F16鈫抯RGB 1D shader bytecode.
 fn cached_bytecode_f16_1d() -> &'static CaptureResult<Vec<u8>> {
     static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
     BYTECODE.get_or_init(|| {
@@ -145,13 +145,13 @@ fn compile_shader_runtime_with_entry(entry: &[u8]) -> CaptureResult<Vec<u8>> {
                 String::from_utf8_lossy(slice).to_string()
             })
             .unwrap_or_default();
-        return Err(CaptureError::Platform(
+        return Err(CaptureError::platform(
             anyhow::anyhow!("HLSL compile failed: {msg}").context(e.to_string()),
         ));
     }
 
     let blob =
-        blob.ok_or_else(|| CaptureError::Platform(anyhow::anyhow!("D3DCompile returned no blob")))?;
+        blob.ok_or_else(|| CaptureError::platform(anyhow::anyhow!("D3DCompile returned no blob")))?;
     let ptr = unsafe { blob.GetBufferPointer() } as *const u8;
     let len = unsafe { blob.GetBufferSize() };
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
@@ -171,18 +171,18 @@ struct GpuParams {
 }
 
 /// Threshold below which we use the 1D dispatch path.
-/// For textures smaller than 512px on either axis, the 16×16 thread
+/// For textures smaller than 512px on either axis, the 16脳16 thread
 /// groups waste significant threads on boundary tiles.
 const SMALL_TEXTURE_THRESHOLD: u32 = 512;
 
 /// Shared GPU compute-shader pass infrastructure.
 ///
 /// Encapsulates the D3D11 resources and caching logic common to both
-/// HDR tonemapping and F16→sRGB conversion: shader objects, output
+/// HDR tonemapping and F16鈫抯RGB conversion: shader objects, output
 /// texture/UAV management, SRV caching, and the dispatch call.
 struct GpuComputePass {
     cs: ID3D11ComputeShader,
-    /// 1D compute shader for small textures (256×1 thread groups).
+    /// 1D compute shader for small textures (256脳1 thread groups).
     cs_1d: Option<ID3D11ComputeShader>,
     cbuf: ID3D11Buffer,
     output_tex: Option<ID3D11Texture2D>,
@@ -208,10 +208,10 @@ impl GpuComputePass {
         let mut cs: Option<ID3D11ComputeShader> = None;
         unsafe { device.CreateComputeShader(bytecode, None, Some(&mut cs)) }
             .context(format!("CreateComputeShader ({label}) failed"))
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let cs = cs
             .context(format!("CreateComputeShader ({label}) returned None"))
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         let cs_1d = bytecode_1d.and_then(|bc| {
             let mut shader: Option<ID3D11ComputeShader> = None;
@@ -229,10 +229,10 @@ impl GpuComputePass {
         let mut cbuf: Option<ID3D11Buffer> = None;
         unsafe { device.CreateBuffer(&cbuf_desc, None, Some(&mut cbuf)) }
             .context(format!("CreateBuffer ({label}) for constant buffer failed"))
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let cbuf = cbuf
             .context(format!("CreateBuffer ({label}) returned None"))
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         Ok(Self {
             cs,
@@ -275,18 +275,18 @@ impl GpuComputePass {
         let mut tex: Option<ID3D11Texture2D> = None;
         unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
             .context("CreateTexture2D for compute output failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let tex = tex
             .context("CreateTexture2D returned None")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         let mut uav: Option<ID3D11UnorderedAccessView> = None;
         unsafe { device.CreateUnorderedAccessView(&tex, None, Some(&mut uav)) }
             .context("CreateUnorderedAccessView failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let uav = uav
             .context("CreateUnorderedAccessView returned None")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         self.output_tex = Some(tex);
         self.output_uav = Some(uav);
@@ -311,10 +311,10 @@ impl GpuComputePass {
         let mut srv: Option<ID3D11ShaderResourceView> = None;
         unsafe { device.CreateShaderResourceView(source, None, Some(&mut srv)) }
             .context("CreateShaderResourceView for source failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         let srv = srv
             .context("CreateShaderResourceView returned None")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
 
         self.cached_srv = Some(srv.clone());
         self.cached_srv_source = source_ptr;
@@ -330,7 +330,7 @@ impl GpuComputePass {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe { context.Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped)) }
             .context("Map constant buffer failed")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 gpu_params as *const GpuParams as *const u8,
@@ -389,14 +389,14 @@ impl GpuComputePass {
 pub(crate) struct GpuTonemapper {
     pass: GpuComputePass,
     /// Combined cache of tonemap params and dimensions written to the
-    /// constant buffer — skip the update when neither has changed.
+    /// constant buffer 鈥?skip the update when neither has changed.
     cached_cbuf_state: Option<(HdrToSdrParams, u32, u32)>,
 }
 
 impl GpuTonemapper {
     pub(crate) fn new(device: &ID3D11Device) -> CaptureResult<Self> {
         let bytecode = cached_bytecode().as_ref().map_err(|e| {
-            CaptureError::Platform(anyhow::anyhow!("shader compilation failed: {e}"))
+            CaptureError::platform(anyhow::anyhow!("shader compilation failed: {e}"))
         })?;
         let bytecode_1d = cached_bytecode_1d().as_ref().ok().map(|v| v.as_slice());
 
@@ -447,7 +447,7 @@ impl GpuTonemapper {
     }
 }
 
-/// GPU-accelerated F16 linear → sRGB conversion (no HDR tonemapping).
+/// GPU-accelerated F16 linear 鈫?sRGB conversion (no HDR tonemapping).
 ///
 /// Used when the source is RGBA16Float but no HDR-to-SDR tonemap is needed.
 /// Converts linear light values directly to sRGB gamma on the GPU, so the
@@ -459,7 +459,7 @@ pub(crate) struct GpuF16Converter {
 impl GpuF16Converter {
     pub(crate) fn new(device: &ID3D11Device) -> CaptureResult<Self> {
         let bytecode = cached_bytecode_f16().as_ref().map_err(|e| {
-            CaptureError::Platform(anyhow::anyhow!("F16 shader compilation failed: {e}"))
+            CaptureError::platform(anyhow::anyhow!("F16 shader compilation failed: {e}"))
         })?;
         let bytecode_1d = cached_bytecode_f16_1d().as_ref().ok().map(|v| v.as_slice());
 
@@ -480,7 +480,7 @@ impl GpuF16Converter {
         let height = source_desc.Height;
         self.pass.ensure_output(device, width, height)?;
 
-        // F16 converter only needs dimensions — HDR fields are zeroed.
+        // F16 converter only needs dimensions 鈥?HDR fields are zeroed.
         let gpu_params = GpuParams {
             hdr_paper_white_nits: 0.0,
             hdr_maximum_nits: 0.0,

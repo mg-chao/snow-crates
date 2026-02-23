@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+﻿use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -83,7 +83,7 @@ impl DisplayInfoCache {
     /// Return a snapshot of the cached monitor list.
     pub(crate) fn monitors(&self) -> CaptureResult<Vec<MonitorId>> {
         let state = self.state.read().map_err(|_| {
-            CaptureError::Platform(anyhow::anyhow!("display cache rwlock was poisoned"))
+            CaptureError::platform(anyhow::anyhow!("display cache rwlock was poisoned"))
         })?;
         if state.monitors.is_empty() {
             drop(state);
@@ -95,13 +95,13 @@ impl DisplayInfoCache {
     /// Return a snapshot of the cached resolved monitors.
     pub(crate) fn resolved(&self) -> CaptureResult<Vec<ResolvedMonitor>> {
         let state = self.state.read().map_err(|_| {
-            CaptureError::Platform(anyhow::anyhow!("display cache rwlock was poisoned"))
+            CaptureError::platform(anyhow::anyhow!("display cache rwlock was poisoned"))
         })?;
         if state.resolved.is_empty() {
             drop(state);
             self.refresh()?;
             let state = self.state.read().map_err(|_| {
-                CaptureError::Platform(anyhow::anyhow!("display cache rwlock was poisoned"))
+                CaptureError::platform(anyhow::anyhow!("display cache rwlock was poisoned"))
             })?;
             return Ok(state.resolved.clone());
         }
@@ -115,7 +115,7 @@ impl DisplayInfoCache {
         let monitors = super::monitor::to_monitor_ids(&resolved);
 
         let mut state = self.state.write().map_err(|_| {
-            CaptureError::Platform(anyhow::anyhow!("display cache rwlock was poisoned"))
+            CaptureError::platform(anyhow::anyhow!("display cache rwlock was poisoned"))
         })?;
         state.monitors = monitors;
         state.resolved = resolved;
@@ -129,7 +129,7 @@ impl DisplayInfoCache {
     fn refresh_and_get_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
         self.refresh()?;
         let state = self.state.read().map_err(|_| {
-            CaptureError::Platform(anyhow::anyhow!("display cache rwlock was poisoned"))
+            CaptureError::platform(anyhow::anyhow!("display cache rwlock was poisoned"))
         })?;
         Ok(state.monitors.clone())
     }
@@ -148,7 +148,7 @@ impl DisplayInfoCache {
                 listener_thread_main(cache_ptr, hwnd_tx);
             })
             .map_err(|e| {
-                CaptureError::Platform(anyhow::anyhow!(
+                CaptureError::platform(anyhow::anyhow!(
                     "failed to spawn display change listener thread: {e}"
                 ))
             })?;
@@ -156,12 +156,12 @@ impl DisplayInfoCache {
         let hwnd_raw = hwnd_rx
             .recv()
             .map_err(|_| {
-                CaptureError::Platform(anyhow::anyhow!(
+                CaptureError::platform(anyhow::anyhow!(
                     "display change listener thread exited before sending HWND"
                 ))
             })?
             .map_err(|e| {
-                CaptureError::Platform(anyhow::anyhow!(
+                CaptureError::platform(anyhow::anyhow!(
                     "display change listener failed to create window: {e}"
                 ))
             })?;
@@ -241,7 +241,7 @@ fn create_listener_window(cache_ptr: usize) -> CaptureResult<HWND> {
 
     let hinstance = unsafe { GetModuleHandleW(None) }
         .context("GetModuleHandleW failed")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
 
     let wc = WNDCLASSW {
         lpfnWndProc: Some(display_change_wnd_proc),
@@ -273,7 +273,7 @@ fn create_listener_window(cache_ptr: usize) -> CaptureResult<HWND> {
         )
     }
     .context("CreateWindowExW for display change listener failed")
-    .map_err(CaptureError::Platform)?;
+    .map_err(CaptureError::platform)?;
 
     Ok(hwnd)
 }

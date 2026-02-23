@@ -322,7 +322,7 @@ impl WasapiSource {
                         .convert_chunk(&self.silence_scratch, frames)
                 } else {
                     if data_ptr.is_null() {
-                        return Err(AudioError::Platform(anyhow::anyhow!(
+                        return Err(AudioError::platform(anyhow::anyhow!(
                             "WASAPI returned null audio buffer pointer"
                         )));
                     }

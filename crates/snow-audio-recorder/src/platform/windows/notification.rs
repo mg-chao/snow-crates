@@ -15,7 +15,7 @@ fn platform_err<E>(err: E) -> AudioError
 where
     E: Into<anyhow::Error>,
 {
-    AudioError::Platform(err.into())
+    AudioError::platform(err)
 }
 
 #[derive(Default)]

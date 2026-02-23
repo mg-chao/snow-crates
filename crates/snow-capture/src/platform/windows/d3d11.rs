@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+﻿use anyhow::{Context, Result};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
 };
@@ -88,7 +88,7 @@ pub(crate) fn with_texture_resource<T>(
     let owned_resource: ID3D11Resource = texture
         .cast()
         .context(cast_context)
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     f(&owned_resource)
 }
 

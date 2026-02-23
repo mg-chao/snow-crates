@@ -1,4 +1,4 @@
-use anyhow::Context;
+﻿use anyhow::Context;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, ID3D11Device,
     ID3D11DeviceContext, ID3D11Query, ID3D11Resource, ID3D11Texture2D,
@@ -22,7 +22,7 @@ pub(crate) const REGION_SPIN_MAX_POLLS: u32 = 64;
 pub(crate) const REGION_SPIN_INCREASE_STEP: u32 = 4;
 
 // ---------------------------------------------------------------------------
-// RegionSlot trait — abstracts slot reset behaviour that differs per backend.
+// RegionSlot trait 鈥?abstracts slot reset behaviour that differs per backend.
 // ---------------------------------------------------------------------------
 
 /// Trait abstracting the slot reset behavior that differs between backends.
@@ -31,14 +31,14 @@ pub(crate) const REGION_SPIN_INCREASE_STEP: u32 = 4;
 /// textures), while WGC calls `invalidate` (drops them).  Both backends call
 /// `invalidate` for the stronger teardown path.
 pub(crate) trait RegionSlot: Default {
-    /// Soft reset — clear runtime bookkeeping but may keep GPU resources.
+    /// Soft reset 鈥?clear runtime bookkeeping but may keep GPU resources.
     fn soft_reset(&mut self);
-    /// Hard reset — drop everything including GPU resources.
+    /// Hard reset 鈥?drop everything including GPU resources.
     fn hard_reset(&mut self);
 }
 
 // ---------------------------------------------------------------------------
-// RegionStagingSlotAccess — read/write access to the common slot fields
+// RegionStagingSlotAccess 鈥?read/write access to the common slot fields
 // needed by the shared pipeline helpers.
 // ---------------------------------------------------------------------------
 
@@ -54,7 +54,7 @@ pub(crate) trait RegionStagingSlotAccess {
 }
 
 // ---------------------------------------------------------------------------
-// RegionPipelineState — shared bookkeeping embedded by both GPU backends.
+// RegionPipelineState 鈥?shared bookkeeping embedded by both GPU backends.
 // ---------------------------------------------------------------------------
 
 /// Shared region-pipeline bookkeeping embedded by both GPU backends.
@@ -115,7 +115,7 @@ impl<S: RegionSlot, const N: usize> RegionPipelineState<S, N> {
 }
 
 // ---------------------------------------------------------------------------
-// Shared GPU pipeline helpers — free functions operating on D3D11 context +
+// Shared GPU pipeline helpers 鈥?free functions operating on D3D11 context +
 // slot references.  These encapsulate the mechanical D3D11 operations that
 // are identical between DXGI and WGC.
 // ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ pub(crate) fn copy_region_source_to_slot<S: RegionStagingSlotAccess>(
     can_use_dirty_gpu_copy: bool,
 ) -> CaptureResult<()> {
     let staging_resource = slot.staging_resource().ok_or_else(|| {
-        CaptureError::Platform(anyhow::anyhow!(
+        CaptureError::platform(anyhow::anyhow!(
             "region staging slot missing staging resource"
         ))
     })?;
@@ -336,7 +336,7 @@ pub(crate) fn ensure_region_slot_query<S: RegionStagingSlotAccess>(
     let mut query: Option<ID3D11Query> = None;
     unsafe { device.CreateQuery(&query_desc, Some(&mut query)) }
         .context("CreateQuery for region staging slot failed")
-        .map_err(CaptureError::Platform)?;
+        .map_err(CaptureError::platform)?;
     if let Some(q) = query {
         slot.set_query(q);
     }
@@ -366,7 +366,7 @@ pub(crate) fn ensure_region_slot_texture<S: RegionStagingSlotAccess>(
         let resource: ID3D11Resource = staging
             .cast::<ID3D11Resource>()
             .context("failed to cast region staging texture to ID3D11Resource")
-            .map_err(CaptureError::Platform)?;
+            .map_err(CaptureError::platform)?;
         slot.set_staging(staging.clone(), resource);
     }
 

@@ -28,7 +28,7 @@ pub(crate) fn map_hresult(hr: windows::core::HRESULT, context: &str) -> AudioErr
         return AudioError::DeviceUnavailable(format!("{context}: Windows Audio service is not running"));
     }
 
-    AudioError::Platform(anyhow::anyhow!("{context}: HRESULT 0x{:08x}", hr.0 as u32))
+    AudioError::platform(anyhow::anyhow!("{context}: HRESULT 0x{:08x}", hr.0 as u32))
 }
 
 #[cfg(test)]
