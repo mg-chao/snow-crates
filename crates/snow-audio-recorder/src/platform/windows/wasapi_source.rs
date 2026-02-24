@@ -567,10 +567,6 @@ fn select_stream_format(
     audio_client: &IAudioClient,
     output: AudioFormat,
 ) -> AudioResult<(Vec<u8>, NativeAudioFormat)> {
-    let mix_ptr = unsafe { audio_client.GetMixFormat() }
-        .map_err(|err| map_hresult(err.code(), "IAudioClient::GetMixFormat"))?;
-    let mix_format = copy_wave_format(mix_ptr)?;
-
     let requested = build_requested_wave_format(output)?;
     let requested_ptr = requested.as_ptr() as *const WAVEFORMATEX;
 
@@ -588,15 +584,18 @@ fn select_stream_format(
     } else if support_hr.is_ok() && !closest_ptr.is_null() {
         copy_wave_format(closest_ptr)?
     } else if support_hr == AUDCLNT_E_UNSUPPORTED_FORMAT {
-        mix_format
+        let mix_ptr = unsafe { audio_client.GetMixFormat() }
+            .map_err(|err| map_hresult(err.code(), "IAudioClient::GetMixFormat"))?;
+        let mix = copy_wave_format(mix_ptr);
+        unsafe {
+            CoTaskMemFree(Some(mix_ptr as *const _));
+        }
+        mix?
     } else {
         if !closest_ptr.is_null() {
             unsafe {
                 CoTaskMemFree(Some(closest_ptr as *const _));
             }
-        }
-        unsafe {
-            CoTaskMemFree(Some(mix_ptr as *const _));
         }
         return Err(map_hresult(support_hr, "IAudioClient::IsFormatSupported"));
     };
@@ -605,9 +604,6 @@ fn select_stream_format(
         unsafe {
             CoTaskMemFree(Some(closest_ptr as *const _));
         }
-    }
-    unsafe {
-        CoTaskMemFree(Some(mix_ptr as *const _));
     }
 
     let native = parse_native_format(selected.as_ptr() as *const WAVEFORMATEX)?;

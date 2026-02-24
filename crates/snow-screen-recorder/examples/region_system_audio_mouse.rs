@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             speed: VideoEncodingSpeed::UltraFast,
         },
         audio: RecordingAudioConfig {
-            microphone_enabled: false,
+            microphone_enabled: true,
             system_audio_enabled: true,
             ..RecordingAudioConfig::default()
         },
@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut editing = EditingSession::open(artifact)?;
     let mut edit_config = EditConfig::default();
-    edit_config.microphone_audio.enabled = false;
+    edit_config.microphone_audio.enabled = true;
     edit_config.system_audio.enabled = true;
     edit_config.mouse = MouseEditConfig {
         visible: true,
