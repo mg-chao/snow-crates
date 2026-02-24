@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{RecordingVideoFormat, VideoEncodeConfig};
 use crate::error::{Result, ScreenRecorderError};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +23,10 @@ pub struct SessionManifest {
     pub audio_mic_path: Option<PathBuf>,
     pub mouse_path: PathBuf,
     pub fps: u32,
+    #[serde(default)]
+    pub recording_video_format: RecordingVideoFormat,
+    #[serde(default)]
+    pub recording_video: VideoEncodeConfig,
     pub width: u32,
     pub height: u32,
     pub capture_origin_x: i32,

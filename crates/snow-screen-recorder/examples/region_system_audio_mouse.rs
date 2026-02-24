@@ -4,7 +4,7 @@ use std::time::Duration;
 use snow_capture::CaptureRegion;
 use snow_screen_recorder::{
     EditConfig, EditingSession, ExportConfig, ExportFormat, MouseEditConfig, RecordingAudioConfig,
-    RecordingConfig, RecordingSession, RecordingTarget,
+    RecordingConfig, RecordingSession, RecordingTarget, VideoEncodeConfig, VideoEncodingSpeed,
 };
 
 const REGION_X: i32 = 0;
@@ -23,6 +23,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target: RecordingTarget::Region(region),
         output_dir: output_dir.clone(),
         fps: TARGET_FPS,
+        video: VideoEncodeConfig {
+            quality: 100,
+            speed: VideoEncodingSpeed::UltraFast,
+        },
         audio: RecordingAudioConfig {
             microphone_enabled: false,
             system_audio_enabled: true,
@@ -59,8 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     edit_config.export = ExportConfig {
         format: ExportFormat::Mp4,
-        quality: 100,
         output_path: export_path.clone(),
+        video: VideoEncodeConfig {
+            quality: 100,
+            speed: VideoEncodingSpeed::UltraFast,
+        },
     };
     editing.set_config(edit_config)?;
 

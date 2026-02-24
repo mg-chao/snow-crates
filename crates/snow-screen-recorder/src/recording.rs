@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
+use ffmpeg_next as ffmpeg;
 use snow_audio_recorder::{
     AudioEvent, AudioFormat, AudioPacket, AudioSampleFormat, AudioSession, AudioSourceKind,
     AudioStreamConfig, AudioTimestampAnchor, DeviceSelector, SourceConfig, align_packet_frames,
@@ -18,7 +19,7 @@ use snow_capture::{
 use uuid::Uuid;
 
 use crate::artifact::{RecordingArtifact, SessionManifest};
-use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat};
+use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat, VideoEncodeConfig};
 use crate::error::{Result, ScreenRecorderError};
 use crate::model::{StoredFrame, write_frames};
 use crate::mouse::{
@@ -27,6 +28,7 @@ use crate::mouse::{
 };
 use crate::temp::TempLayout;
 use crate::timeline::PauseTimeline;
+use crate::video_quality::{quality_to_h264_crf, smart_quality_bitrate_bps};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordingState {
@@ -90,12 +92,6 @@ impl RecordingSession {
         config
             .validate()
             .map_err(ScreenRecorderError::InvalidConfig)?;
-
-        if !matches!(config.video_format, RecordingVideoFormat::H264Lossless) {
-            return Err(ScreenRecorderError::UnsupportedFeature(
-                "only H264Lossless is supported in v1".to_string(),
-            ));
-        }
 
         let session_id = Uuid::new_v4().simple().to_string();
         let layout = TempLayout::create(&config, &session_id)?;
@@ -277,6 +273,8 @@ impl RecordingSession {
                 .then(|| self.layout.audio_mic_path.clone()),
             mouse_path: self.layout.mouse_path.clone(),
             fps: self.config.fps,
+            recording_video_format: self.config.video_format,
+            recording_video: self.config.video.clone(),
             width: outcome.width,
             height: outcome.height,
             capture_origin_x,
@@ -532,9 +530,318 @@ impl PcmTrackWriter {
     }
 }
 
+struct LiveVideoEncoder {
+    output: ffmpeg::format::context::Output,
+    encoder: ffmpeg::encoder::video::Encoder,
+    stream_index: usize,
+    stream_time_base: ffmpeg::Rational,
+    scaler: ffmpeg::software::scaling::Context,
+    rgba_frame: ffmpeg::frame::Video,
+    encode_frame: ffmpeg::frame::Video,
+    width: u32,
+    height: u32,
+    fps: u32,
+    last_pts: Option<i64>,
+}
+
+impl LiveVideoEncoder {
+    fn create(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        video_format: RecordingVideoFormat,
+        video_config: &VideoEncodeConfig,
+    ) -> Result<Self> {
+        ensure_ffmpeg_initialized()?;
+
+        let mut output = ffmpeg::format::output(path).map_err(|err| {
+            ScreenRecorderError::Encode(format!(
+                "failed to create temporary video output {}: {err}",
+                path.display()
+            ))
+        })?;
+        let global_header = output
+            .format()
+            .flags()
+            .contains(ffmpeg::format::Flags::GLOBAL_HEADER);
+        let fps = fps.max(1).min(i32::MAX as u32);
+        let video_time_base = ffmpeg::Rational(1, fps as i32);
+        let video_frame_rate = ffmpeg::Rational(fps as i32, 1);
+
+        let container_video_codec = output.format().codec(path, ffmpeg::media::Type::Video);
+        let video_codec = ffmpeg::encoder::find(ffmpeg::codec::Id::H264)
+            .or_else(|| ffmpeg::encoder::find(container_video_codec))
+            .ok_or_else(|| {
+                ScreenRecorderError::Encode(
+                    "no usable video encoder available for temporary recording file".to_string(),
+                )
+            })?;
+        let codec_video_info = video_codec.video().map_err(|err| {
+            ScreenRecorderError::Encode(format!(
+                "selected temporary video codec is not a video encoder: {err}"
+            ))
+        })?;
+        let pixel_format = choose_video_pixel_format(codec_video_info);
+
+        let mut video_encoder = ffmpeg::codec::context::Context::new_with_codec(video_codec)
+            .encoder()
+            .video()
+            .map_err(|err| {
+                ScreenRecorderError::Encode(format!(
+                    "failed to create temporary video encoder context: {err}"
+                ))
+            })?;
+        video_encoder.set_width(width);
+        video_encoder.set_height(height);
+        video_encoder.set_format(pixel_format);
+        video_encoder.set_time_base(video_time_base);
+        video_encoder.set_frame_rate(Some(video_frame_rate));
+        video_encoder.set_bit_rate(smart_quality_bitrate_bps(
+            width,
+            height,
+            fps,
+            video_config,
+            matches!(video_format, RecordingVideoFormat::H264Lossless),
+        ));
+        if global_header {
+            video_encoder.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
+        }
+
+        let use_h264_options =
+            video_codec.id() == ffmpeg::codec::Id::H264 || video_codec.name().contains("264");
+        let video_encoder = if use_h264_options {
+            let mut options = ffmpeg::Dictionary::new();
+            options.set("preset", video_config.speed.as_x264_preset());
+            match video_format {
+                RecordingVideoFormat::H264Lossless => {
+                    options.set("crf", "0");
+                    options.set("qp", "0");
+                }
+                RecordingVideoFormat::H264 => {
+                    options.set(
+                        "crf",
+                        &quality_to_h264_crf(video_config.quality).to_string(),
+                    );
+                }
+            }
+            video_encoder
+                .open_as_with(video_codec, options)
+                .map_err(|err| {
+                    ScreenRecorderError::Encode(format!(
+                        "failed to open temporary video encoder with h264 options: {err}"
+                    ))
+                })?
+        } else {
+            video_encoder.open_as(video_codec).map_err(|err| {
+                ScreenRecorderError::Encode(format!(
+                    "failed to open temporary video encoder: {err}"
+                ))
+            })?
+        };
+
+        let stream_index = {
+            let mut stream = output.add_stream(video_codec).map_err(|err| {
+                ScreenRecorderError::Encode(format!(
+                    "failed to add temporary video output stream: {err}"
+                ))
+            })?;
+            stream.set_time_base(video_time_base);
+            stream.set_rate(video_frame_rate);
+            stream.set_avg_frame_rate(video_frame_rate);
+            stream.set_parameters(&video_encoder);
+            stream.index()
+        };
+
+        output.write_header().map_err(|err| {
+            ScreenRecorderError::Encode(format!(
+                "failed to write temporary video output header: {err}"
+            ))
+        })?;
+        let stream_time_base = output
+            .stream(stream_index)
+            .map(|stream| stream.time_base())
+            .ok_or_else(|| {
+                ScreenRecorderError::Encode(format!(
+                    "failed to resolve temporary video stream {stream_index} after header"
+                ))
+            })?;
+
+        let scaler = ffmpeg::software::scaling::Context::get(
+            ffmpeg::format::Pixel::RGBA,
+            width,
+            height,
+            pixel_format,
+            width,
+            height,
+            ffmpeg::software::scaling::flag::Flags::BILINEAR,
+        )
+        .map_err(|err| {
+            ScreenRecorderError::Encode(format!("failed to create temporary video scaler: {err}"))
+        })?;
+
+        Ok(Self {
+            output,
+            encoder: video_encoder,
+            stream_index,
+            stream_time_base,
+            scaler,
+            rgba_frame: ffmpeg::frame::Video::new(ffmpeg::format::Pixel::RGBA, width, height),
+            encode_frame: ffmpeg::frame::Video::new(pixel_format, width, height),
+            width,
+            height,
+            fps,
+            last_pts: None,
+        })
+    }
+
+    fn encode_frame(&mut self, rgba: &[u8], timestamp_ms: u64) -> Result<()> {
+        let pts = self
+            .timestamp_to_pts(timestamp_ms)
+            .max(self.last_pts.unwrap_or(-1).saturating_add(1));
+        self.encode_frame_at_pts(rgba, pts)
+    }
+
+    fn finalize(mut self, final_timestamp_ms: u64, tail_rgba: Option<&[u8]>) -> Result<()> {
+        if let (Some(last_pts), Some(rgba)) = (self.last_pts, tail_rgba) {
+            let final_pts = self.timestamp_to_pts(final_timestamp_ms);
+            if final_pts > last_pts {
+                self.encode_frame_at_pts(rgba, final_pts)?;
+            }
+        }
+
+        self.encoder.send_eof().map_err(|err| {
+            ScreenRecorderError::Encode(format!(
+                "failed to finalize temporary video encoder: {err}"
+            ))
+        })?;
+        self.drain_packets(true)?;
+        self.output.write_trailer().map_err(|err| {
+            ScreenRecorderError::Encode(format!(
+                "failed to write temporary video output trailer: {err}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn encode_frame_at_pts(&mut self, rgba: &[u8], pts: i64) -> Result<()> {
+        let expected_len = self.width as usize * self.height as usize * 4;
+        if rgba.len() != expected_len {
+            return Err(ScreenRecorderError::Encode(format!(
+                "temporary video RGBA size mismatch: expected {expected_len} bytes, got {}",
+                rgba.len()
+            )));
+        }
+
+        copy_rgba_into_frame(&mut self.rgba_frame, self.width, rgba);
+        self.scaler
+            .run(&self.rgba_frame, &mut self.encode_frame)
+            .map_err(|err| {
+                ScreenRecorderError::Encode(format!(
+                    "failed to convert frame for temporary video encoding: {err}"
+                ))
+            })?;
+        self.encode_frame.set_pts(Some(pts));
+
+        self.encoder.send_frame(&self.encode_frame).map_err(|err| {
+            ScreenRecorderError::Encode(format!(
+                "failed to send frame to temporary video encoder: {err}"
+            ))
+        })?;
+        self.drain_packets(false)?;
+        self.last_pts = Some(pts);
+        Ok(())
+    }
+
+    fn drain_packets(&mut self, draining: bool) -> Result<()> {
+        loop {
+            let mut packet = ffmpeg::Packet::empty();
+            match self.encoder.receive_packet(&mut packet) {
+                Ok(()) => {
+                    packet.set_stream(self.stream_index);
+                    packet.rescale_ts(self.encoder.time_base(), self.stream_time_base);
+                    packet.write_interleaved(&mut self.output).map_err(|err| {
+                        ScreenRecorderError::Encode(format!(
+                            "failed to write temporary encoded video packet: {err}"
+                        ))
+                    })?;
+                }
+                Err(err) if err == ffmpeg::Error::Eof => break,
+                Err(err) if is_eagain(&err) && !draining => break,
+                Err(err) if is_eagain(&err) && draining => continue,
+                Err(err) => {
+                    return Err(ScreenRecorderError::Encode(format!(
+                        "failed to receive temporary encoded video packet: {err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn timestamp_to_pts(&self, timestamp_ms: u64) -> i64 {
+        let pts = (u128::from(timestamp_ms) * u128::from(self.fps) + 500) / 1_000;
+        pts.min(i64::MAX as u128) as i64
+    }
+}
+
+fn ensure_ffmpeg_initialized() -> Result<()> {
+    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| ffmpeg::init().map_err(|err| err.to_string()))
+        .clone()
+        .map_err(|err| {
+            ScreenRecorderError::Encode(format!("failed to initialize ffmpeg for recording: {err}"))
+        })
+}
+
+fn is_eagain(err: &ffmpeg::Error) -> bool {
+    matches!(
+        err,
+        ffmpeg::Error::Other { errno } if *errno == ffmpeg::error::EAGAIN
+    )
+}
+
+fn choose_video_pixel_format(codec: ffmpeg::codec::Video) -> ffmpeg::format::Pixel {
+    let preferred = [
+        ffmpeg::format::Pixel::YUV420P,
+        ffmpeg::format::Pixel::YUV422P,
+        ffmpeg::format::Pixel::RGB24,
+    ];
+    if let Some(formats) = codec.formats() {
+        let available: Vec<_> = formats.collect();
+        for pixel in preferred {
+            if available.iter().any(|fmt| *fmt == pixel) {
+                return pixel;
+            }
+        }
+        if let Some(first) = available.first().copied() {
+            return first;
+        }
+    }
+    ffmpeg::format::Pixel::YUV420P
+}
+
+fn copy_rgba_into_frame(frame: &mut ffmpeg::frame::Video, width: u32, rgba: &[u8]) {
+    let stride = frame.stride(0);
+    let row_bytes = width as usize * 4;
+    let height = frame.height() as usize;
+    let dst = frame.data_mut(0);
+
+    for y in 0..height {
+        let src_start = y * row_bytes;
+        let src_end = src_start + row_bytes;
+        let dst_start = y * stride;
+        let dst_end = dst_start + row_bytes;
+        dst[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
+    }
+}
+
 struct WorkerContext {
     layout: TempLayout,
     frame_interval_ms: u32,
+    target_fps: u32,
+    video_format: RecordingVideoFormat,
+    video_config: VideoEncodeConfig,
     timeline: PauseTimeline,
     capture_origin_x: i32,
     capture_origin_y: i32,
@@ -549,6 +856,7 @@ struct WorkerContext {
     active_cursor_shape_id: Option<u32>,
     system_audio: Option<PcmTrackWriter>,
     mic_audio: Option<PcmTrackWriter>,
+    preview_encoder: Option<LiveVideoEncoder>,
     capture_ended: bool,
     audio_ended: bool,
     recorded_system_audio: bool,
@@ -592,6 +900,9 @@ impl WorkerContext {
         Ok(Self {
             layout,
             frame_interval_ms,
+            target_fps: config.fps.max(1),
+            video_format: config.video_format,
+            video_config: config.video.clone(),
             timeline: PauseTimeline::new(started_at),
             capture_origin_x,
             capture_origin_y,
@@ -606,6 +917,7 @@ impl WorkerContext {
             active_cursor_shape_id: None,
             system_audio,
             mic_audio,
+            preview_encoder: None,
             capture_ended: false,
             audio_ended: false,
             recorded_system_audio: false,
@@ -729,6 +1041,22 @@ impl WorkerContext {
             return Ok(());
         }
 
+        let rgba = frame.as_rgba_bytes().to_vec();
+
+        if self.preview_encoder.is_none() {
+            self.preview_encoder = Some(LiveVideoEncoder::create(
+                &self.layout.video_temp_path,
+                width,
+                height,
+                self.target_fps,
+                self.video_format,
+                &self.video_config,
+            )?);
+        }
+        if let Some(encoder) = self.preview_encoder.as_mut() {
+            encoder.encode_frame(&rgba, ts_ms)?;
+        }
+
         if let Some(done) = self.pending_frame.take() {
             self.frames.push(done);
         }
@@ -738,7 +1066,7 @@ impl WorkerContext {
             duration_ms: self.frame_interval_ms,
             width,
             height,
-            rgba: frame.as_rgba_bytes().to_vec(),
+            rgba,
         });
         Ok(())
     }
@@ -808,6 +1136,14 @@ impl WorkerContext {
         self.timeline.finalize(at);
         let final_ts_ms = self.timeline.active_elapsed_ms(at);
         self.observe_video_time(final_ts_ms);
+
+        if let Some(encoder) = self.preview_encoder.take() {
+            let tail_rgba = self
+                .pending_frame
+                .as_ref()
+                .map(|frame| frame.rgba.as_slice());
+            encoder.finalize(final_ts_ms, tail_rgba)?;
+        }
 
         if let Some(done) = self.pending_frame.take() {
             self.frames.push(done);

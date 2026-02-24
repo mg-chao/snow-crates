@@ -8,7 +8,7 @@ use ffmpeg_next as ffmpeg;
 use snow_audio_recorder::align_i16_interleaved_to_duration;
 
 use crate::artifact::{RecordingArtifact, SessionManifest};
-use crate::config::{EditConfig, ExportFormat, MouseEditConfig};
+use crate::config::{EditConfig, ExportFormat, MouseEditConfig, VideoEncodeConfig};
 use crate::error::{Result, ScreenRecorderError};
 use crate::export::ExportResult;
 use crate::model::{StoredFrame, read_frames};
@@ -16,6 +16,7 @@ use crate::mouse::{
     ClickEventRecord, CursorSampleRecord, CursorShapeCompositionMode, CursorShapeModeRecord,
     CursorShapeRecord, MouseRecord, read_mouse_records,
 };
+use crate::video_quality::{quality_to_h264_crf, smart_quality_bitrate_bps};
 
 pub struct EditingSession {
     artifact: RecordingArtifact,
@@ -33,7 +34,7 @@ impl EditingSession {
         config.system_audio.enabled = manifest.recorded_system_audio;
         config.microphone_audio.enabled = manifest.recorded_microphone_audio;
         config.export.format = ExportFormat::Mp4;
-        config.export.quality = 100;
+        config.export.video = manifest.recording_video.clone();
         config.export.output_path = manifest
             .output_dir
             .join(format!("{}.mp4", manifest.session_id));
@@ -96,35 +97,26 @@ impl EditingSession {
         let mouse_records = read_mouse_records(&self.manifest.mouse_path)?;
         let mouse_tracks = build_mouse_tracks(&mouse_records);
 
-        let params = quality_params(
-            self.manifest.fps,
-            self.config.export.quality,
-            self.config.export.format,
-        );
-        let mut frames = retime_frames(
-            &source_frames,
-            self.config.playback_speed,
-            params.export_fps,
-        )?;
+        let export_fps = choose_export_fps(self.manifest.fps, self.config.export.format);
+        let mut frames = retime_frames(&source_frames, self.config.playback_speed, export_fps)?;
         if frames.is_empty() {
             return Err(ScreenRecorderError::Export(
                 "retiming produced no frames".to_string(),
             ));
         }
 
-        let (scaled_w, scaled_h) = scaled_dimensions(
+        let (output_w, output_h) = output_dimensions(
             source_frames[0].width,
             source_frames[0].height,
-            params.scale,
             self.config.export.format != ExportFormat::Gif,
         );
         for frame in &mut frames {
             apply_mouse_overlays(frame, &mouse_tracks, &self.config.mouse);
-            if frame.width != scaled_w || frame.height != scaled_h {
+            if frame.width != output_w || frame.height != output_h {
                 frame.rgba =
-                    resize_rgba_nearest(&frame.rgba, frame.width, frame.height, scaled_w, scaled_h);
-                frame.width = scaled_w;
-                frame.height = scaled_h;
+                    resize_rgba_nearest(&frame.rgba, frame.width, frame.height, output_w, output_h);
+                frame.width = output_w;
+                frame.height = output_h;
             }
         }
 
@@ -144,26 +136,29 @@ impl EditingSession {
             ExportFormat::Mp4 => export_video(
                 &self.config.export.output_path,
                 &frames,
-                params.export_fps,
+                export_fps,
                 ExportFormat::Mp4,
                 mixed_audio.as_ref(),
                 self.manifest.audio_bitrate_kbps.max(8),
+                &self.config.export.video,
             )?,
             ExportFormat::Avi => export_video(
                 &self.config.export.output_path,
                 &frames,
-                params.export_fps,
+                export_fps,
                 ExportFormat::Avi,
                 mixed_audio.as_ref(),
                 self.manifest.audio_bitrate_kbps.max(8),
+                &self.config.export.video,
             )?,
             ExportFormat::Gif => export_video(
                 &self.config.export.output_path,
                 &frames,
-                params.export_fps,
+                export_fps,
                 ExportFormat::Gif,
                 None,
                 self.manifest.audio_bitrate_kbps.max(8),
+                &self.config.export.video,
             )?,
         }
 
@@ -175,29 +170,18 @@ impl EditingSession {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct QualityParams {
-    scale: f32,
-    export_fps: u32,
-}
-
-fn quality_params(record_fps: u32, quality: u8, format: ExportFormat) -> QualityParams {
-    let q = quality.min(100) as f32 / 100.0;
-    let scale = 0.5 + 0.5 * q;
-    let fps_factor = 0.35 + 0.65 * q;
-    let mut export_fps = ((record_fps.max(1) as f32) * fps_factor).round() as u32;
-    export_fps = export_fps.clamp(10, record_fps.max(10));
+fn choose_export_fps(record_fps: u32, format: ExportFormat) -> u32 {
+    let fps = record_fps.max(1);
     if matches!(format, ExportFormat::Gif) {
-        export_fps = export_fps.min(20).max(1);
+        fps.min(20).max(1)
+    } else {
+        fps
     }
-    QualityParams { scale, export_fps }
 }
 
-fn scaled_dimensions(src_w: u32, src_h: u32, scale: f32, force_even: bool) -> (u32, u32) {
-    let mut w = ((src_w as f32) * scale).round() as u32;
-    let mut h = ((src_h as f32) * scale).round() as u32;
-    w = w.clamp(1, src_w.max(1));
-    h = h.clamp(1, src_h.max(1));
+fn output_dimensions(src_w: u32, src_h: u32, force_even: bool) -> (u32, u32) {
+    let mut w = src_w.max(1);
+    let mut h = src_h.max(1);
 
     if force_even {
         if w % 2 != 0 {
@@ -966,6 +950,7 @@ fn export_video(
     format: ExportFormat,
     mixed_audio: Option<&MixedAudio>,
     audio_bitrate_kbps: u16,
+    video_config: &VideoEncodeConfig,
 ) -> Result<()> {
     ensure_ffmpeg_initialized()?;
     let (width, height) = validate_export_frames(frames, format != ExportFormat::Gif)?;
@@ -1010,13 +995,39 @@ fn export_video(
     video_encoder.set_format(pixel_format);
     video_encoder.set_time_base(video_time_base);
     video_encoder.set_frame_rate(Some(video_frame_rate));
-    video_encoder.set_bit_rate(8_000_000usize);
+    if format != ExportFormat::Gif {
+        video_encoder.set_bit_rate(smart_quality_bitrate_bps(
+            width,
+            height,
+            export_fps,
+            video_config,
+            false,
+        ));
+    }
     if global_header {
         video_encoder.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
     }
-    let mut video_encoder = video_encoder.open_as(video_codec).map_err(|err| {
-        ScreenRecorderError::Export(format!("failed to open video encoder: {err}"))
-    })?;
+    let use_h264_options =
+        video_codec.id() == ffmpeg::codec::Id::H264 || video_codec.name().contains("264");
+    let mut video_encoder = if use_h264_options {
+        let mut options = ffmpeg::Dictionary::new();
+        options.set("preset", video_config.speed.as_x264_preset());
+        options.set(
+            "crf",
+            &quality_to_h264_crf(video_config.quality).to_string(),
+        );
+        video_encoder
+            .open_as_with(video_codec, options)
+            .map_err(|err| {
+                ScreenRecorderError::Export(format!(
+                    "failed to open video encoder with h264 options: {err}"
+                ))
+            })?
+    } else {
+        video_encoder.open_as(video_codec).map_err(|err| {
+            ScreenRecorderError::Export(format!("failed to open video encoder: {err}"))
+        })?
+    };
 
     let video_stream_index = {
         let mut stream = output.add_stream(video_codec).map_err(|err| {
@@ -1467,6 +1478,8 @@ mod tests {
                 audio_mic_path: Some(PathBuf::from("recordings/tmp/mic.pcm")),
                 mouse_path: PathBuf::from("recordings/tmp/mouse.jsonl"),
                 fps: 30,
+                recording_video_format: crate::config::RecordingVideoFormat::H264Lossless,
+                recording_video: VideoEncodeConfig::default(),
                 width: 1920,
                 height: 1080,
                 capture_origin_x: 0,
@@ -1513,21 +1526,15 @@ mod tests {
     }
 
     #[test]
-    fn quality_endpoints_match_plan() {
-        let low = quality_params(60, 0, ExportFormat::Mp4);
-        let high = quality_params(60, 100, ExportFormat::Mp4);
-        assert!((low.scale - 0.5).abs() < 1e-6);
-        assert_eq!(low.export_fps, 21);
-        assert!((high.scale - 1.0).abs() < 1e-6);
-        assert_eq!(high.export_fps, 60);
+    fn choose_export_fps_keeps_recording_fps() {
+        assert_eq!(choose_export_fps(60, ExportFormat::Mp4), 60);
+        assert_eq!(choose_export_fps(30, ExportFormat::Avi), 30);
     }
 
     #[test]
-    fn gif_quality_clamps_export_fps() {
-        let low = quality_params(60, 0, ExportFormat::Gif);
-        let high = quality_params(60, 100, ExportFormat::Gif);
-        assert_eq!(low.export_fps, 20);
-        assert_eq!(high.export_fps, 20);
+    fn choose_export_fps_clamps_gif() {
+        assert_eq!(choose_export_fps(60, ExportFormat::Gif), 20);
+        assert_eq!(choose_export_fps(10, ExportFormat::Gif), 10);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub enum RecordingTarget {
 pub enum RecordingVideoFormat {
     #[default]
     H264Lossless,
+    H264,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +37,61 @@ impl AudioChannels {
             Self::Mono => 1,
             Self::Stereo => 2,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VideoEncodingSpeed {
+    UltraFast,
+    SuperFast,
+    VeryFast,
+    Faster,
+    Fast,
+    #[default]
+    Medium,
+    Slow,
+    Slower,
+    VerySlow,
+}
+
+impl VideoEncodingSpeed {
+    pub const fn as_x264_preset(self) -> &'static str {
+        match self {
+            Self::UltraFast => "ultrafast",
+            Self::SuperFast => "superfast",
+            Self::VeryFast => "veryfast",
+            Self::Faster => "faster",
+            Self::Fast => "fast",
+            Self::Medium => "medium",
+            Self::Slow => "slow",
+            Self::Slower => "slower",
+            Self::VerySlow => "veryslow",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoEncodeConfig {
+    pub quality: u8,
+    pub speed: VideoEncodingSpeed,
+}
+
+impl Default for VideoEncodeConfig {
+    fn default() -> Self {
+        Self {
+            quality: 75,
+            speed: VideoEncodingSpeed::Medium,
+        }
+    }
+}
+
+impl VideoEncodeConfig {
+    pub fn validate(&self, prefix: &str) -> Result<(), String> {
+        if self.quality > 100 {
+            return Err(format!("{prefix}.quality must be in 0..=100"));
+        }
+
+        Ok(())
     }
 }
 
@@ -70,6 +126,7 @@ pub struct RecordingConfig {
     pub output_dir: PathBuf,
     pub fps: u32,
     pub video_format: RecordingVideoFormat,
+    pub video: VideoEncodeConfig,
     pub audio: RecordingAudioConfig,
 }
 
@@ -82,6 +139,8 @@ impl RecordingConfig {
         if self.output_dir.as_os_str().is_empty() {
             return Err("output_dir must not be empty".to_string());
         }
+
+        self.video.validate("video")?;
 
         if self.audio.bitrate_kbps == 0 {
             return Err("audio bitrate must be > 0".to_string());
@@ -106,6 +165,7 @@ impl Default for RecordingConfig {
             output_dir: PathBuf::from("."),
             fps: 60,
             video_format: RecordingVideoFormat::H264Lossless,
+            video: VideoEncodeConfig::default(),
             audio: RecordingAudioConfig::default(),
         }
     }
@@ -154,16 +214,16 @@ pub enum ExportFormat {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ExportConfig {
     pub format: ExportFormat,
-    pub quality: u8,
     pub output_path: PathBuf,
+    pub video: VideoEncodeConfig,
 }
 
 impl Default for ExportConfig {
     fn default() -> Self {
         Self {
             format: ExportFormat::Mp4,
-            quality: 100,
             output_path: PathBuf::from("output.mp4"),
+            video: VideoEncodeConfig::default(),
         }
     }
 }
@@ -207,9 +267,7 @@ impl EditConfig {
             return Err("export.output_path must not be empty".to_string());
         }
 
-        if self.export.quality > 100 {
-            return Err("export.quality must be in 0..=100".to_string());
-        }
+        self.export.video.validate("export.video")?;
 
         Ok(())
     }
@@ -234,7 +292,7 @@ mod tests {
         assert!(cfg.validate().is_err());
 
         cfg = EditConfig::default();
-        cfg.export.quality = 101;
+        cfg.export.video.quality = 101;
         assert!(cfg.validate().is_err());
     }
 }
