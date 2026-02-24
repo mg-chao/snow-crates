@@ -747,8 +747,7 @@ fn append_quadratic_segment(
         let inv = 1.0 - t;
         let x = inv * inv * start.x + 2.0 * inv * t * control.x + t * t * end.x;
         let y = inv * inv * start.y + 2.0 * inv * t * control.y + t * t * end.y;
-        let ts_ms =
-            inv * inv * start.ts_ms + 2.0 * inv * t * control.ts_ms + t * t * end.ts_ms;
+        let ts_ms = inv * inv * start.ts_ms + 2.0 * inv * t * control.ts_ms + t * t * end.ts_ms;
         out.push(TrailCurvePoint { x, y, ts_ms });
     }
 }
@@ -804,8 +803,15 @@ fn cursor_shape_is_renderable(mode: CursorShapeCompositionMode, rgba: &[u8]) -> 
         // In that case rendering the sampled bitmap is a no-op, so we should
         // fall back to the synthetic cursor.
         CursorShapeCompositionMode::AlphaBlend => rgba.chunks_exact(4).any(|px| px[3] != 0),
-        CursorShapeCompositionMode::MaskedColor => !rgba.is_empty(),
+        CursorShapeCompositionMode::MaskedColor => masked_color_shape_has_visible_effect(rgba),
     }
+}
+
+fn masked_color_shape_has_visible_effect(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4).any(|px| {
+        let alpha = px[3];
+        alpha != 0xFF || px[0] != 0 || px[1] != 0 || px[2] != 0
+    })
 }
 
 fn draw_cursor_shape(
@@ -2114,6 +2120,54 @@ mod tests {
         assert_eq!(&frame.rgba[0..4], &[10, 20, 30, 255]);
         assert_eq!(&frame.rgba[4..8], &[235, 215, 195, 255]);
         assert_eq!(&frame.rgba[8..12], &[5, 6, 7, 255]);
+    }
+
+    #[test]
+    fn apply_mouse_overlays_uses_fallback_for_noop_masked_shape() {
+        let mut frame = StoredFrame {
+            timestamp_ms: 0,
+            duration_ms: 16,
+            width: 16,
+            height: 16,
+            rgba: vec![0; 16 * 16 * 4],
+        };
+        let store = MouseStore {
+            schema_version: crate::mouse::MOUSE_STORE_SCHEMA_VERSION,
+            cursor_shapes: vec![CursorShapeRecord {
+                shape_id: 123,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                width: 2,
+                height: 2,
+                mode: CursorShapeCompositionMode::MaskedColor,
+                shape_rgba: vec![0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF],
+            }],
+            cursor_frames: vec![crate::mouse::CursorFrameRecord {
+                timestamp_ms: 0,
+                x: 8,
+                y: 8,
+                visible: true,
+                shape_id: Some(123),
+            }],
+            clicks: vec![],
+        };
+        let tracks = build_mouse_tracks(&store);
+
+        apply_mouse_overlays(
+            &mut frame,
+            &tracks,
+            &MouseEditConfig {
+                visible: true,
+                trail_enabled: false,
+                click_enabled: false,
+            },
+        );
+
+        let cursor_pixel = (8usize * 16 + 8usize) * 4;
+        assert!(
+            frame.rgba[cursor_pixel + 3] > 0,
+            "fallback cursor should draw when masked shape pixels are all no-op"
+        );
     }
 
     #[test]

@@ -89,9 +89,16 @@ fn extract_color_shape(
     let (width, height, mut rgba) = read_bitmap_rgba(color)?;
     let mut composition_mode = CursorCompositionMode::AlphaBlend;
 
-    if rgba.chunks_exact(4).all(|px| px[3] == 0)
-        && !mask.is_invalid()
+    if !mask.is_invalid()
         && let Some((mask_width, mask_height, mask_rgba)) = read_bitmap_rgba(mask)
+        && should_use_masked_color_composition(
+            &rgba,
+            width,
+            height,
+            mask_width,
+            mask_height,
+            &mask_rgba,
+        )
         && apply_color_mask_as_masked_composition(
             &mut rgba,
             width,
@@ -204,6 +211,93 @@ fn apply_color_mask_as_masked_composition(
     true
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct AlphaStats {
+    total: usize,
+    zero: usize,
+    opaque: usize,
+    partial: usize,
+}
+
+fn analyze_alpha_channel(rgba: &[u8]) -> AlphaStats {
+    let mut stats = AlphaStats::default();
+    for px in rgba.chunks_exact(4) {
+        stats.total += 1;
+        match px[3] {
+            0 => stats.zero += 1,
+            255 => stats.opaque += 1,
+            _ => stats.partial += 1,
+        }
+    }
+    stats
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MaskStats {
+    valid: bool,
+    has_set_bits: bool,
+}
+
+fn analyze_color_mask(
+    width: u32,
+    height: u32,
+    mask_width: u32,
+    mask_height: u32,
+    mask_rgba: &[u8],
+) -> MaskStats {
+    let and_height = if mask_height >= height.saturating_mul(2) {
+        height
+    } else {
+        mask_height.min(height)
+    };
+    let rows = and_height.min(height);
+    let cols = mask_width.min(width);
+    if rows == 0 || cols == 0 {
+        return MaskStats::default();
+    }
+
+    let mut has_set_bits = false;
+    for y in 0..rows {
+        for x in 0..cols {
+            let idx = ((y * mask_width + x) * 4) as usize;
+            if idx + 3 >= mask_rgba.len() {
+                return MaskStats::default();
+            }
+            if pixel_is_set(&mask_rgba[idx..idx + 4]) {
+                has_set_bits = true;
+            }
+        }
+    }
+
+    MaskStats {
+        valid: true,
+        has_set_bits,
+    }
+}
+
+fn should_use_masked_color_composition(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    mask_width: u32,
+    mask_height: u32,
+    mask_rgba: &[u8],
+) -> bool {
+    let alpha = analyze_alpha_channel(rgba);
+    if alpha.total == 0 || alpha.partial > 0 {
+        return false;
+    }
+
+    let mask = analyze_color_mask(width, height, mask_width, mask_height, mask_rgba);
+    if !mask.valid || !mask.has_set_bits {
+        return false;
+    }
+
+    // Legacy color cursor formats often carry unusable alpha (all 0 or all 255)
+    // and rely on the AND mask for composition.
+    alpha.zero == alpha.total || alpha.opaque == alpha.total
+}
+
 fn read_bitmap_rgba(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     if bitmap.is_invalid() {
         return None;
@@ -294,5 +388,33 @@ mod tests {
         assert_eq!(rgba[7], 0);
         assert_eq!(rgba[11], 0);
         assert_eq!(rgba[15], 255);
+    }
+
+    #[test]
+    fn should_use_masked_color_composition_accepts_all_opaque_alpha_with_mask_bits() {
+        let rgba = vec![
+            10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let mask_rgba = vec![
+            255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+        ];
+
+        assert!(should_use_masked_color_composition(
+            &rgba, 2, 2, 2, 2, &mask_rgba
+        ));
+    }
+
+    #[test]
+    fn should_use_masked_color_composition_rejects_partial_alpha_even_with_mask() {
+        let rgba = vec![
+            10, 20, 30, 255, 40, 50, 60, 128, 70, 80, 90, 255, 100, 110, 120, 0,
+        ];
+        let mask_rgba = vec![
+            255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+        ];
+
+        assert!(!should_use_masked_color_composition(
+            &rgba, 2, 2, 2, 2, &mask_rgba
+        ));
     }
 }
