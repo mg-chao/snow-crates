@@ -589,34 +589,167 @@ fn apply_mouse_overlays(frame: &mut StoredFrame, tracks: &MouseTracks, config: &
 }
 
 fn draw_mouse_trail(frame: &mut StoredFrame, samples: &[MouseSample], ts: u64) {
-    let trail_window_ms = 600u64;
+    let trail_window_ms = 128u64;
     let cutoff = ts.saturating_sub(trail_window_ms);
-    let recent: Vec<&MouseSample> = samples
-        .iter()
-        .rev()
-        .take_while(|s| s.ts_ms >= cutoff)
-        .collect();
-    if recent.len() < 2 {
+    let visible = collect_visible_trail_window(samples, cutoff);
+    if visible.len() < 2 {
         return;
     }
 
-    let mut ordered = recent;
-    ordered.reverse();
+    let smoothed = build_smoothed_trail_points(&visible, 2.0);
+    if smoothed.len() < 2 {
+        return;
+    }
 
-    let mut prev_visible: Option<&MouseSample> = None;
-    for sample in ordered {
-        if !sample.visible {
+    for segment in smoothed.windows(2) {
+        let a = segment[0];
+        let b = segment[1];
+        let b_ts_ms = b.ts_ms.max(0.0).round() as u64;
+        let age = ts.saturating_sub(b_ts_ms).min(trail_window_ms);
+        let alpha = ((1.0 - age as f32 / trail_window_ms as f32) * 180.0).round() as u8;
+        if alpha == 0 {
             continue;
         }
-        let Some(a) = prev_visible else {
-            prev_visible = Some(sample);
-            continue;
-        };
-        let b = sample;
-        let age = ts.saturating_sub(b.ts_ms).min(trail_window_ms);
-        let alpha = ((1.0 - age as f32 / trail_window_ms as f32) * 180.0).round() as u8;
-        draw_line(frame, a.x, a.y, b.x, b.y, [255, 32, 32, alpha], 2);
-        prev_visible = Some(sample);
+        draw_line(
+            frame,
+            a.x.round() as i32,
+            a.y.round() as i32,
+            b.x.round() as i32,
+            b.y.round() as i32,
+            [255, 32, 32, alpha],
+            2,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TrailCurvePoint {
+    x: f32,
+    y: f32,
+    ts_ms: f32,
+}
+
+fn collect_visible_trail_window(samples: &[MouseSample], cutoff_ms: u64) -> Vec<TrailCurvePoint> {
+    let visible: Vec<TrailCurvePoint> = samples
+        .iter()
+        .filter(|s| s.visible)
+        .map(|s| TrailCurvePoint {
+            x: s.x as f32,
+            y: s.y as f32,
+            ts_ms: s.ts_ms as f32,
+        })
+        .collect();
+    if visible.is_empty() {
+        return visible;
+    }
+
+    let cutoff_ms = cutoff_ms as f32;
+    let first_in_window = visible.partition_point(|p| p.ts_ms < cutoff_ms);
+    if first_in_window == 0 {
+        return visible;
+    }
+    if first_in_window >= visible.len() {
+        return Vec::new();
+    }
+
+    let prev = visible[first_in_window - 1];
+    let next = visible[first_in_window];
+    let mut window = Vec::with_capacity(visible.len() - first_in_window + 1);
+    if cutoff_ms > prev.ts_ms && cutoff_ms < next.ts_ms {
+        let t = (cutoff_ms - prev.ts_ms) / (next.ts_ms - prev.ts_ms);
+        window.push(TrailCurvePoint {
+            x: prev.x + (next.x - prev.x) * t,
+            y: prev.y + (next.y - prev.y) * t,
+            ts_ms: cutoff_ms,
+        });
+    }
+    window.extend_from_slice(&visible[first_in_window..]);
+    window
+}
+
+fn build_smoothed_trail_points(samples: &[TrailCurvePoint], step_px: f32) -> Vec<TrailCurvePoint> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let step_px = step_px.max(1.0);
+    let mut points = Vec::new();
+    let first = samples[0];
+    points.push(first);
+    if samples.len() == 1 {
+        return points;
+    }
+
+    if samples.len() == 2 {
+        append_linear_segment(&mut points, first, samples[1], step_px);
+        return points;
+    }
+
+    let first_mid = midpoint(samples[0], samples[1]);
+    append_linear_segment(&mut points, first, first_mid, step_px);
+
+    for idx in 1..samples.len() - 1 {
+        let prev = samples[idx - 1];
+        let current = samples[idx];
+        let next = samples[idx + 1];
+        let start = midpoint(prev, current);
+        let end = midpoint(current, next);
+        append_quadratic_segment(&mut points, start, current, end, step_px);
+    }
+
+    let last_mid = midpoint(samples[samples.len() - 2], samples[samples.len() - 1]);
+    let last = samples[samples.len() - 1];
+    append_linear_segment(&mut points, last_mid, last, step_px);
+    points
+}
+
+fn midpoint(a: TrailCurvePoint, b: TrailCurvePoint) -> TrailCurvePoint {
+    TrailCurvePoint {
+        x: (a.x + b.x) * 0.5,
+        y: (a.y + b.y) * 0.5,
+        ts_ms: (a.ts_ms + b.ts_ms) * 0.5,
+    }
+}
+
+fn append_linear_segment(
+    out: &mut Vec<TrailCurvePoint>,
+    start: TrailCurvePoint,
+    end: TrailCurvePoint,
+    step_px: f32,
+) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = (dist / step_px).ceil().max(1.0) as usize;
+
+    for step in 1..=steps {
+        let t = step as f32 / steps as f32;
+        let x = start.x + (end.x - start.x) * t;
+        let y = start.y + (end.y - start.y) * t;
+        let ts_ms = start.ts_ms + (end.ts_ms - start.ts_ms) * t;
+        out.push(TrailCurvePoint { x, y, ts_ms });
+    }
+}
+
+fn append_quadratic_segment(
+    out: &mut Vec<TrailCurvePoint>,
+    start: TrailCurvePoint,
+    control: TrailCurvePoint,
+    end: TrailCurvePoint,
+    step_px: f32,
+) {
+    let approx_len = ((control.x - start.x).powi(2) + (control.y - start.y).powi(2)).sqrt()
+        + ((end.x - control.x).powi(2) + (end.y - control.y).powi(2)).sqrt();
+    let steps = (approx_len / step_px).ceil().max(1.0) as usize;
+
+    for step in 1..=steps {
+        let t = step as f32 / steps as f32;
+        let inv = 1.0 - t;
+        let x = inv * inv * start.x + 2.0 * inv * t * control.x + t * t * end.x;
+        let y = inv * inv * start.y + 2.0 * inv * t * control.y + t * t * end.y;
+        let ts_ms =
+            inv * inv * start.ts_ms + 2.0 * inv * t * control.ts_ms + t * t * end.ts_ms;
+        out.push(TrailCurvePoint { x, y, ts_ms });
     }
 }
 
@@ -2040,5 +2173,76 @@ mod tests {
             frame.rgba[mid] > 0 || frame.rgba[mid + 1] > 0 || frame.rgba[mid + 2] > 0,
             "visible cursor samples should still render trail segments"
         );
+    }
+
+    #[test]
+    fn build_smoothed_trail_points_rounds_corners() {
+        let points = vec![
+            TrailCurvePoint {
+                ts_ms: 0.0,
+                x: 8.0,
+                y: 8.0,
+            },
+            TrailCurvePoint {
+                ts_ms: 10.0,
+                x: 8.0,
+                y: 24.0,
+            },
+            TrailCurvePoint {
+                ts_ms: 20.0,
+                x: 24.0,
+                y: 24.0,
+            },
+        ];
+        let smoothed = build_smoothed_trail_points(&points, 2.0);
+
+        assert!(
+            smoothed.len() > points.len(),
+            "curve sampling should emit intermediate points"
+        );
+        assert!(
+            smoothed
+                .iter()
+                .any(|p| p.x > 8.0 && p.x < 16.0 && p.y > 16.0 && p.y < 24.0),
+            "smoothed trail should include rounded corner points between line segments"
+        );
+    }
+
+    #[test]
+    fn collect_visible_trail_window_moves_tail_continuously() {
+        let samples = vec![
+            MouseSample {
+                ts_ms: 0,
+                x: 0,
+                y: 0,
+                visible: true,
+                shape_id: None,
+            },
+            MouseSample {
+                ts_ms: 100,
+                x: 100,
+                y: 0,
+                visible: true,
+                shape_id: None,
+            },
+            MouseSample {
+                ts_ms: 200,
+                x: 200,
+                y: 0,
+                visible: true,
+                shape_id: None,
+            },
+        ];
+
+        let window_99 = collect_visible_trail_window(&samples, 99);
+        let window_100 = collect_visible_trail_window(&samples, 100);
+        let window_101 = collect_visible_trail_window(&samples, 101);
+
+        assert!(!window_99.is_empty());
+        assert!(!window_100.is_empty());
+        assert!(!window_101.is_empty());
+        assert!((window_99[0].x - 99.0).abs() < 0.01);
+        assert!((window_100[0].x - 100.0).abs() < 0.01);
+        assert!((window_101[0].x - 101.0).abs() < 0.01);
     }
 }

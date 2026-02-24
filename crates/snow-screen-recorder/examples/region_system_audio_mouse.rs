@@ -11,7 +11,7 @@ const REGION_X: i32 = 0;
 const REGION_Y: i32 = 0;
 const REGION_WIDTH: u32 = 2000;
 const REGION_HEIGHT: u32 = 2000;
-const TARGET_FPS: u32 = 24;
+const TARGET_FPS: u32 = 120;
 const RECORD_SECONDS: u64 = 5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
