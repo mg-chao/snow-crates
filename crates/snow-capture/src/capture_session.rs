@@ -946,6 +946,7 @@ mod tests {
                 visible: true,
                 shape_width: 2,
                 shape_height: 2,
+                composition_mode: crate::frame::CursorCompositionMode::AlphaBlend,
                 shape_rgba: vec![255; 16],
             });
             Ok(frame)

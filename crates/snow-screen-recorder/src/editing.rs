@@ -13,7 +13,8 @@ use crate::error::{Result, ScreenRecorderError};
 use crate::export::ExportResult;
 use crate::model::{StoredFrame, read_frames};
 use crate::mouse::{
-    ClickEventRecord, CursorSampleRecord, CursorShapeRecord, MouseRecord, read_mouse_records,
+    ClickEventRecord, CursorSampleRecord, CursorShapeCompositionMode, CursorShapeModeRecord,
+    CursorShapeRecord, MouseRecord, read_mouse_records,
 };
 
 pub struct EditingSession {
@@ -293,6 +294,7 @@ struct MouseTracks {
     samples: Vec<MouseSample>,
     click_downs: Vec<MouseClickDown>,
     cursor_shapes: HashMap<u32, CursorShapeRecord>,
+    cursor_shape_modes: HashMap<u32, CursorShapeCompositionMode>,
 }
 
 fn build_mouse_tracks(records: &[MouseRecord]) -> MouseTracks {
@@ -320,6 +322,9 @@ fn build_mouse_tracks(records: &[MouseRecord]) -> MouseTracks {
                     .cursor_shapes
                     .entry(shape.shape_id)
                     .or_insert_with(|| shape.clone());
+            }
+            MouseRecord::CursorShapeMode(CursorShapeModeRecord { shape_id, mode }) => {
+                tracks.cursor_shape_modes.insert(*shape_id, *mode);
             }
             MouseRecord::Click(ClickEventRecord {
                 timestamp_ms,
@@ -406,6 +411,11 @@ fn draw_cursor(frame: &mut StoredFrame, current: &MouseSample, tracks: &MouseTra
     if let Some(shape_id) = current.shape_id
         && let Some(shape) = tracks.cursor_shapes.get(&shape_id)
     {
+        let mode = tracks
+            .cursor_shape_modes
+            .get(&shape_id)
+            .copied()
+            .unwrap_or(CursorShapeCompositionMode::AlphaBlend);
         let width = shape.width as usize;
         let height = shape.height as usize;
         let expected_len = width
@@ -419,6 +429,7 @@ fn draw_cursor(frame: &mut StoredFrame, current: &MouseSample, tracks: &MouseTra
                 current.y.saturating_sub(shape.hotspot_y as i32),
                 width,
                 height,
+                mode,
                 &shape.shape_rgba[..expected_len],
             );
             return;
@@ -429,6 +440,25 @@ fn draw_cursor(frame: &mut StoredFrame, current: &MouseSample, tracks: &MouseTra
 }
 
 fn draw_cursor_shape(
+    frame: &mut StoredFrame,
+    origin_x: i32,
+    origin_y: i32,
+    width: usize,
+    height: usize,
+    mode: CursorShapeCompositionMode,
+    rgba: &[u8],
+) {
+    match mode {
+        CursorShapeCompositionMode::AlphaBlend => {
+            draw_alpha_blended_cursor_shape(frame, origin_x, origin_y, width, height, rgba)
+        }
+        CursorShapeCompositionMode::MaskedColor => {
+            draw_masked_color_cursor_shape(frame, origin_x, origin_y, width, height, rgba)
+        }
+    }
+}
+
+fn draw_alpha_blended_cursor_shape(
     frame: &mut StoredFrame,
     origin_x: i32,
     origin_y: i32,
@@ -456,6 +486,51 @@ fn draw_cursor_shape(
     }
 }
 
+fn draw_masked_color_cursor_shape(
+    frame: &mut StoredFrame,
+    origin_x: i32,
+    origin_y: i32,
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) {
+    for y in 0..height {
+        let dst_y = origin_y.saturating_add(y as i32);
+        for x in 0..width {
+            let idx = (y * width + x) * 4;
+            let color = [rgba[idx], rgba[idx + 1], rgba[idx + 2]];
+            match rgba[idx + 3] {
+                0x00 => set_pixel_copy(
+                    &mut frame.rgba,
+                    frame.width,
+                    frame.height,
+                    origin_x + x as i32,
+                    dst_y,
+                    color,
+                ),
+                0xFF => {
+                    set_pixel_xor(
+                        &mut frame.rgba,
+                        frame.width,
+                        frame.height,
+                        origin_x + x as i32,
+                        dst_y,
+                        color,
+                    );
+                }
+                alpha => set_pixel_blended(
+                    &mut frame.rgba,
+                    frame.width,
+                    frame.height,
+                    origin_x + x as i32,
+                    dst_y,
+                    [color[0], color[1], color[2], alpha],
+                ),
+            }
+        }
+    }
+}
+
 fn draw_fallback_cursor(frame: &mut StoredFrame, x: i32, y: i32) {
     let points = [(x, y), (x + 12, y + 4), (x + 4, y + 12)];
     fill_triangle(frame, points, [255, 255, 255, 235]);
@@ -464,11 +539,37 @@ fn draw_fallback_cursor(frame: &mut StoredFrame, x: i32, y: i32) {
     draw_line(frame, x + 12, y + 4, x + 4, y + 12, [0, 0, 0, 200], 1);
 }
 
-fn set_pixel_blended(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 4]) {
+fn pixel_offset(width: u32, height: u32, x: i32, y: i32) -> Option<usize> {
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
-        return;
+        return None;
     }
-    let idx = (y as usize * width as usize + x as usize) * 4;
+    Some((y as usize * width as usize + x as usize) * 4)
+}
+
+fn set_pixel_copy(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 3]) {
+    let Some(idx) = pixel_offset(width, height, x, y) else {
+        return;
+    };
+    rgba[idx] = color[0];
+    rgba[idx + 1] = color[1];
+    rgba[idx + 2] = color[2];
+    rgba[idx + 3] = 255;
+}
+
+fn set_pixel_xor(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, mask: [u8; 3]) {
+    let Some(idx) = pixel_offset(width, height, x, y) else {
+        return;
+    };
+    rgba[idx] ^= mask[0];
+    rgba[idx + 1] ^= mask[1];
+    rgba[idx + 2] ^= mask[2];
+    rgba[idx + 3] = 255;
+}
+
+fn set_pixel_blended(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 4]) {
+    let Some(idx) = pixel_offset(width, height, x, y) else {
+        return;
+    };
     let src_a = color[3] as f32 / 255.0;
     let inv = 1.0 - src_a;
     rgba[idx] = (color[0] as f32 * src_a + rgba[idx] as f32 * inv) as u8;
@@ -1452,6 +1553,10 @@ mod tests {
                 height: 8,
                 shape_rgba: vec![255; 8 * 8 * 4],
             }),
+            MouseRecord::CursorShapeMode(CursorShapeModeRecord {
+                shape_id: 7,
+                mode: CursorShapeCompositionMode::MaskedColor,
+            }),
             MouseRecord::CursorSample(CursorSampleRecord {
                 timestamp_ms: 12,
                 x: 100,
@@ -1465,6 +1570,10 @@ mod tests {
         assert_eq!(tracks.samples.len(), 1);
         assert_eq!(tracks.samples[0].shape_id, Some(7));
         assert!(tracks.cursor_shapes.contains_key(&7));
+        assert_eq!(
+            tracks.cursor_shape_modes.get(&7),
+            Some(&CursorShapeCompositionMode::MaskedColor)
+        );
     }
 
     #[test]
@@ -1485,6 +1594,10 @@ mod tests {
                 width: 1,
                 height: 1,
                 shape_rgba: vec![200, 10, 20, 255],
+            }),
+            MouseRecord::CursorShapeMode(CursorShapeModeRecord {
+                shape_id: 1,
+                mode: CursorShapeCompositionMode::AlphaBlend,
             }),
             MouseRecord::CursorSample(CursorSampleRecord {
                 timestamp_ms: 0,
@@ -1507,5 +1620,61 @@ mod tests {
 
         let px = (1usize * 4 + 2usize) * 4;
         assert_eq!(&frame.rgba[px..px + 4], &[200, 10, 20, 255]);
+    }
+
+    #[test]
+    fn apply_mouse_overlays_renders_masked_color_shape_without_black_box() {
+        let mut frame = StoredFrame {
+            timestamp_ms: 0,
+            duration_ms: 16,
+            width: 4,
+            height: 2,
+            rgba: vec![
+                // row 0
+                10, 20, 30, 255, 20, 40, 60, 255, 100, 120, 140, 255, 0, 0, 0, 255, // row 1
+                0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        };
+        let tracks = build_mouse_tracks(&[
+            MouseRecord::CursorShape(CursorShapeRecord {
+                shape_id: 5,
+                shape_hash: 5,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                width: 3,
+                height: 1,
+                shape_rgba: vec![
+                    // alpha=0xFF + zero mask => no-op
+                    0, 0, 0, 0xFF, // alpha=0xFF + non-zero mask => XOR
+                    0xFF, 0xFF, 0xFF, 0xFF, // alpha=0x00 => source copy
+                    5, 6, 7, 0x00,
+                ],
+            }),
+            MouseRecord::CursorShapeMode(CursorShapeModeRecord {
+                shape_id: 5,
+                mode: CursorShapeCompositionMode::MaskedColor,
+            }),
+            MouseRecord::CursorSample(CursorSampleRecord {
+                timestamp_ms: 0,
+                x: 0,
+                y: 0,
+                visible: true,
+                shape_id: Some(5),
+            }),
+        ]);
+
+        apply_mouse_overlays(
+            &mut frame,
+            &tracks,
+            &MouseEditConfig {
+                visible: true,
+                trail_enabled: false,
+                click_enabled: false,
+            },
+        );
+
+        assert_eq!(&frame.rgba[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&frame.rgba[4..8], &[235, 215, 195, 255]);
+        assert_eq!(&frame.rgba[8..12], &[5, 6, 7, 255]);
     }
 }

@@ -21,7 +21,7 @@ use windows::core::Interface;
 use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata, CursorCaptureConfig};
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
-use crate::frame::{CursorData, DirtyRect, Frame};
+use crate::frame::{CursorCompositionMode, CursorData, DirtyRect, Frame};
 use crate::monitor::MonitorId;
 
 use super::d3d11;
@@ -1487,7 +1487,7 @@ fn extract_cursor_data(
     let position_y = info.PointerPosition.Position.y;
 
     // Try to get pointer shape if it was updated this frame.
-    let (hotspot_x, hotspot_y, shape_width, shape_height, shape_rgba) =
+    let (hotspot_x, hotspot_y, shape_width, shape_height, composition_mode, shape_rgba) =
         if info.PointerShapeBufferSize > 0 {
             let buf_size = info.PointerShapeBufferSize as usize;
             let mut shape_buf = vec![0u8; buf_size];
@@ -1507,24 +1507,30 @@ fn extract_cursor_data(
                 let hotx = shape_info.HotSpot.x as u32;
                 let hoty = shape_info.HotSpot.y as u32;
 
-                // Convert to RGBA based on shape type.
-                let rgba = match shape_info.Type {
-                    t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32
-                        || t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 =>
-                    {
-                        convert_cursor_shape_bgra_to_rgba(&shape_buf, &shape_info)
-                    }
-                    _ => {
-                        // Monochrome or unknown -- skip shape data.
-                        Vec::new()
-                    }
-                };
-                (hotx, hoty, w, h, rgba)
+                if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
+                    let rgba = convert_cursor_shape_bgra_to_rgba(&shape_buf, &shape_info);
+                    (hotx, hoty, w, h, CursorCompositionMode::AlphaBlend, rgba)
+                } else if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
+                    // Keep DXGI masked-color alpha values intact. Downstream composition
+                    // handles `0x00 => copy` and `0xFF => XOR`.
+                    let rgba = convert_cursor_shape_bgra_to_rgba(&shape_buf, &shape_info);
+                    (hotx, hoty, w, h, CursorCompositionMode::MaskedColor, rgba)
+                } else {
+                    // Monochrome or unknown -- skip shape data.
+                    (
+                        hotx,
+                        hoty,
+                        w,
+                        h,
+                        CursorCompositionMode::AlphaBlend,
+                        Vec::new(),
+                    )
+                }
             } else {
-                (0, 0, 0, 0, Vec::new())
+                (0, 0, 0, 0, CursorCompositionMode::AlphaBlend, Vec::new())
             }
         } else {
-            (0, 0, 0, 0, Vec::new())
+            (0, 0, 0, 0, CursorCompositionMode::AlphaBlend, Vec::new())
         };
 
     Some(CursorData {
@@ -1535,6 +1541,7 @@ fn extract_cursor_data(
         visible,
         shape_width,
         shape_height,
+        composition_mode,
         shape_rgba,
     })
 }

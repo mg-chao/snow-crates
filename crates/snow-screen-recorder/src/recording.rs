@@ -12,14 +12,19 @@ use snow_audio_recorder::{
     AudioEvent, AudioFormat, AudioPacket, AudioSampleFormat, AudioSession, AudioSourceKind,
     AudioStreamConfig, AudioTimestampAnchor, DeviceSelector, SourceConfig, align_packet_frames,
 };
-use snow_capture::{CaptureEvent, CaptureMode, CaptureSession, CaptureTarget, StreamConfig};
+use snow_capture::{
+    CaptureEvent, CaptureMode, CaptureSession, CaptureTarget, CursorCompositionMode, StreamConfig,
+};
 use uuid::Uuid;
 
 use crate::artifact::{RecordingArtifact, SessionManifest};
 use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat};
 use crate::error::{Result, ScreenRecorderError};
 use crate::model::{StoredFrame, write_frames};
-use crate::mouse::{CursorSampleRecord, CursorShapeRecord, MouseRecord, write_mouse_records};
+use crate::mouse::{
+    CursorSampleRecord, CursorShapeCompositionMode, CursorShapeModeRecord, CursorShapeRecord,
+    MouseRecord, write_mouse_records,
+};
 use crate::temp::TempLayout;
 use crate::timeline::PauseTimeline;
 
@@ -652,6 +657,11 @@ impl WorkerContext {
                     height: cursor.shape_height,
                     shape_rgba: cursor.shape_rgba[..shape_bytes_len].to_vec(),
                 }));
+            self.mouse_records
+                .push(MouseRecord::CursorShapeMode(CursorShapeModeRecord {
+                    shape_id,
+                    mode: map_cursor_composition_mode(cursor.composition_mode),
+                }));
             shape_id
         };
 
@@ -939,6 +949,13 @@ fn duration_between_timestamps_ms(start_ts: u64, end_ts: u64, fallback_ms: u32) 
     delta.min(u64::from(u32::MAX)) as u32
 }
 
+fn map_cursor_composition_mode(mode: CursorCompositionMode) -> CursorShapeCompositionMode {
+    match mode {
+        CursorCompositionMode::AlphaBlend => CursorShapeCompositionMode::AlphaBlend,
+        CursorCompositionMode::MaskedColor => CursorShapeCompositionMode::MaskedColor,
+    }
+}
+
 fn cursor_shape_hash(cursor: &snow_capture::CursorData) -> Option<(u64, usize)> {
     if cursor.shape_width == 0 || cursor.shape_height == 0 {
         return None;
@@ -955,6 +972,7 @@ fn cursor_shape_hash(cursor: &snow_capture::CursorData) -> Option<(u64, usize)> 
     cursor.hotspot_y.hash(&mut hasher);
     cursor.shape_width.hash(&mut hasher);
     cursor.shape_height.hash(&mut hasher);
+    cursor.composition_mode.hash(&mut hasher);
     cursor.shape_rgba[..shape_bytes_len].hash(&mut hasher);
     Some((hasher.finish(), shape_bytes_len))
 }
@@ -1024,6 +1042,7 @@ mod tests {
             visible: true,
             shape_width: 8,
             shape_height: 8,
+            composition_mode: CursorCompositionMode::AlphaBlend,
             shape_rgba: vec![0; 8 * 8 * 4 - 1],
         };
         assert!(cursor_shape_hash(&cursor).is_none());
@@ -1039,6 +1058,7 @@ mod tests {
             visible: true,
             shape_width: 2,
             shape_height: 2,
+            composition_mode: CursorCompositionMode::AlphaBlend,
             shape_rgba: vec![0, 0, 0, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         };
 
@@ -1046,6 +1066,30 @@ mod tests {
             .expect("shape hash should exist")
             .0;
         cursor.shape_rgba[5] ^= 0xFF;
+        let second = cursor_shape_hash(&cursor)
+            .expect("shape hash should exist")
+            .0;
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn cursor_shape_hash_changes_when_composition_mode_changes() {
+        let mut cursor = snow_capture::CursorData {
+            hotspot_x: 1,
+            hotspot_y: 2,
+            position_x: 100,
+            position_y: 200,
+            visible: true,
+            shape_width: 1,
+            shape_height: 1,
+            composition_mode: CursorCompositionMode::AlphaBlend,
+            shape_rgba: vec![10, 20, 30, 40],
+        };
+
+        let first = cursor_shape_hash(&cursor)
+            .expect("shape hash should exist")
+            .0;
+        cursor.composition_mode = CursorCompositionMode::MaskedColor;
         let second = cursor_shape_hash(&cursor)
             .expect("shape hash should exist")
             .0;

@@ -12,6 +12,12 @@ pub enum MouseButton {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CursorShapeCompositionMode {
+    AlphaBlend,
+    MaskedColor,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CursorShapeRecord {
     pub shape_id: u32,
@@ -21,6 +27,12 @@ pub struct CursorShapeRecord {
     pub width: u32,
     pub height: u32,
     pub shape_rgba: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CursorShapeModeRecord {
+    pub shape_id: u32,
+    pub mode: CursorShapeCompositionMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +58,7 @@ pub enum MouseRecord {
     CursorShape(CursorShapeRecord),
     CursorSample(CursorSampleRecord),
     Click(ClickEventRecord),
+    CursorShapeMode(CursorShapeModeRecord),
 }
 
 pub fn write_mouse_records(path: &Path, records: &[MouseRecord]) -> Result<()> {

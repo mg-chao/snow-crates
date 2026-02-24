@@ -33,6 +33,17 @@ pub struct DirtyRect {
     pub height: u32,
 }
 
+/// Composition mode for cursor pixels captured alongside the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum CursorCompositionMode {
+    /// Standard per-pixel alpha compositing.
+    #[default]
+    AlphaBlend,
+    /// DXGI masked-color cursor semantics:
+    /// alpha `0x00` = source copy, alpha `0xFF` = XOR with destination.
+    MaskedColor,
+}
+
 /// Cursor shape data captured alongside the frame.
 #[derive(Clone, Debug)]
 pub struct CursorData {
@@ -50,6 +61,8 @@ pub struct CursorData {
     pub shape_width: u32,
     /// Cursor image height in pixels.
     pub shape_height: u32,
+    /// How cursor pixels should be composed onto the destination frame.
+    pub composition_mode: CursorCompositionMode,
     /// RGBA8 pixel data for the cursor shape.
     pub shape_rgba: Vec<u8>,
 }
