@@ -1,4 +1,4 @@
-pub mod artifact;
+﻿pub mod artifact;
 pub mod config;
 pub mod editing;
 pub mod error;
@@ -7,9 +7,8 @@ pub mod mouse;
 pub mod recording;
 pub mod temp;
 
-pub(crate) mod audio;
+pub(crate) mod model;
 pub(crate) mod timeline;
-pub(crate) mod video;
 
 pub use artifact::RecordingArtifact;
 pub use config::{

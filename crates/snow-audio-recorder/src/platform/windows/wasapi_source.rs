@@ -19,7 +19,9 @@ use windows::Win32::System::Com::{CLSCTX_ALL, CoTaskMemFree};
 use crate::device::{DeviceFlow, DeviceSelector};
 use crate::error::{AudioError, AudioResult};
 use crate::format::{AudioFormat, AudioSampleFormat};
-use crate::packet::{AudioPacket, AudioPacketMetadata, AudioSourceKind};
+use crate::packet::{
+    AudioPacket, AudioPacketMetadata, AudioSourceKind, frames_to_100ns, frames_to_duration,
+};
 use crate::session::SourceConfig;
 
 use super::com::EventHandle;
@@ -47,14 +49,103 @@ struct PendingMetadata {
     is_silent: bool,
 }
 
+struct BufferedChunk {
+    data: Vec<u8>,
+    frames: u32,
+    consumed_frames: u32,
+    metadata: PendingMetadata,
+}
+
+impl BufferedChunk {
+    fn remaining_frames(&self) -> u32 {
+        self.frames.saturating_sub(self.consumed_frames)
+    }
+
+    fn is_depleted(&self) -> bool {
+        self.consumed_frames >= self.frames
+    }
+
+    fn append_prefix_to(
+        &mut self,
+        frames: u32,
+        bytes_per_frame: usize,
+        sample_rate: u32,
+        packet_data: &mut Vec<u8>,
+        packet_meta: &mut Option<PendingMetadata>,
+    ) -> AudioResult<()> {
+        if frames == 0 {
+            return Ok(());
+        }
+
+        let start = (self.consumed_frames as usize)
+            .checked_mul(bytes_per_frame)
+            .ok_or(AudioError::BufferOverflow)?;
+        let byte_count = (frames as usize)
+            .checked_mul(bytes_per_frame)
+            .ok_or(AudioError::BufferOverflow)?;
+        let end = start
+            .checked_add(byte_count)
+            .ok_or(AudioError::BufferOverflow)?;
+        if end > self.data.len() {
+            return Err(AudioError::BufferOverflow);
+        }
+
+        packet_data.extend_from_slice(&self.data[start..end]);
+        let slice_meta = self.slice_end_metadata(frames, sample_rate)?;
+        merge_pending_meta(packet_meta, slice_meta);
+        self.consumed_frames = self
+            .consumed_frames
+            .checked_add(frames)
+            .ok_or(AudioError::BufferOverflow)?;
+        Ok(())
+    }
+
+    fn slice_end_metadata(
+        &self,
+        consumed_slice_frames: u32,
+        sample_rate: u32,
+    ) -> AudioResult<PendingMetadata> {
+        let slice_end_frame = self
+            .consumed_frames
+            .checked_add(consumed_slice_frames)
+            .ok_or(AudioError::BufferOverflow)?;
+        if slice_end_frame > self.frames {
+            return Err(AudioError::BufferOverflow);
+        }
+
+        let tail_frames = self.frames.saturating_sub(slice_end_frame);
+        let tail_duration = frames_to_duration(tail_frames, sample_rate);
+        let tail_100ns = frames_to_100ns(tail_frames, sample_rate);
+        let tail_frames_u64 = u64::from(tail_frames);
+
+        Ok(PendingMetadata {
+            capture_time: self
+                .metadata
+                .capture_time
+                .map(|end| end.checked_sub(tail_duration).unwrap_or(end)),
+            qpc_position_100ns: self
+                .metadata
+                .qpc_position_100ns
+                .map(|end| end.saturating_sub(tail_100ns)),
+            device_position_frames: self
+                .metadata
+                .device_position_frames
+                .map(|end| end.saturating_sub(tail_frames_u64)),
+            // WASAPI discontinuity marks the first sample after a gap, so it
+            // only applies to the first slice emitted from this chunk.
+            discontinuity: self.metadata.discontinuity && self.consumed_frames == 0,
+            is_silent: self.metadata.is_silent,
+        })
+    }
+}
+
 struct PacketAccumulator {
     source: AudioSourceKind,
     format: AudioFormat,
     target_frames: u32,
     bytes_per_frame: usize,
-    buffer: VecDeque<u8>,
+    chunks: VecDeque<BufferedChunk>,
     buffered_frames: u32,
-    pending_meta: Option<PendingMetadata>,
 }
 
 impl PacketAccumulator {
@@ -77,16 +168,14 @@ impl PacketAccumulator {
             format,
             target_frames,
             bytes_per_frame,
-            buffer: VecDeque::new(),
+            chunks: VecDeque::new(),
             buffered_frames: 0,
-            pending_meta: None,
         })
     }
 
     fn clear(&mut self) {
-        self.buffer.clear();
+        self.chunks.clear();
         self.buffered_frames = 0;
-        self.pending_meta = None;
     }
 
     fn push_chunk(
@@ -108,62 +197,88 @@ impl PacketAccumulator {
             return Err(AudioError::BufferOverflow);
         }
 
-        self.buffer.extend(bytes.iter().copied());
+        self.chunks.push_back(BufferedChunk {
+            data: bytes.to_vec(),
+            frames,
+            consumed_frames: 0,
+            metadata: meta,
+        });
         self.buffered_frames = self
             .buffered_frames
             .checked_add(frames)
             .ok_or(AudioError::BufferOverflow)?;
 
-        merge_pending_meta(&mut self.pending_meta, meta);
-
         let mut output = Vec::new();
-
         while self.buffered_frames >= self.target_frames {
-            let packet_byte_count = self
-                .bytes_per_frame
-                .checked_mul(self.target_frames as usize)
-                .ok_or(AudioError::BufferOverflow)?;
-
-            // Ensure the deque's internal storage is contiguous so we can
-            // drain efficiently instead of popping byte-by-byte.
-            self.buffer.make_contiguous();
-            let data: Vec<u8> = self.buffer.drain(..packet_byte_count).collect();
-
-            if data.len() != packet_byte_count {
-                return Err(AudioError::BufferOverflow);
-            }
-
-            self.buffered_frames -= self.target_frames;
-            *sequence = sequence.wrapping_add(1);
-            let pending = self
-                .pending_meta
-                .clone()
-                .unwrap_or_else(|| PendingMetadata {
-                    is_silent: true,
-                    ..Default::default()
-                });
-
-            output.push(AudioPacket {
-                source: self.source,
-                format: self.format,
-                frames: self.target_frames,
-                data,
-                metadata: AudioPacketMetadata {
-                    capture_time: pending.capture_time,
-                    qpc_position_100ns: pending.qpc_position_100ns,
-                    device_position_frames: pending.device_position_frames,
-                    discontinuity: pending.discontinuity,
-                    is_silent: pending.is_silent,
-                    sequence: *sequence,
-                },
-            });
-        }
-
-        if self.buffered_frames == 0 {
-            self.pending_meta = None;
+            output.push(self.build_packet(sequence)?);
         }
 
         Ok(output)
+    }
+
+    fn build_packet(&mut self, sequence: &mut u64) -> AudioResult<AudioPacket> {
+        let packet_byte_count = self
+            .bytes_per_frame
+            .checked_mul(self.target_frames as usize)
+            .ok_or(AudioError::BufferOverflow)?;
+
+        let mut data = Vec::with_capacity(packet_byte_count);
+        let mut packet_meta: Option<PendingMetadata> = None;
+        let mut remaining_frames = self.target_frames;
+
+        while remaining_frames > 0 {
+            let drop_chunk = {
+                let chunk = self.chunks.front_mut().ok_or(AudioError::BufferOverflow)?;
+                let available = chunk.remaining_frames();
+                if available == 0 {
+                    true
+                } else {
+                    let take = available.min(remaining_frames);
+                    chunk.append_prefix_to(
+                        take,
+                        self.bytes_per_frame,
+                        self.format.sample_rate,
+                        &mut data,
+                        &mut packet_meta,
+                    )?;
+                    remaining_frames = remaining_frames.saturating_sub(take);
+                    chunk.is_depleted()
+                }
+            };
+            if drop_chunk {
+                let _ = self.chunks.pop_front();
+            }
+        }
+
+        if data.len() != packet_byte_count {
+            return Err(AudioError::BufferOverflow);
+        }
+
+        self.buffered_frames = self
+            .buffered_frames
+            .checked_sub(self.target_frames)
+            .ok_or(AudioError::BufferOverflow)?;
+        *sequence = sequence.wrapping_add(1);
+
+        let pending = packet_meta.unwrap_or_else(|| PendingMetadata {
+            is_silent: true,
+            ..Default::default()
+        });
+
+        Ok(AudioPacket {
+            source: self.source,
+            format: self.format,
+            frames: self.target_frames,
+            data,
+            metadata: AudioPacketMetadata {
+                capture_time: pending.capture_time,
+                qpc_position_100ns: pending.qpc_position_100ns,
+                device_position_frames: pending.device_position_frames,
+                discontinuity: pending.discontinuity,
+                is_silent: pending.is_silent,
+                sequence: *sequence,
+            },
+        })
     }
 }
 

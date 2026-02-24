@@ -1,27 +1,25 @@
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use snow_audio_recorder::{
-    AudioEvent, AudioFormat, AudioSampleFormat, AudioSession, AudioSourceKind, AudioStreamConfig,
-    DeviceSelector, SourceConfig,
+    AudioEvent, AudioFormat, AudioPacket, AudioSampleFormat, AudioSession, AudioSourceKind,
+    AudioStreamConfig, AudioTimestampAnchor, DeviceSelector, SourceConfig, align_packet_frames,
 };
 use snow_capture::{CaptureEvent, CaptureMode, CaptureSession, CaptureTarget, StreamConfig};
 use uuid::Uuid;
 
 use crate::artifact::{RecordingArtifact, SessionManifest};
-use crate::audio::audio_writer::{AudioFileWriter, AudioWriterConfig};
 use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat};
 use crate::error::{Result, ScreenRecorderError};
-use crate::mouse::start_mouse_worker;
+use crate::model::{StoredFrame, write_frames};
+use crate::mouse::{CursorSampleRecord, MouseRecord, write_mouse_records};
 use crate::temp::TempLayout;
 use crate::timeline::PauseTimeline;
-use crate::video::encoder_h264_lossless::H264LosslessFileWriter;
-use crate::video::frame_cache::{
-    FrameBlock, FrameBlockKind, FrameCacheWriter, RectPatch, extract_patch,
-};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordingState {
@@ -60,8 +58,6 @@ enum WorkerCommand {
 struct RuntimeHandles {
     control_tx: Sender<WorkerCommand>,
     worker_handle: JoinHandle<Result<WorkerOutcome>>,
-    mouse_stop: Arc<std::sync::atomic::AtomicBool>,
-    mouse_handle: JoinHandle<Result<()>>,
 }
 
 #[derive(Debug)]
@@ -125,12 +121,9 @@ impl RecordingSession {
 
         let capture_session = CaptureSession::builder()
             .capture_mode(CaptureMode::ScreenRecording)
-            .capture_cursor(false)
+            .capture_cursor(true)
             .build()?;
-        // Video-priority strategy:
-        // 1) start audio first to guarantee full coverage,
-        // 2) then start capture,
-        // 3) trim against video timeline during export.
+
         let started_at = Instant::now();
         let mut audio_stream = start_audio_stream_if_enabled(&self.config)?;
         let capture_stream = match capture_session.start_streaming(
@@ -153,8 +146,8 @@ impl RecordingSession {
                 return Err(ScreenRecorderError::Capture(err));
             }
         };
-        let (control_tx, control_rx) = crossbeam_channel::unbounded::<WorkerCommand>();
 
+        let (control_tx, control_rx) = crossbeam_channel::unbounded::<WorkerCommand>();
         let layout = self.layout.clone();
         let config = self.config.clone();
         let worker_handle = std::thread::Builder::new()
@@ -167,24 +160,15 @@ impl RecordingSession {
                     audio_stream,
                     control_rx,
                     started_at,
+                    origin.0,
+                    origin.1,
                 )
             })
             .map_err(|e| ScreenRecorderError::Io(std::io::Error::other(e)))?;
 
-        let mouse_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mouse_handle = start_mouse_worker(
-            self.layout.mouse_path.clone(),
-            Arc::clone(&mouse_stop),
-            started_at,
-            origin.0,
-            origin.1,
-        );
-
         let runtime = RuntimeHandles {
             control_tx,
             worker_handle,
-            mouse_stop,
-            mouse_handle,
         };
 
         let mut guard = self
@@ -254,20 +238,14 @@ impl RecordingSession {
         drop(runtime_guard);
 
         let _ = runtime.control_tx.send(WorkerCommand::Stop);
-        runtime.mouse_stop.store(true, Ordering::Release);
 
         let worker_result = runtime.worker_handle.join().map_err(|_| {
             ScreenRecorderError::Encode("recording worker thread panicked".to_string())
         })?;
-        let mouse_result = runtime
-            .mouse_handle
-            .join()
-            .map_err(|_| ScreenRecorderError::Encode("mouse worker thread panicked".to_string()))?;
 
         self.state
             .store(RecordingState::Stopped.as_u8(), Ordering::Release);
 
-        mouse_result?;
         let outcome = worker_result?;
 
         let (capture_origin_x, capture_origin_y) = *self.capture_origin.lock().map_err(|_| {
@@ -426,20 +404,141 @@ fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
     }
 }
 
+struct PcmTrackWriter {
+    writer: BufWriter<File>,
+    sample_rate_hz: u32,
+    channels: u16,
+    written_frames: u64,
+    anchor: AudioTimestampAnchor,
+}
+
+impl PcmTrackWriter {
+    fn create(
+        path: &std::path::Path,
+        sample_rate_hz: u32,
+        channels: u16,
+        started_at: Instant,
+    ) -> Result<Self> {
+        let file = File::create(path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+            sample_rate_hz: sample_rate_hz.max(1),
+            channels: channels.max(1),
+            written_frames: 0,
+            anchor: AudioTimestampAnchor::from_origin_instant(started_at),
+        })
+    }
+
+    fn append_silence_frames(&mut self, frames: u64) -> Result<()> {
+        if frames == 0 {
+            return Ok(());
+        }
+
+        let channels = usize::from(self.channels);
+        const CHUNK_FRAMES: u64 = 4096;
+        let chunk = vec![0u8; CHUNK_FRAMES as usize * channels * 2];
+
+        let mut remaining = frames;
+        while remaining > 0 {
+            let take = remaining.min(CHUNK_FRAMES);
+            let take_bytes = take as usize * channels * 2;
+            self.writer.write_all(&chunk[..take_bytes])?;
+            self.written_frames = self.written_frames.saturating_add(take);
+            remaining -= take;
+        }
+
+        Ok(())
+    }
+
+    fn append_i16_bytes(&mut self, bytes: &[u8]) -> Result<u64> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+
+        let channels = usize::from(self.channels);
+        if bytes.len() % (channels * 2) != 0 {
+            return Err(ScreenRecorderError::Encode(
+                "PCM bytes are not channel aligned".to_string(),
+            ));
+        }
+
+        self.writer.write_all(bytes)?;
+        let frames = (bytes.len() / 2 / channels) as u64;
+        self.written_frames = self.written_frames.saturating_add(frames);
+        Ok(frames)
+    }
+
+    fn write_packet(
+        &mut self,
+        packet: &AudioPacket,
+        bytes: &[u8],
+        timeline: &PauseTimeline,
+    ) -> Result<u64> {
+        let channels = usize::from(self.channels);
+        if bytes.len() % (channels * 2) != 0 {
+            return Err(ScreenRecorderError::Encode(
+                "audio packet bytes are not channel aligned".to_string(),
+            ));
+        }
+
+        let packet_frames = (bytes.len() / 2 / channels) as u64;
+        if packet_frames == 0 {
+            return Ok(0);
+        }
+
+        let packet_ts = self.anchor.stream_relative(packet);
+        let active_start = timeline.active_elapsed_from_stream_offset(packet_ts.start);
+        let aligned = align_packet_frames(
+            self.written_frames,
+            self.sample_rate_hz,
+            snow_audio_recorder::AudioPacketTimestamp {
+                start: active_start,
+                end: timeline.active_elapsed_from_stream_offset(packet_ts.end),
+            },
+            packet_frames,
+        );
+
+        if aligned.silence_prefix_frames > 0 {
+            self.append_silence_frames(aligned.silence_prefix_frames)?;
+        }
+
+        if aligned.write_packet_frames == 0 {
+            return Ok(0);
+        }
+
+        let skip_samples = aligned
+            .skip_packet_frames
+            .checked_mul(channels as u64)
+            .ok_or_else(|| {
+                ScreenRecorderError::Encode("audio overlap computation overflow".to_string())
+            })? as usize;
+        let skip_bytes = skip_samples.checked_mul(2).ok_or_else(|| {
+            ScreenRecorderError::Encode("audio overlap byte computation overflow".to_string())
+        })?;
+
+        self.append_i16_bytes(&bytes[skip_bytes..])
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
+    }
+}
+
 struct WorkerContext {
+    layout: TempLayout,
     frame_interval_ms: u32,
-    video_writer: H264LosslessFileWriter,
-    frame_cache: FrameCacheWriter,
-    system_audio_writer: Option<AudioFileWriter>,
-    mic_audio_writer: Option<AudioFileWriter>,
-    audio_channels: u16,
     timeline: PauseTimeline,
+    capture_origin_x: i32,
+    capture_origin_y: i32,
     width: u32,
     height: u32,
-    prev_rgba: Option<Vec<u8>>,
-    pending_block: Option<FrameBlock>,
-    last_keyframe_ts_ms: u64,
+    frames: Vec<StoredFrame>,
+    pending_frame: Option<StoredFrame>,
     last_observed_ts_ms: Option<u64>,
+    mouse_records: Vec<MouseRecord>,
+    system_audio: Option<PcmTrackWriter>,
+    mic_audio: Option<PcmTrackWriter>,
     capture_ended: bool,
     audio_ended: bool,
     recorded_system_audio: bool,
@@ -447,47 +546,53 @@ struct WorkerContext {
 }
 
 impl WorkerContext {
-    fn new(config: &RecordingConfig, layout: &TempLayout, started_at: Instant) -> Result<Self> {
+    fn new(
+        config: &RecordingConfig,
+        layout: TempLayout,
+        started_at: Instant,
+        capture_origin_x: i32,
+        capture_origin_y: i32,
+    ) -> Result<Self> {
         let frame_interval_ms = ((1000.0 / config.fps.max(1) as f32).round() as u32).max(1);
+        let sample_rate_hz = config.audio.sample_rate_hz.max(1);
+        let channels = config.audio.channels.channels().max(1);
 
-        let system_audio_writer = if config.audio.system_audio_enabled {
-            Some(AudioFileWriter::create(AudioWriterConfig {
-                output_path: layout.audio_system_path.clone(),
-                format: config.audio.format,
-                sample_rate_hz: config.audio.sample_rate_hz,
-                channels: config.audio.channels.channels(),
-                bitrate_kbps: config.audio.bitrate_kbps,
-            })?)
+        let system_audio = if config.audio.system_audio_enabled {
+            Some(PcmTrackWriter::create(
+                &layout.audio_system_path,
+                sample_rate_hz,
+                channels,
+                started_at,
+            )?)
         } else {
             None
         };
 
-        let mic_audio_writer = if config.audio.microphone_enabled {
-            Some(AudioFileWriter::create(AudioWriterConfig {
-                output_path: layout.audio_mic_path.clone(),
-                format: config.audio.format,
-                sample_rate_hz: config.audio.sample_rate_hz,
-                channels: config.audio.channels.channels(),
-                bitrate_kbps: config.audio.bitrate_kbps,
-            })?)
+        let mic_audio = if config.audio.microphone_enabled {
+            Some(PcmTrackWriter::create(
+                &layout.audio_mic_path,
+                sample_rate_hz,
+                channels,
+                started_at,
+            )?)
         } else {
             None
         };
 
         Ok(Self {
+            layout,
             frame_interval_ms,
-            video_writer: H264LosslessFileWriter::create(&layout.video_temp_path)?,
-            frame_cache: FrameCacheWriter::create(&layout.frame_cache_path)?,
-            system_audio_writer,
-            mic_audio_writer,
-            audio_channels: config.audio.channels.channels(),
             timeline: PauseTimeline::new(started_at),
+            capture_origin_x,
+            capture_origin_y,
             width: 0,
             height: 0,
-            prev_rgba: None,
-            pending_block: None,
-            last_keyframe_ts_ms: 0,
+            frames: Vec::new(),
+            pending_frame: None,
             last_observed_ts_ms: None,
+            mouse_records: Vec::new(),
+            system_audio,
+            mic_audio,
             capture_ended: false,
             audio_ended: false,
             recorded_system_audio: false,
@@ -497,7 +602,7 @@ impl WorkerContext {
 
     fn pause(&mut self, at: Instant) {
         let ts = self.timeline.active_elapsed_ms(at);
-        self.settle_pending_block_duration(ts);
+        self.observe_video_time(ts);
         self.timeline.mark_pause(at);
     }
 
@@ -505,13 +610,23 @@ impl WorkerContext {
         self.timeline.mark_resume(at);
     }
 
+    fn observe_video_time(&mut self, ts_ms: u64) {
+        self.last_observed_ts_ms = Some(ts_ms);
+        if let Some(frame) = self.pending_frame.as_mut() {
+            frame.duration_ms = duration_between_timestamps_ms(
+                frame.timestamp_ms,
+                ts_ms,
+                self.frame_interval_ms.max(1),
+            );
+        }
+    }
+
     fn handle_capture_event(&mut self, event: CaptureEvent) -> Result<()> {
         match event {
             CaptureEvent::Frame(frame) => self.handle_frame(frame),
             CaptureEvent::FrameDropped { .. } => {
-                if let Some(last_ts) = self.last_observed_ts_ms {
-                    let inferred_ts = last_ts.saturating_add(u64::from(self.frame_interval_ms));
-                    self.settle_pending_block_duration(inferred_ts);
+                if let Some(last) = self.last_observed_ts_ms {
+                    self.observe_video_time(last.saturating_add(u64::from(self.frame_interval_ms)));
                 }
                 Ok(())
             }
@@ -524,7 +639,7 @@ impl WorkerContext {
                 Ok(())
             }
             CaptureEvent::ResolutionChanged { .. } => Err(ScreenRecorderError::Encode(
-                "resolution changes during recording are not supported in v1".to_string(),
+                "resolution changes during recording are not supported in this version".to_string(),
             )),
             CaptureEvent::StreamEnded => {
                 self.capture_ended = true;
@@ -536,8 +651,6 @@ impl WorkerContext {
 
     fn handle_frame(&mut self, frame: snow_capture::frame::Frame) -> Result<()> {
         let (width, height) = frame.dimensions();
-        let rgba = frame.as_rgba_bytes();
-
         if self.width == 0 || self.height == 0 {
             self.width = width;
             self.height = height;
@@ -548,78 +661,62 @@ impl WorkerContext {
             )));
         }
 
-        let ts = self
-            .timeline
-            .active_elapsed_ms(frame.metadata.capture_time.unwrap_or_else(Instant::now));
-        self.settle_pending_block_duration(ts);
+        let capture_at = frame.metadata.capture_time.unwrap_or_else(Instant::now);
+        let ts_ms = self.timeline.active_elapsed_ms(capture_at);
+        self.observe_video_time(ts_ms);
 
-        let is_duplicate = frame.metadata.is_duplicate;
-        if is_duplicate {
+        if let Some(cursor) = frame.metadata.cursor.as_ref() {
+            self.mouse_records
+                .push(MouseRecord::CursorSample(CursorSampleRecord {
+                    timestamp_ms: ts_ms,
+                    x: cursor.position_x - self.capture_origin_x,
+                    y: cursor.position_y - self.capture_origin_y,
+                    visible: cursor.visible,
+                    shape_id: None,
+                }));
+        }
+
+        if frame.metadata.is_duplicate {
             return Ok(());
         }
 
-        self.video_writer.write_rgba_frame(width, height, rgba)?;
-
-        if let Some(block) = self.pending_block.take() {
-            self.frame_cache.write_block(&block)?;
+        if let Some(done) = self.pending_frame.take() {
+            self.frames.push(done);
         }
 
-        let force_keyframe =
-            self.prev_rgba.is_none() || ts.saturating_sub(self.last_keyframe_ts_ms) >= 2000;
-        let kind = if !force_keyframe {
-            build_delta_kind(&frame, self.width, self.height)?.unwrap_or_else(|| {
-                FrameBlockKind::Keyframe {
-                    rgba: rgba.to_vec(),
-                }
-            })
-        } else {
-            FrameBlockKind::Keyframe {
-                rgba: rgba.to_vec(),
-            }
-        };
-
-        if matches!(kind, FrameBlockKind::Keyframe { .. }) {
-            self.last_keyframe_ts_ms = ts;
-        }
-
-        self.prev_rgba = Some(rgba.to_vec());
-        self.pending_block = Some(FrameBlock {
-            timestamp_ms: ts,
+        self.pending_frame = Some(StoredFrame {
+            timestamp_ms: ts_ms,
             duration_ms: self.frame_interval_ms,
-            width: self.width,
-            height: self.height,
-            kind,
+            width,
+            height,
+            rgba: frame.as_rgba_bytes().to_vec(),
         });
         Ok(())
-    }
-
-    fn settle_pending_block_duration(&mut self, ts: u64) {
-        self.last_observed_ts_ms = Some(ts);
-        let Some(block) = self.pending_block.as_mut() else {
-            return;
-        };
-
-        block.duration_ms =
-            duration_between_timestamps_ms(block.timestamp_ms, ts, self.frame_interval_ms.max(1));
     }
 
     fn handle_audio_event(&mut self, event: AudioEvent) -> Result<()> {
         match event {
             AudioEvent::Packet(packet) => {
                 let bytes = audio_packet_to_i16_le_bytes(&packet)?;
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+
                 match packet.source {
                     AudioSourceKind::System => {
-                        if let Some(writer) = self.system_audio_writer.as_mut() {
-                            writer.append_i16_le_bytes(&bytes)?;
-                            self.recorded_system_audio =
-                                self.recorded_system_audio || !bytes.is_empty();
+                        if let Some(writer) = self.system_audio.as_mut() {
+                            let appended = writer.write_packet(&packet, &bytes, &self.timeline)?;
+                            if appended > 0 {
+                                self.recorded_system_audio = true;
+                            }
                         }
                     }
                     AudioSourceKind::Microphone => {
-                        if let Some(writer) = self.mic_audio_writer.as_mut() {
-                            writer.append_i16_le_bytes(&bytes)?;
-                            self.recorded_microphone_audio =
-                                self.recorded_microphone_audio || !bytes.is_empty();
+                        if let Some(writer) = self.mic_audio.as_mut() {
+                            let appended = writer.write_packet(&packet, &bytes, &self.timeline)?;
+                            if appended > 0 {
+                                self.recorded_microphone_audio = true;
+                            }
                         }
                     }
                 }
@@ -631,15 +728,19 @@ impl WorkerContext {
             } => {
                 match source {
                     AudioSourceKind::System => {
-                        if let Some(writer) = self.system_audio_writer.as_mut() {
-                            append_silence_i16_frames(writer, dropped_frames, self.audio_channels)?;
-                            self.recorded_system_audio = true;
+                        if let Some(writer) = self.system_audio.as_mut() {
+                            writer.append_silence_frames(dropped_frames)?;
+                            if dropped_frames > 0 {
+                                self.recorded_system_audio = true;
+                            }
                         }
                     }
                     AudioSourceKind::Microphone => {
-                        if let Some(writer) = self.mic_audio_writer.as_mut() {
-                            append_silence_i16_frames(writer, dropped_frames, self.audio_channels)?;
-                            self.recorded_microphone_audio = true;
+                        if let Some(writer) = self.mic_audio.as_mut() {
+                            writer.append_silence_frames(dropped_frames)?;
+                            if dropped_frames > 0 {
+                                self.recorded_microphone_audio = true;
+                            }
                         }
                     }
                 }
@@ -656,27 +757,27 @@ impl WorkerContext {
 
     fn finalize(mut self, at: Instant) -> Result<WorkerOutcome> {
         self.timeline.finalize(at);
-        let final_ts = self.timeline.active_elapsed_ms(at);
-        self.settle_pending_block_duration(final_ts);
+        let final_ts_ms = self.timeline.active_elapsed_ms(at);
+        self.observe_video_time(final_ts_ms);
 
-        if let Some(block) = self.pending_block.take() {
-            self.frame_cache.write_block(&block)?;
-        }
-        self.frame_cache.flush()?;
-
-        self.video_writer.flush()?;
-
-        if let Some(writer) = self.system_audio_writer.take() {
-            writer.finish()?;
-        }
-        if let Some(writer) = self.mic_audio_writer.take() {
-            writer.finish()?;
+        if let Some(done) = self.pending_frame.take() {
+            self.frames.push(done);
         }
 
-        if self.width == 0 || self.height == 0 {
+        if self.frames.is_empty() {
             return Err(ScreenRecorderError::Encode(
                 "recording ended without any video frames".to_string(),
             ));
+        }
+
+        write_frames(&self.layout.frame_cache_path, &self.frames)?;
+        write_mouse_records(&self.layout.mouse_path, &self.mouse_records)?;
+
+        if let Some(writer) = self.system_audio.take() {
+            writer.finish()?;
+        }
+        if let Some(writer) = self.mic_audio.take() {
+            writer.finish()?;
         }
 
         Ok(WorkerOutcome {
@@ -696,8 +797,16 @@ fn recording_worker(
     mut audio_stream: Option<snow_audio_recorder::AudioStreamHandle>,
     control_rx: Receiver<WorkerCommand>,
     started_at: Instant,
+    capture_origin_x: i32,
+    capture_origin_y: i32,
 ) -> Result<WorkerOutcome> {
-    let mut ctx = WorkerContext::new(&config, &layout, started_at)?;
+    let mut ctx = WorkerContext::new(
+        &config,
+        layout,
+        started_at,
+        capture_origin_x,
+        capture_origin_y,
+    )?;
     let mut stopping = false;
     let mut stop_requested_at = None::<Instant>;
 
@@ -705,18 +814,20 @@ fn recording_worker(
         while let Ok(cmd) = control_rx.try_recv() {
             match cmd {
                 WorkerCommand::Pause => {
+                    let now = Instant::now();
+                    ctx.pause(now);
                     capture_stream.pause();
                     if let Some(audio) = audio_stream.as_ref() {
                         audio.pause();
                     }
-                    ctx.pause(Instant::now());
                 }
                 WorkerCommand::Resume => {
+                    let now = Instant::now();
+                    ctx.resume(now);
                     capture_stream.resume();
                     if let Some(audio) = audio_stream.as_ref() {
                         audio.resume();
                     }
-                    ctx.resume(Instant::now());
                 }
                 WorkerCommand::Stop => {
                     stop_requested_at = Some(Instant::now());
@@ -761,10 +872,6 @@ fn recording_worker(
         }
     }
 
-    // Stop order for video-priority export:
-    // 1) stop video first,
-    // 2) then stop audio,
-    // 3) export-stage trimming aligns audio to the video window.
     capture_stream.stop();
     for event in capture_stream.stop_and_drain() {
         ctx.handle_capture_event(event)?;
@@ -782,53 +889,6 @@ fn recording_worker(
 
     let finalize_at = stop_requested_at.unwrap_or_else(Instant::now);
     ctx.finalize(finalize_at)
-}
-
-fn build_delta_kind(
-    frame: &snow_capture::frame::Frame,
-    width: u32,
-    height: u32,
-) -> Result<Option<FrameBlockKind>> {
-    let dirty_rects = &frame.metadata.dirty_rects;
-    if dirty_rects.is_empty() {
-        return Ok(None);
-    }
-
-    let frame_area = u64::from(width) * u64::from(height);
-    if frame_area == 0 {
-        return Ok(None);
-    }
-
-    let mut dirty_area: u64 = 0;
-    let mut patches = Vec::<RectPatch>::new();
-    let rgba = frame.as_rgba_bytes();
-
-    for rect in dirty_rects {
-        if rect.width == 0 || rect.height == 0 {
-            continue;
-        }
-
-        let safe_w = rect.width.min(width.saturating_sub(rect.x));
-        let safe_h = rect.height.min(height.saturating_sub(rect.y));
-        if safe_w == 0 || safe_h == 0 {
-            continue;
-        }
-
-        dirty_area = dirty_area.saturating_add(u64::from(safe_w) * u64::from(safe_h));
-        patches.push(extract_patch(
-            rgba, width, height, rect.x, rect.y, safe_w, safe_h,
-        )?);
-    }
-
-    if patches.is_empty() {
-        return Ok(None);
-    }
-
-    if (dirty_area as f64 / frame_area as f64) > 0.40 {
-        return Ok(None);
-    }
-
-    Ok(Some(FrameBlockKind::Delta { patches }))
 }
 
 fn duration_between_timestamps_ms(start_ts: u64, end_ts: u64, fallback_ms: u32) -> u32 {
@@ -868,30 +928,6 @@ fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPacket) -> Re
     }
 }
 
-fn append_silence_i16_frames(
-    writer: &mut AudioFileWriter,
-    frames: u64,
-    channels: u16,
-) -> Result<()> {
-    if frames == 0 {
-        return Ok(());
-    }
-
-    let channels = usize::from(channels.max(1));
-    const CHUNK_FRAMES: u64 = 4096;
-    let chunk_template = vec![0u8; CHUNK_FRAMES as usize * channels * 2];
-
-    let mut remaining = frames;
-    while remaining > 0 {
-        let take_frames = remaining.min(CHUNK_FRAMES);
-        let take_bytes = take_frames as usize * channels * 2;
-        writer.append_i16_le_bytes(&chunk_template[..take_bytes])?;
-        remaining -= take_frames;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,18 +942,6 @@ mod tests {
         ] {
             assert_eq!(state, RecordingState::from_u8(state.as_u8()));
         }
-    }
-
-    #[test]
-    fn create_accepts_aac() {
-        let mut config = RecordingConfig::default();
-        config.audio.format = crate::config::RecordingAudioFormat::Aac;
-        config.output_dir = std::env::temp_dir().join(format!(
-            "snow-screen-recorder-test-{}",
-            Uuid::new_v4().simple()
-        ));
-
-        assert!(RecordingSession::create(config).is_ok());
     }
 
     #[test]

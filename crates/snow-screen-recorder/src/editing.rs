@@ -1,16 +1,17 @@
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::Duration;
 
-use crate::artifact::{PauseInterval, RecordingArtifact, SessionManifest};
+use ffmpeg_next as ffmpeg;
+use snow_audio_recorder::align_i16_interleaved_to_duration;
+
+use crate::artifact::{RecordingArtifact, SessionManifest};
 use crate::config::{EditConfig, ExportFormat, MouseEditConfig};
 use crate::error::{Result, ScreenRecorderError};
 use crate::export::ExportResult;
+use crate::model::{StoredFrame, read_frames};
 use crate::mouse::{ClickEventRecord, CursorSampleRecord, MouseRecord, read_mouse_records};
-use crate::video::encoder_h264_lossless::{
-    AudioMixTrack, Mp4AudioMixConfig, decode_h264_video_to_frames, export_frames_to_avi,
-    export_frames_to_gif, export_frames_to_mp4_with_audio,
-};
-use crate::video::frame_cache::{ReconstructedFrame, reconstruct_frames};
 
 pub struct EditingSession {
     artifact: RecordingArtifact,
@@ -79,23 +80,21 @@ impl EditingSession {
     }
 
     fn export_inner(self) -> Result<ExportResult> {
-        if let Some(parent) = self.config.export.output_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = self.config.export.output_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
 
-        let source_frames = load_source_frames(&self.manifest)?;
+        let source_frames = read_frames(&self.manifest.frame_cache_path)?;
         if source_frames.is_empty() {
             return Err(ScreenRecorderError::Export(
                 "no frames available for export".to_string(),
             ));
         }
 
-        let mouse_tracks = build_mouse_tracks(
-            &self.manifest.pause_intervals,
-            &read_mouse_records(&self.manifest.mouse_path)?,
-        );
+        let mouse_records = read_mouse_records(&self.manifest.mouse_path)?;
+        let mouse_tracks = build_mouse_tracks(&mouse_records);
 
         let params = quality_params(
             self.manifest.fps,
@@ -117,9 +116,8 @@ impl EditingSession {
             source_frames[0].width,
             source_frames[0].height,
             params.scale,
-            self.config.export.format == ExportFormat::Mp4,
+            self.config.export.format != ExportFormat::Gif,
         );
-
         for frame in &mut frames {
             apply_mouse_overlays(frame, &mouse_tracks, &self.config.mouse);
             if frame.width != scaled_w || frame.height != scaled_h {
@@ -130,26 +128,44 @@ impl EditingSession {
             }
         }
 
+        let duration_ms = frames
+            .iter()
+            .map(|f| u64::from(f.duration_ms.max(1)))
+            .sum::<u64>()
+            .max(1);
+
+        let mixed_audio = if self.config.export.format == ExportFormat::Gif {
+            None
+        } else {
+            build_mixed_audio(&self.manifest, &self.config, duration_ms)?
+        };
+
         match self.config.export.format {
-            ExportFormat::Mp4 => export_mp4(
+            ExportFormat::Mp4 => export_video(
                 &self.config.export.output_path,
                 &frames,
                 params.export_fps,
-                build_mp4_audio_mix_config(&self.manifest, &self.config, &source_frames),
+                ExportFormat::Mp4,
+                mixed_audio.as_ref(),
+                self.manifest.audio_bitrate_kbps.max(8),
             )?,
-            ExportFormat::Avi => {
-                export_avi(&self.config.export.output_path, &frames, params.export_fps)?
-            }
-            ExportFormat::Gif => {
-                export_gif(&self.config.export.output_path, &frames, params.export_fps)?
-            }
+            ExportFormat::Avi => export_video(
+                &self.config.export.output_path,
+                &frames,
+                params.export_fps,
+                ExportFormat::Avi,
+                mixed_audio.as_ref(),
+                self.manifest.audio_bitrate_kbps.max(8),
+            )?,
+            ExportFormat::Gif => export_video(
+                &self.config.export.output_path,
+                &frames,
+                params.export_fps,
+                ExportFormat::Gif,
+                None,
+                self.manifest.audio_bitrate_kbps.max(8),
+            )?,
         }
-
-        let duration_ms = frames
-            .iter()
-            .map(|f| u64::from(f.duration_ms))
-            .sum::<u64>()
-            .max(1);
 
         Ok(ExportResult {
             output_path: self.config.export.output_path,
@@ -196,10 +212,10 @@ fn scaled_dimensions(src_w: u32, src_h: u32, scale: f32, force_even: bool) -> (u
 }
 
 fn retime_frames(
-    source_frames: &[ReconstructedFrame],
+    source_frames: &[StoredFrame],
     playback_speed: f32,
     export_fps: u32,
-) -> Result<Vec<ReconstructedFrame>> {
+) -> Result<Vec<StoredFrame>> {
     let speed = playback_speed.clamp(0.25, 4.0);
     let interval_ms = (1000.0 / export_fps.max(1) as f64).max(1.0);
 
@@ -278,7 +294,7 @@ struct MouseTracks {
     click_downs: Vec<MouseClickDown>,
 }
 
-fn build_mouse_tracks(pauses: &[PauseInterval], records: &[MouseRecord]) -> MouseTracks {
+fn build_mouse_tracks(records: &[MouseRecord]) -> MouseTracks {
     let mut tracks = MouseTracks::default();
 
     for record in records {
@@ -291,7 +307,7 @@ fn build_mouse_tracks(pauses: &[PauseInterval], records: &[MouseRecord]) -> Mous
                 ..
             }) => {
                 tracks.samples.push(MouseSample {
-                    ts_ms: map_wall_to_active(*timestamp_ms, pauses),
+                    ts_ms: *timestamp_ms,
                     x: *x,
                     y: *y,
                     visible: *visible,
@@ -305,7 +321,7 @@ fn build_mouse_tracks(pauses: &[PauseInterval], records: &[MouseRecord]) -> Mous
                 ..
             }) if *down => {
                 tracks.click_downs.push(MouseClickDown {
-                    ts_ms: map_wall_to_active(*timestamp_ms, pauses),
+                    ts_ms: *timestamp_ms,
                     x: *x,
                     y: *y,
                 });
@@ -319,26 +335,7 @@ fn build_mouse_tracks(pauses: &[PauseInterval], records: &[MouseRecord]) -> Mous
     tracks
 }
 
-fn map_wall_to_active(timestamp_ms: u64, pauses: &[PauseInterval]) -> u64 {
-    let mut active = timestamp_ms;
-    for pause in pauses {
-        if timestamp_ms >= pause.end_ms {
-            active = active.saturating_sub(pause.end_ms.saturating_sub(pause.start_ms));
-            continue;
-        }
-        if timestamp_ms > pause.start_ms {
-            active = active.saturating_sub(timestamp_ms.saturating_sub(pause.start_ms));
-            break;
-        }
-    }
-    active
-}
-
-fn apply_mouse_overlays(
-    frame: &mut ReconstructedFrame,
-    tracks: &MouseTracks,
-    config: &MouseEditConfig,
-) {
+fn apply_mouse_overlays(frame: &mut StoredFrame, tracks: &MouseTracks, config: &MouseEditConfig) {
     if tracks.samples.is_empty() {
         return;
     }
@@ -353,17 +350,15 @@ fn apply_mouse_overlays(
     if config.trail_enabled {
         draw_mouse_trail(frame, &tracks.samples[..cursor_idx], ts);
     }
-
     if config.click_enabled {
         draw_click_ripples(frame, &tracks.click_downs, ts);
     }
-
     if config.visible && current.visible {
         draw_cursor(frame, current.x, current.y);
     }
 }
 
-fn draw_mouse_trail(frame: &mut ReconstructedFrame, samples: &[MouseSample], ts: u64) {
+fn draw_mouse_trail(frame: &mut StoredFrame, samples: &[MouseSample], ts: u64) {
     let trail_window_ms = 600u64;
     let cutoff = ts.saturating_sub(trail_window_ms);
     let recent: Vec<&MouseSample> = samples
@@ -386,7 +381,7 @@ fn draw_mouse_trail(frame: &mut ReconstructedFrame, samples: &[MouseSample], ts:
     }
 }
 
-fn draw_click_ripples(frame: &mut ReconstructedFrame, clicks: &[MouseClickDown], ts: u64) {
+fn draw_click_ripples(frame: &mut StoredFrame, clicks: &[MouseClickDown], ts: u64) {
     let ripple_ms = 350u64;
     for click in clicks {
         if ts < click.ts_ms || ts > click.ts_ms + ripple_ms {
@@ -399,7 +394,7 @@ fn draw_click_ripples(frame: &mut ReconstructedFrame, clicks: &[MouseClickDown],
     }
 }
 
-fn draw_cursor(frame: &mut ReconstructedFrame, x: i32, y: i32) {
+fn draw_cursor(frame: &mut StoredFrame, x: i32, y: i32) {
     let points = [(x, y), (x + 12, y + 4), (x + 4, y + 12)];
     fill_triangle(frame, points, [255, 255, 255, 235]);
     draw_line(frame, x, y, x + 12, y + 4, [0, 0, 0, 200], 1);
@@ -421,7 +416,7 @@ fn set_pixel_blended(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, c
 }
 
 fn draw_line(
-    frame: &mut ReconstructedFrame,
+    frame: &mut StoredFrame,
     x0: i32,
     y0: i32,
     x1: i32,
@@ -465,13 +460,7 @@ fn draw_line(
     }
 }
 
-fn draw_circle_outline(
-    frame: &mut ReconstructedFrame,
-    cx: i32,
-    cy: i32,
-    radius: i32,
-    color: [u8; 4],
-) {
+fn draw_circle_outline(frame: &mut StoredFrame, cx: i32, cy: i32, radius: i32, color: [u8; 4]) {
     if radius <= 0 {
         return;
     }
@@ -511,7 +500,7 @@ fn draw_circle_outline(
     }
 }
 
-fn fill_triangle(frame: &mut ReconstructedFrame, points: [(i32, i32); 3], color: [u8; 4]) {
+fn fill_triangle(frame: &mut StoredFrame, points: [(i32, i32); 3], color: [u8; 4]) {
     let min_x = points.iter().map(|p| p.0).min().unwrap_or(0);
     let max_x = points.iter().map(|p| p.0).max().unwrap_or(0);
     let min_y = points.iter().map(|p| p.1).min().unwrap_or(0);
@@ -539,115 +528,720 @@ fn edge(a: (i32, i32), b: (i32, i32), p: (i32, i32)) -> i32 {
     (p.0 - a.0) * (b.1 - a.1) - (p.1 - a.1) * (b.0 - a.0)
 }
 
-fn export_mp4(
-    output_path: &Path,
-    frames: &[ReconstructedFrame],
-    export_fps: u32,
-    audio_mix: Option<Mp4AudioMixConfig>,
-) -> Result<()> {
-    export_frames_to_mp4_with_audio(output_path, frames, export_fps, audio_mix.as_ref())
+#[derive(Clone, Debug)]
+struct MixedAudio {
+    sample_rate_hz: u32,
+    channels: u16,
+    samples_i16: Vec<i16>,
 }
 
-fn export_avi(output_path: &Path, frames: &[ReconstructedFrame], export_fps: u32) -> Result<()> {
-    export_frames_to_avi(output_path, frames, export_fps)
-}
-
-fn export_gif(output_path: &Path, frames: &[ReconstructedFrame], export_fps: u32) -> Result<()> {
-    export_frames_to_gif(output_path, frames, export_fps)
-}
-
-fn build_mp4_audio_mix_config(
+fn build_mixed_audio(
     manifest: &SessionManifest,
     config: &EditConfig,
-    source_frames: &[ReconstructedFrame],
-) -> Option<Mp4AudioMixConfig> {
-    let mut tracks = Vec::<AudioMixTrack>::new();
+    target_duration_ms: u64,
+) -> Result<Option<MixedAudio>> {
+    let mut tracks = Vec::<(Vec<i16>, f32)>::new();
+    let channels = manifest.audio_channels.max(1);
 
-    if config.system_audio.enabled {
-        if let Some(path) = manifest.audio_system_path.as_ref() {
-            tracks.push(AudioMixTrack {
-                path: path.clone(),
-                volume: config.system_audio.volume,
-            });
+    if config.system_audio.enabled
+        && let Some(path) = manifest.audio_system_path.as_ref()
+    {
+        let samples = read_pcm_i16(path, channels)?;
+        if !samples.is_empty() {
+            tracks.push((samples, config.system_audio.volume.clamp(0.0, 2.0)));
         }
     }
 
-    if config.microphone_audio.enabled {
-        if let Some(path) = manifest.audio_mic_path.as_ref() {
-            tracks.push(AudioMixTrack {
-                path: path.clone(),
-                volume: config.microphone_audio.volume,
-            });
+    if config.microphone_audio.enabled
+        && let Some(path) = manifest.audio_mic_path.as_ref()
+    {
+        let samples = read_pcm_i16(path, channels)?;
+        if !samples.is_empty() {
+            tracks.push((samples, config.microphone_audio.volume.clamp(0.0, 2.0)));
         }
     }
 
     if tracks.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let trim_start_ms = source_frames
-        .first()
-        .map(|frame| frame.timestamp_ms)
-        .unwrap_or(0);
-    let trim_duration_ms = (!source_frames.is_empty()).then(|| {
-        source_frames
-            .iter()
-            .map(|frame| u64::from(frame.duration_ms.max(1)))
-            .sum::<u64>()
-            .max(1)
-    });
+    let mixed = mix_audio_tracks_i16_interleaved(&tracks, channels);
+    if mixed.is_empty() {
+        return Ok(None);
+    }
 
-    Some(Mp4AudioMixConfig {
-        tracks,
+    let retimed = retime_audio_i16_interleaved(&mixed, channels, config.playback_speed);
+    let aligned = align_i16_interleaved_to_duration(
+        retimed,
+        manifest.audio_sample_rate_hz.max(1),
+        channels,
+        Duration::from_millis(target_duration_ms),
+    );
+    if aligned.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(MixedAudio {
         sample_rate_hz: manifest.audio_sample_rate_hz.max(1),
-        channels: manifest.audio_channels.max(1),
-        bitrate_kbps: manifest.audio_bitrate_kbps.max(8),
-        playback_speed: config.playback_speed,
-        trim_start_ms,
-        trim_duration_ms,
-    })
+        channels,
+        samples_i16: aligned,
+    }))
 }
 
-fn load_source_frames(manifest: &SessionManifest) -> Result<Vec<ReconstructedFrame>> {
-    if manifest.frame_cache_path.is_file() {
-        match reconstruct_frames(&manifest.frame_cache_path) {
-            Ok(frames) if !frames.is_empty() => return Ok(frames),
-            Ok(_) => {}
-            Err(cache_err) => {
-                if manifest.video_temp_path.is_file() {
-                    let decoded = decode_h264_video_to_frames(&manifest.video_temp_path)?;
-                    if !decoded.is_empty() {
-                        return Ok(decoded);
-                    }
+fn read_pcm_i16(path: &Path, channels: u16) -> Result<Vec<i16>> {
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if bytes.len() % 2 != 0 {
+        return Err(ScreenRecorderError::Decode(format!(
+            "pcm file {} has odd byte length",
+            path.display()
+        )));
+    }
+
+    let mut samples = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    let channels = usize::from(channels.max(1));
+    let aligned = (samples.len() / channels) * channels;
+    samples.truncate(aligned);
+    Ok(samples)
+}
+
+fn mix_audio_tracks_i16_interleaved(tracks: &[(Vec<i16>, f32)], channels: u16) -> Vec<i16> {
+    let channels_usize = usize::from(channels.max(1));
+    if channels_usize == 0 || tracks.is_empty() {
+        return Vec::new();
+    }
+
+    let max_frames = tracks
+        .iter()
+        .map(|(samples, _)| samples.len() / channels_usize)
+        .max()
+        .unwrap_or(0);
+    if max_frames == 0 {
+        return Vec::new();
+    }
+
+    let mut mixed = vec![0i16; max_frames * channels_usize];
+    for frame_idx in 0..max_frames {
+        for ch in 0..channels_usize {
+            let mut acc = 0.0f32;
+            for (samples, volume) in tracks {
+                let sample_index = frame_idx * channels_usize + ch;
+                if sample_index < samples.len() {
+                    acc += samples[sample_index] as f32 * *volume;
                 }
-                return Err(ScreenRecorderError::Decode(format!(
-                    "failed to decode frame cache {}: {cache_err}",
-                    manifest.frame_cache_path.display()
+            }
+            mixed[frame_idx * channels_usize + ch] =
+                acc.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+    mixed
+}
+
+fn retime_audio_i16_interleaved(samples: &[i16], channels: u16, playback_speed: f32) -> Vec<i16> {
+    let channels_usize = usize::from(channels.max(1));
+    if channels_usize == 0 || samples.is_empty() {
+        return Vec::new();
+    }
+
+    let frame_count = samples.len() / channels_usize;
+    if frame_count == 0 {
+        return Vec::new();
+    }
+
+    let speed = playback_speed.clamp(0.25, 4.0);
+    if (speed - 1.0).abs() < f32::EPSILON {
+        return samples.to_vec();
+    }
+
+    let output_frames = ((frame_count as f64) / speed as f64).ceil().max(1.0) as usize;
+    let mut out = Vec::<i16>::with_capacity(output_frames * channels_usize);
+    for out_frame in 0..output_frames {
+        let src_pos = out_frame as f64 * speed as f64;
+        let src_index = src_pos.floor() as usize;
+        let next_index = (src_index + 1).min(frame_count.saturating_sub(1));
+        let frac = (src_pos - src_index as f64) as f32;
+
+        for ch in 0..channels_usize {
+            let a = samples[src_index * channels_usize + ch] as f32;
+            let b = samples[next_index * channels_usize + ch] as f32;
+            let mixed = a + (b - a) * frac;
+            out.push(mixed.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+        }
+    }
+    out
+}
+
+fn ensure_ffmpeg_initialized() -> Result<()> {
+    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| ffmpeg::init().map_err(|err| err.to_string()))
+        .clone()
+        .map_err(|err| ScreenRecorderError::Export(format!("failed to initialize ffmpeg: {err}")))
+}
+
+fn is_eagain(err: &ffmpeg::Error) -> bool {
+    matches!(
+        err,
+        ffmpeg::Error::Other { errno } if *errno == ffmpeg::error::EAGAIN
+    )
+}
+
+fn choose_video_codec_id(format: ExportFormat) -> ffmpeg::codec::Id {
+    match format {
+        ExportFormat::Mp4 => ffmpeg::codec::Id::H264,
+        ExportFormat::Avi => ffmpeg::codec::Id::MPEG4,
+        ExportFormat::Gif => ffmpeg::codec::Id::GIF,
+    }
+}
+
+fn choose_video_pixel_format(
+    format: ExportFormat,
+    codec: ffmpeg::codec::Video,
+) -> ffmpeg::format::Pixel {
+    let preferred = match format {
+        ExportFormat::Gif => [
+            ffmpeg::format::Pixel::RGB8,
+            ffmpeg::format::Pixel::PAL8,
+            ffmpeg::format::Pixel::RGB24,
+        ]
+        .as_slice(),
+        ExportFormat::Mp4 | ExportFormat::Avi => [
+            ffmpeg::format::Pixel::YUV420P,
+            ffmpeg::format::Pixel::YUV422P,
+            ffmpeg::format::Pixel::RGB24,
+        ]
+        .as_slice(),
+    };
+
+    if let Some(formats) = codec.formats() {
+        let available: Vec<_> = formats.collect();
+        for pixel in preferred {
+            if available.iter().any(|fmt| *fmt == *pixel) {
+                return *pixel;
+            }
+        }
+        if let Some(first) = available.first().copied() {
+            return first;
+        }
+    }
+
+    match format {
+        ExportFormat::Gif => ffmpeg::format::Pixel::RGB8,
+        ExportFormat::Mp4 | ExportFormat::Avi => ffmpeg::format::Pixel::YUV420P,
+    }
+}
+
+fn choose_audio_codec(format: ExportFormat) -> Option<ffmpeg::Codec> {
+    match format {
+        ExportFormat::Mp4 => ffmpeg::encoder::find(ffmpeg::codec::Id::AAC),
+        ExportFormat::Avi => ffmpeg::encoder::find_by_name("libmp3lame")
+            .or_else(|| ffmpeg::encoder::find_by_name("libshine"))
+            .or_else(|| ffmpeg::encoder::find(ffmpeg::codec::Id::MP3))
+            .or_else(|| ffmpeg::encoder::find(ffmpeg::codec::Id::AAC)),
+        ExportFormat::Gif => None,
+    }
+}
+
+fn choose_audio_sample_rate(codec: ffmpeg::codec::Audio, requested_hz: u32) -> u32 {
+    if let Some(rates) = codec.rates() {
+        let available: Vec<u32> = rates.map(|rate| rate.max(1) as u32).collect();
+        if available.is_empty() {
+            return requested_hz.max(1);
+        }
+        if available.contains(&requested_hz) {
+            return requested_hz;
+        }
+        return available
+            .into_iter()
+            .min_by_key(|rate| rate.abs_diff(requested_hz))
+            .unwrap_or(requested_hz.max(1));
+    }
+    requested_hz.max(1)
+}
+
+fn choose_audio_channel_layout(
+    codec: ffmpeg::codec::Audio,
+    requested_channels: u16,
+) -> ffmpeg::ChannelLayout {
+    codec
+        .channel_layouts()
+        .map(|layouts| layouts.best(i32::from(requested_channels.max(1))))
+        .unwrap_or_else(|| ffmpeg::ChannelLayout::default(i32::from(requested_channels.max(1))))
+}
+
+fn choose_audio_sample_format(codec: ffmpeg::codec::Audio) -> ffmpeg::format::Sample {
+    let preferred = [
+        ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar),
+        ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
+        ffmpeg::format::Sample::I16(ffmpeg::format::sample::Type::Planar),
+        ffmpeg::format::Sample::I16(ffmpeg::format::sample::Type::Packed),
+    ];
+
+    if let Some(formats) = codec.formats() {
+        let available: Vec<_> = formats.collect();
+        for candidate in preferred {
+            if available.iter().any(|fmt| *fmt == candidate) {
+                return candidate;
+            }
+        }
+        if let Some(first) = available.first().copied() {
+            return first;
+        }
+    }
+
+    ffmpeg::format::Sample::I16(ffmpeg::format::sample::Type::Packed)
+}
+
+fn export_video(
+    output_path: &Path,
+    frames: &[StoredFrame],
+    export_fps: u32,
+    format: ExportFormat,
+    mixed_audio: Option<&MixedAudio>,
+    audio_bitrate_kbps: u16,
+) -> Result<()> {
+    ensure_ffmpeg_initialized()?;
+    let (width, height) = validate_export_frames(frames, format != ExportFormat::Gif)?;
+
+    let mut output = ffmpeg::format::output(output_path).map_err(|err| {
+        ScreenRecorderError::Export(format!("failed to create ffmpeg output context: {err}"))
+    })?;
+    let global_header = output
+        .format()
+        .flags()
+        .contains(ffmpeg::format::Flags::GLOBAL_HEADER);
+
+    let fps = export_fps.max(1).min(i32::MAX as u32) as i32;
+    let video_time_base = ffmpeg::Rational(1, fps);
+    let video_frame_rate = ffmpeg::Rational(fps, 1);
+
+    let container_video_codec = output
+        .format()
+        .codec(output_path, ffmpeg::media::Type::Video);
+    let preferred_video_codec = choose_video_codec_id(format);
+    let video_codec = ffmpeg::encoder::find(preferred_video_codec)
+        .or_else(|| ffmpeg::encoder::find(container_video_codec))
+        .ok_or_else(|| {
+            ScreenRecorderError::Export(format!(
+                "no video encoder available for {format:?} (preferred={preferred_video_codec:?}, container={container_video_codec:?})"
+            ))
+        })?;
+    let codec_video_info = video_codec.video().map_err(|err| {
+        ScreenRecorderError::Export(format!(
+            "selected video codec is not usable as video: {err}"
+        ))
+    })?;
+    let pixel_format = choose_video_pixel_format(format, codec_video_info);
+    let mut video_encoder = ffmpeg::codec::context::Context::new_with_codec(video_codec)
+        .encoder()
+        .video()
+        .map_err(|err| {
+            ScreenRecorderError::Export(format!("failed to create video encoder context: {err}"))
+        })?;
+    video_encoder.set_width(width);
+    video_encoder.set_height(height);
+    video_encoder.set_format(pixel_format);
+    video_encoder.set_time_base(video_time_base);
+    video_encoder.set_frame_rate(Some(video_frame_rate));
+    video_encoder.set_bit_rate(8_000_000usize);
+    if global_header {
+        video_encoder.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
+    }
+    let mut video_encoder = video_encoder.open_as(video_codec).map_err(|err| {
+        ScreenRecorderError::Export(format!("failed to open video encoder: {err}"))
+    })?;
+
+    let video_stream_index = {
+        let mut stream = output.add_stream(video_codec).map_err(|err| {
+            ScreenRecorderError::Export(format!("failed to add output video stream: {err}"))
+        })?;
+        stream.set_time_base(video_time_base);
+        stream.set_rate(video_frame_rate);
+        stream.set_avg_frame_rate(video_frame_rate);
+        stream.set_parameters(&video_encoder);
+        stream.index()
+    };
+
+    let mut audio_state = None;
+    if let Some(mixed) = mixed_audio
+        && format != ExportFormat::Gif
+    {
+        let container_audio_codec = output
+            .format()
+            .codec(output_path, ffmpeg::media::Type::Audio);
+        let audio_codec = choose_audio_codec(format)
+            .or_else(|| ffmpeg::encoder::find(container_audio_codec))
+            .ok_or_else(|| {
+                ScreenRecorderError::Export(format!(
+                    "no audio encoder available for {format:?} (container={container_audio_codec:?})"
+                ))
+            })?;
+        let codec_audio_info = audio_codec.audio().map_err(|err| {
+            ScreenRecorderError::Export(format!(
+                "selected audio codec is not usable as audio: {err}"
+            ))
+        })?;
+        let output_rate_hz = choose_audio_sample_rate(codec_audio_info, mixed.sample_rate_hz);
+        let output_layout = choose_audio_channel_layout(codec_audio_info, mixed.channels);
+        let output_sample_format = choose_audio_sample_format(codec_audio_info);
+
+        let mut audio_encoder = ffmpeg::codec::context::Context::new_with_codec(audio_codec)
+            .encoder()
+            .audio()
+            .map_err(|err| {
+                ScreenRecorderError::Export(format!(
+                    "failed to create audio encoder context: {err}"
+                ))
+            })?;
+        audio_encoder.set_rate(output_rate_hz as i32);
+        audio_encoder.set_channel_layout(output_layout);
+        audio_encoder.set_format(output_sample_format);
+        audio_encoder.set_bit_rate(usize::from(audio_bitrate_kbps.max(8)) * 1000);
+        audio_encoder.set_time_base((1, output_rate_hz as i32));
+        if global_header {
+            audio_encoder.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
+        }
+
+        let audio_encoder = if audio_codec.name().eq_ignore_ascii_case("aac") {
+            let mut options = ffmpeg::Dictionary::new();
+            options.set("profile", "aac_low");
+            audio_encoder
+                .open_as_with(audio_codec, options)
+                .map_err(|err| {
+                    ScreenRecorderError::Export(format!("failed to open audio encoder: {err}"))
+                })?
+        } else {
+            audio_encoder.open_as(audio_codec).map_err(|err| {
+                ScreenRecorderError::Export(format!("failed to open audio encoder: {err}"))
+            })?
+        };
+
+        let audio_stream_index = {
+            let mut stream = output.add_stream(audio_codec).map_err(|err| {
+                ScreenRecorderError::Export(format!("failed to add output audio stream: {err}"))
+            })?;
+            stream.set_time_base(ffmpeg::Rational(1, output_rate_hz as i32));
+            stream.set_rate(ffmpeg::Rational(output_rate_hz as i32, 1));
+            stream.set_parameters(&audio_encoder);
+            stream.index()
+        };
+
+        audio_state = Some((
+            audio_encoder,
+            audio_stream_index,
+            ffmpeg::Rational(1, output_rate_hz as i32),
+        ));
+    }
+
+    output.write_header().map_err(|err| {
+        ScreenRecorderError::Export(format!("failed to write output header: {err}"))
+    })?;
+
+    let video_stream_time_base = output
+        .stream(video_stream_index)
+        .map(|stream| stream.time_base())
+        .ok_or_else(|| {
+            ScreenRecorderError::Export(format!(
+                "failed to resolve output video stream {} after header",
+                video_stream_index
+            ))
+        })?;
+
+    if let Some((_, stream_index, stream_time_base)) = audio_state.as_mut() {
+        *stream_time_base = output
+            .stream(*stream_index)
+            .map(|stream| stream.time_base())
+            .ok_or_else(|| {
+                ScreenRecorderError::Export(format!(
+                    "failed to resolve output audio stream {} after header",
+                    stream_index
+                ))
+            })?;
+    }
+
+    let mut scaler = ffmpeg::software::scaling::Context::get(
+        ffmpeg::format::Pixel::RGBA,
+        width,
+        height,
+        pixel_format,
+        width,
+        height,
+        ffmpeg::software::scaling::flag::Flags::BILINEAR,
+    )
+    .map_err(|err| {
+        ScreenRecorderError::Export(format!("failed to create RGBA video scaler: {err}"))
+    })?;
+
+    let mut rgba_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::RGBA, width, height);
+    let mut encode_frame = ffmpeg::frame::Video::new(pixel_format, width, height);
+
+    for (index, frame) in frames.iter().enumerate() {
+        copy_rgba_into_frame(&mut rgba_frame, width, &frame.rgba);
+        scaler.run(&rgba_frame, &mut encode_frame).map_err(|err| {
+            ScreenRecorderError::Export(format!("failed to convert frame for video export: {err}"))
+        })?;
+        encode_frame.set_pts(Some(index as i64));
+
+        video_encoder.send_frame(&encode_frame).map_err(|err| {
+            ScreenRecorderError::Export(format!("failed to send frame to video encoder: {err}"))
+        })?;
+        drain_video_packets(
+            &mut video_encoder,
+            &mut output,
+            video_stream_index,
+            video_stream_time_base,
+            false,
+        )?;
+    }
+
+    video_encoder.send_eof().map_err(|err| {
+        ScreenRecorderError::Export(format!("failed to finalize video encoder: {err}"))
+    })?;
+    drain_video_packets(
+        &mut video_encoder,
+        &mut output,
+        video_stream_index,
+        video_stream_time_base,
+        true,
+    )?;
+
+    if let (Some(audio), Some((audio_encoder, stream_index, stream_time_base))) =
+        (mixed_audio, audio_state.as_mut())
+    {
+        encode_audio_samples(
+            &mut output,
+            audio_encoder,
+            *stream_index,
+            *stream_time_base,
+            audio,
+        )?;
+    }
+
+    output.write_trailer().map_err(|err| {
+        ScreenRecorderError::Export(format!("failed to write output trailer: {err}"))
+    })?;
+    Ok(())
+}
+
+fn validate_export_frames(frames: &[StoredFrame], require_even: bool) -> Result<(u32, u32)> {
+    if frames.is_empty() {
+        return Err(ScreenRecorderError::Export(
+            "video export requires at least one frame".to_string(),
+        ));
+    }
+
+    let width = frames[0].width;
+    let height = frames[0].height;
+    if width == 0 || height == 0 {
+        return Err(ScreenRecorderError::Export(
+            "video export requires non-zero frame dimensions".to_string(),
+        ));
+    }
+
+    if require_even && (width % 2 != 0 || height % 2 != 0) {
+        return Err(ScreenRecorderError::Export(
+            "selected export requires even width and height".to_string(),
+        ));
+    }
+
+    let expected_len = width as usize * height as usize * 4;
+    for frame in frames {
+        if frame.width != width || frame.height != height {
+            return Err(ScreenRecorderError::Export(format!(
+                "dynamic resolution is unsupported (expected {}x{}, got {}x{})",
+                width, height, frame.width, frame.height
+            )));
+        }
+        if frame.rgba.len() != expected_len {
+            return Err(ScreenRecorderError::Export(
+                "RGBA input size mismatch".to_string(),
+            ));
+        }
+    }
+
+    Ok((width, height))
+}
+
+fn copy_rgba_into_frame(frame: &mut ffmpeg::frame::Video, width: u32, rgba: &[u8]) {
+    let stride = frame.stride(0);
+    let row_bytes = width as usize * 4;
+    let height = frame.height() as usize;
+    let dst = frame.data_mut(0);
+
+    for y in 0..height {
+        let src_start = y * row_bytes;
+        let src_end = src_start + row_bytes;
+        let dst_start = y * stride;
+        let dst_end = dst_start + row_bytes;
+        dst[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
+    }
+}
+
+fn drain_video_packets(
+    encoder: &mut ffmpeg::encoder::video::Encoder,
+    output: &mut ffmpeg::format::context::Output,
+    stream_index: usize,
+    stream_time_base: ffmpeg::Rational,
+    draining: bool,
+) -> Result<()> {
+    loop {
+        let mut packet = ffmpeg::Packet::empty();
+        match encoder.receive_packet(&mut packet) {
+            Ok(()) => {
+                packet.set_stream(stream_index);
+                packet.rescale_ts(encoder.time_base(), stream_time_base);
+                packet.write_interleaved(output).map_err(|err| {
+                    ScreenRecorderError::Export(format!(
+                        "failed to write encoded video packet: {err}"
+                    ))
+                })?;
+            }
+            Err(err) if err == ffmpeg::Error::Eof => break,
+            Err(err) if is_eagain(&err) && !draining => break,
+            Err(err) if is_eagain(&err) && draining => continue,
+            Err(err) => {
+                return Err(ScreenRecorderError::Export(format!(
+                    "failed to receive encoded video packet: {err}"
                 )));
             }
         }
     }
+    Ok(())
+}
 
-    if manifest.video_temp_path.is_file() {
-        return decode_h264_video_to_frames(&manifest.video_temp_path);
+fn drain_audio_packets(
+    encoder: &mut ffmpeg::encoder::audio::Encoder,
+    output: &mut ffmpeg::format::context::Output,
+    stream_index: usize,
+    stream_time_base: ffmpeg::Rational,
+    draining: bool,
+) -> Result<()> {
+    loop {
+        let mut packet = ffmpeg::Packet::empty();
+        match encoder.receive_packet(&mut packet) {
+            Ok(()) => {
+                packet.set_stream(stream_index);
+                packet.rescale_ts(encoder.time_base(), stream_time_base);
+                packet.write_interleaved(output).map_err(|err| {
+                    ScreenRecorderError::Export(format!(
+                        "failed to write encoded audio packet: {err}"
+                    ))
+                })?;
+            }
+            Err(err) if err == ffmpeg::Error::Eof => break,
+            Err(err) if is_eagain(&err) && !draining => break,
+            Err(err) if is_eagain(&err) && draining => continue,
+            Err(err) => {
+                return Err(ScreenRecorderError::Export(format!(
+                    "failed to receive encoded audio packet: {err}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_audio_samples(
+    output: &mut ffmpeg::format::context::Output,
+    encoder: &mut ffmpeg::encoder::audio::Encoder,
+    stream_index: usize,
+    stream_time_base: ffmpeg::Rational,
+    mixed: &MixedAudio,
+) -> Result<()> {
+    let input_layout = ffmpeg::ChannelLayout::default(i32::from(mixed.channels.max(1)));
+    let mut resampler = ffmpeg::software::resampling::Context::get(
+        ffmpeg::format::Sample::I16(ffmpeg::format::sample::Type::Packed),
+        input_layout,
+        mixed.sample_rate_hz.max(1),
+        encoder.format(),
+        encoder.channel_layout(),
+        encoder.rate(),
+    )
+    .map_err(|err| {
+        ScreenRecorderError::Export(format!("failed to create encode resampler: {err}"))
+    })?;
+
+    let frame_samples = {
+        let fs = encoder.frame_size() as usize;
+        if fs == 0 { 1024 } else { fs }
+    };
+    let variable_frame_size = encoder.frame_size() == 0;
+    let input_channels = usize::from(mixed.channels.max(1));
+
+    let mut next_pts = 0i64;
+    let mut sample_cursor = 0usize;
+    let samples_per_chunk = if variable_frame_size {
+        ((mixed.sample_rate_hz as usize / 25).max(1) * input_channels).max(input_channels)
+    } else {
+        frame_samples * input_channels
+    };
+
+    while sample_cursor < mixed.samples_i16.len() {
+        let remaining = mixed.samples_i16.len() - sample_cursor;
+        let take = remaining.min(samples_per_chunk);
+
+        let mut chunk = mixed.samples_i16[sample_cursor..sample_cursor + take].to_vec();
+        sample_cursor += take;
+
+        if !variable_frame_size && chunk.len() < samples_per_chunk {
+            chunk.resize(samples_per_chunk, 0);
+        }
+        if chunk.is_empty() {
+            continue;
+        }
+
+        let input_samples_per_channel = chunk.len() / input_channels;
+        let mut source = ffmpeg::frame::Audio::new(
+            ffmpeg::format::Sample::I16(ffmpeg::format::sample::Type::Packed),
+            input_samples_per_channel,
+            input_layout,
+        );
+        source.set_rate(mixed.sample_rate_hz.max(1));
+
+        let expected_bytes = chunk.len() * 2;
+        let source_data = source.data_mut(0);
+        if source_data.len() < expected_bytes {
+            return Err(ScreenRecorderError::Export(
+                "allocated source audio frame is too small".to_string(),
+            ));
+        }
+
+        for (i, sample) in chunk.iter().enumerate() {
+            let bytes = sample.to_le_bytes();
+            source_data[i * 2] = bytes[0];
+            source_data[i * 2 + 1] = bytes[1];
+        }
+
+        let mut converted = ffmpeg::frame::Audio::empty();
+        resampler.run(&source, &mut converted).map_err(|err| {
+            ScreenRecorderError::Export(format!("failed to resample audio for encoding: {err}"))
+        })?;
+
+        if converted.samples() == 0 {
+            continue;
+        }
+
+        converted.set_pts(Some(next_pts));
+        next_pts = next_pts.saturating_add(converted.samples() as i64);
+        encoder.send_frame(&converted).map_err(|err| {
+            ScreenRecorderError::Export(format!("failed to send audio frame to encoder: {err}"))
+        })?;
+        drain_audio_packets(encoder, output, stream_index, stream_time_base, false)?;
     }
 
-    Err(ScreenRecorderError::Decode(format!(
-        "neither frame cache nor video file exists for session {}",
-        manifest.session_id
-    )))
+    encoder.send_eof().map_err(|err| {
+        ScreenRecorderError::Export(format!("failed to finalize audio encoder: {err}"))
+    })?;
+    drain_audio_packets(encoder, output, stream_index, stream_time_base, true)
 }
 
 fn validate_manifest_paths(manifest: &SessionManifest) -> Result<()> {
+    validate_file_exists(&manifest.frame_cache_path)?;
     validate_file_exists(&manifest.mouse_path)?;
-
-    if !manifest.frame_cache_path.is_file() && !manifest.video_temp_path.is_file() {
-        return Err(ScreenRecorderError::Decode(format!(
-            "both frame cache and video artifacts are missing: {} and {}",
-            manifest.frame_cache_path.display(),
-            manifest.video_temp_path.display()
-        )));
-    }
 
     if manifest.recorded_system_audio {
         if let Some(path) = manifest.audio_system_path.as_ref() {
@@ -697,20 +1291,21 @@ mod tests {
     }
 
     #[test]
-    fn map_wall_time_excludes_pause_gaps() {
-        let pauses = vec![
-            PauseInterval {
-                start_ms: 100,
-                end_ms: 200,
-            },
-            PauseInterval {
-                start_ms: 400,
-                end_ms: 500,
-            },
-        ];
-        assert_eq!(map_wall_to_active(50, &pauses), 50);
-        assert_eq!(map_wall_to_active(250, &pauses), 150);
-        assert_eq!(map_wall_to_active(450, &pauses), 300);
-        assert_eq!(map_wall_to_active(800, &pauses), 600);
+    fn gif_quality_clamps_export_fps() {
+        let low = quality_params(60, 0, ExportFormat::Gif);
+        let high = quality_params(60, 100, ExportFormat::Gif);
+        assert_eq!(low.export_fps, 20);
+        assert_eq!(high.export_fps, 20);
+    }
+
+    #[test]
+    fn align_audio_pads_or_truncates_to_duration() {
+        let padded =
+            align_i16_interleaved_to_duration(vec![1; 20], 10, 2, Duration::from_millis(1_500));
+        assert_eq!(padded.len(), 30);
+
+        let truncated =
+            align_i16_interleaved_to_duration(vec![1; 40], 10, 2, Duration::from_millis(1_500));
+        assert_eq!(truncated.len(), 30);
     }
 }

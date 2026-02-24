@@ -1,4 +1,4 @@
-﻿use std::time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
 use crate::artifact::PauseInterval;
 
@@ -45,12 +45,24 @@ impl PauseTimeline {
         &self.intervals
     }
 
-    pub fn active_elapsed_ms(&self, at: Instant) -> u64 {
+    pub fn active_elapsed_duration(&self, at: Instant) -> Duration {
         let elapsed = at.saturating_duration_since(self.started_at);
         let mut paused = self.total_paused;
         if let Some(paused_from) = self.pause_started_at {
             paused += at.saturating_duration_since(paused_from);
         }
-        elapsed.saturating_sub(paused).as_millis() as u64
+        elapsed.saturating_sub(paused)
+    }
+
+    pub fn active_elapsed_ms(&self, at: Instant) -> u64 {
+        self.active_elapsed_duration(at).as_millis() as u64
+    }
+
+    pub fn active_elapsed_from_stream_offset(&self, offset: Duration) -> Duration {
+        let at = self
+            .started_at
+            .checked_add(offset)
+            .unwrap_or(self.started_at);
+        self.active_elapsed_duration(at)
     }
 }
