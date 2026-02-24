@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+pub use snow_cursor_capture::{CursorCompositionMode, CursorFrameSample, CursorShape};
+
 use crate::error::{CaptureError, CaptureResult};
 
 /// Color space / transfer function describing the frame's pixel data.
@@ -33,39 +35,8 @@ pub struct DirtyRect {
     pub height: u32,
 }
 
-/// Composition mode for cursor pixels captured alongside the frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub enum CursorCompositionMode {
-    /// Standard per-pixel alpha compositing.
-    #[default]
-    AlphaBlend,
-    /// DXGI masked-color cursor semantics:
-    /// alpha `0x00` = source copy, alpha `0xFF` = XOR with destination.
-    MaskedColor,
-}
-
-/// Cursor shape data captured alongside the frame.
-#[derive(Clone, Debug)]
-pub struct CursorData {
-    /// Cursor hotspot X relative to the cursor image.
-    pub hotspot_x: u32,
-    /// Cursor hotspot Y relative to the cursor image.
-    pub hotspot_y: u32,
-    /// Cursor position X in desktop coordinates.
-    pub position_x: i32,
-    /// Cursor position Y in desktop coordinates.
-    pub position_y: i32,
-    /// Whether the cursor is currently visible.
-    pub visible: bool,
-    /// Cursor image width in pixels.
-    pub shape_width: u32,
-    /// Cursor image height in pixels.
-    pub shape_height: u32,
-    /// How cursor pixels should be composed onto the destination frame.
-    pub composition_mode: CursorCompositionMode,
-    /// RGBA8 pixel data for the cursor shape.
-    pub shape_rgba: Vec<u8>,
-}
+/// Cursor data captured alongside the frame.
+pub type CursorData = CursorFrameSample;
 
 /// Metadata attached to each captured frame for recording pipelines.
 #[derive(Clone, Debug, Default)]

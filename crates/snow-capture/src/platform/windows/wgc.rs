@@ -1,4 +1,4 @@
-﻿use std::cell::RefCell;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::core::{IInspectable, Interface};
 
-use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata, CursorCaptureConfig};
+use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata};
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::{DirtyRect, Frame};
@@ -867,7 +867,6 @@ struct WindowsGraphicsCaptureCapturer {
     gpu_tonemapper: Option<GpuTonemapper>,
     /// GPU F16->sRGB converter for when source is F16 but no HDR tonemap needed.
     gpu_f16_converter: Option<GpuF16Converter>,
-    cursor_config: CursorCaptureConfig,
     has_frame_history: bool,
     source_dirty_rects_scratch: Vec<DirtyRect>,
     region_dirty_rects_scratch: Vec<DirtyRect>,
@@ -918,10 +917,9 @@ impl WindowsGraphicsCaptureCapturer {
             .CreateCaptureSession(&item)
             .context("Direct3D11CaptureFramePool::CreateCaptureSession failed")
             .map_err(CaptureError::platform)?;
-        let cursor_config = CursorCaptureConfig::default();
         // Best-effort session tuning:
-        // - Disable cursor composition unless explicitly requested.
-        let _ = session.SetIsCursorCaptureEnabled(cursor_config.capture_cursor);
+        // - Disable cursor composition; cursor overlays are handled in recorder.
+        let _ = session.SetIsCursorCaptureEnabled(false);
         // Keep the platform default dirty-region mode at startup. For
         // screenshot single-shot captures this avoids paying an extra
         // mode-transition setup cost on the first frame.
@@ -1027,7 +1025,6 @@ impl WindowsGraphicsCaptureCapturer {
             hdr_to_sdr,
             gpu_tonemapper,
             gpu_f16_converter,
-            cursor_config,
             has_frame_history: false,
             source_dirty_rects_scratch: Vec::new(),
             region_dirty_rects_scratch: Vec::new(),
@@ -2610,13 +2607,6 @@ impl WindowsGraphicsCaptureCapturer {
             CaptureMode::Screenshot => self.trim_scratch_for_screenshot(),
         }
     }
-
-    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
-        self.cursor_config = config;
-        let _ = self
-            .session
-            .SetIsCursorCaptureEnabled(self.cursor_config.capture_cursor);
-    }
 }
 
 impl Drop for WindowsGraphicsCaptureCapturer {
@@ -2670,10 +2660,6 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.inner.set_capture_mode(mode);
     }
-
-    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
-        self.inner.set_cursor_config(config);
-    }
 }
 
 pub(crate) struct WindowsWindowCapturer {
@@ -2706,10 +2692,6 @@ impl crate::backend::MonitorCapturer for WindowsWindowCapturer {
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.inner.set_capture_mode(mode);
-    }
-
-    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
-        self.inner.set_cursor_config(config);
     }
 }
 

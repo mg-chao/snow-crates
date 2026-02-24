@@ -673,7 +673,15 @@ dependencies = [
  "image",
  "rayon",
  "rustc-hash",
+ "snow-cursor-capture",
  "tokio",
+ "windows",
+]
+
+[[package]]
+name = "snow-cursor-capture"
+version = "0.1.0"
+dependencies = [
  "windows",
 ]
 

@@ -12,10 +12,7 @@ use crate::config::{EditConfig, ExportFormat, MouseEditConfig, VideoEncodeConfig
 use crate::error::{Result, ScreenRecorderError};
 use crate::export::ExportResult;
 use crate::model::StoredFrame;
-use crate::mouse::{
-    ClickEventRecord, CursorSampleRecord, CursorShapeCompositionMode, CursorShapeModeRecord,
-    CursorShapeRecord, MouseRecord, read_mouse_records,
-};
+use crate::mouse::{CursorShapeCompositionMode, CursorShapeRecord, MouseStore, read_mouse_records};
 use crate::video_quality::{quality_to_h264_crf, smart_quality_bitrate_bps};
 
 pub struct EditingSession {
@@ -95,8 +92,8 @@ impl EditingSession {
             ));
         }
 
-        let mouse_records = read_mouse_records(&self.manifest.mouse_path)?;
-        let mouse_tracks = build_mouse_tracks(&mouse_records);
+        let mouse_store = read_mouse_records(&self.manifest.mouse_path)?;
+        let mouse_tracks = build_mouse_tracks(&mouse_store);
 
         let export_fps = choose_export_fps(self.manifest.fps, self.config.export.format);
         let mut frames = retime_frames(&source_frames, self.config.playback_speed, export_fps)?;
@@ -518,7 +515,7 @@ struct MouseSample {
     x: i32,
     y: i32,
     visible: bool,
-    shape_id: Option<u32>,
+    shape_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -532,53 +529,34 @@ struct MouseClickDown {
 struct MouseTracks {
     samples: Vec<MouseSample>,
     click_downs: Vec<MouseClickDown>,
-    cursor_shapes: HashMap<u32, CursorShapeRecord>,
-    cursor_shape_modes: HashMap<u32, CursorShapeCompositionMode>,
+    cursor_shapes: HashMap<u64, CursorShapeRecord>,
 }
 
-fn build_mouse_tracks(records: &[MouseRecord]) -> MouseTracks {
+fn build_mouse_tracks(store: &MouseStore) -> MouseTracks {
     let mut tracks = MouseTracks::default();
 
-    for record in records {
-        match record {
-            MouseRecord::CursorSample(CursorSampleRecord {
-                timestamp_ms,
-                x,
-                y,
-                visible,
-                shape_id,
-            }) => {
-                tracks.samples.push(MouseSample {
-                    ts_ms: *timestamp_ms,
-                    x: *x,
-                    y: *y,
-                    visible: *visible,
-                    shape_id: *shape_id,
-                });
-            }
-            MouseRecord::CursorShape(shape) => {
-                tracks
-                    .cursor_shapes
-                    .entry(shape.shape_id)
-                    .or_insert_with(|| shape.clone());
-            }
-            MouseRecord::CursorShapeMode(CursorShapeModeRecord { shape_id, mode }) => {
-                tracks.cursor_shape_modes.insert(*shape_id, *mode);
-            }
-            MouseRecord::Click(ClickEventRecord {
-                timestamp_ms,
-                x,
-                y,
-                down,
-                ..
-            }) if *down => {
-                tracks.click_downs.push(MouseClickDown {
-                    ts_ms: *timestamp_ms,
-                    x: *x,
-                    y: *y,
-                });
-            }
-            _ => {}
+    for sample in &store.cursor_frames {
+        tracks.samples.push(MouseSample {
+            ts_ms: sample.timestamp_ms,
+            x: sample.x,
+            y: sample.y,
+            visible: sample.visible,
+            shape_id: sample.shape_id,
+        });
+    }
+    for shape in &store.cursor_shapes {
+        tracks
+            .cursor_shapes
+            .entry(shape.shape_id)
+            .or_insert_with(|| shape.clone());
+    }
+    for click in &store.clicks {
+        if click.down {
+            tracks.click_downs.push(MouseClickDown {
+                ts_ms: click.timestamp_ms,
+                x: click.x,
+                y: click.y,
+            });
         }
     }
 
@@ -659,11 +637,6 @@ fn draw_cursor(frame: &mut StoredFrame, current: &MouseSample, tracks: &MouseTra
     if let Some(shape_id) = current.shape_id
         && let Some(shape) = tracks.cursor_shapes.get(&shape_id)
     {
-        let mode = tracks
-            .cursor_shape_modes
-            .get(&shape_id)
-            .copied()
-            .unwrap_or(CursorShapeCompositionMode::AlphaBlend);
         let width = shape.width as usize;
         let height = shape.height as usize;
         let expected_len = width
@@ -677,7 +650,7 @@ fn draw_cursor(frame: &mut StoredFrame, current: &MouseSample, tracks: &MouseTra
                 current.y.saturating_sub(shape.hotspot_y as i32),
                 width,
                 height,
-                mode,
+                shape.mode,
                 &shape.shape_rgba[..expected_len],
             );
             return;
@@ -1814,36 +1787,34 @@ mod tests {
 
     #[test]
     fn build_mouse_tracks_keeps_shape_binding() {
-        let records = vec![
-            MouseRecord::CursorShape(CursorShapeRecord {
+        let store = MouseStore {
+            schema_version: crate::mouse::MOUSE_STORE_SCHEMA_VERSION,
+            cursor_shapes: vec![CursorShapeRecord {
                 shape_id: 7,
-                shape_hash: 99,
                 hotspot_x: 3,
                 hotspot_y: 4,
                 width: 8,
                 height: 8,
-                shape_rgba: vec![255; 8 * 8 * 4],
-            }),
-            MouseRecord::CursorShapeMode(CursorShapeModeRecord {
-                shape_id: 7,
                 mode: CursorShapeCompositionMode::MaskedColor,
-            }),
-            MouseRecord::CursorSample(CursorSampleRecord {
+                shape_rgba: vec![255; 8 * 8 * 4],
+            }],
+            cursor_frames: vec![crate::mouse::CursorFrameRecord {
                 timestamp_ms: 12,
                 x: 100,
                 y: 200,
                 visible: true,
                 shape_id: Some(7),
-            }),
-        ];
+            }],
+            clicks: vec![],
+        };
 
-        let tracks = build_mouse_tracks(&records);
+        let tracks = build_mouse_tracks(&store);
         assert_eq!(tracks.samples.len(), 1);
         assert_eq!(tracks.samples[0].shape_id, Some(7));
         assert!(tracks.cursor_shapes.contains_key(&7));
         assert_eq!(
-            tracks.cursor_shape_modes.get(&7),
-            Some(&CursorShapeCompositionMode::MaskedColor)
+            tracks.cursor_shapes.get(&7).map(|s| s.mode),
+            Some(CursorShapeCompositionMode::MaskedColor)
         );
     }
 
@@ -1856,28 +1827,27 @@ mod tests {
             height: 4,
             rgba: vec![0; 4 * 4 * 4],
         };
-        let tracks = build_mouse_tracks(&[
-            MouseRecord::CursorShape(CursorShapeRecord {
+        let store = MouseStore {
+            schema_version: crate::mouse::MOUSE_STORE_SCHEMA_VERSION,
+            cursor_shapes: vec![CursorShapeRecord {
                 shape_id: 1,
-                shape_hash: 1,
                 hotspot_x: 0,
                 hotspot_y: 0,
                 width: 1,
                 height: 1,
-                shape_rgba: vec![200, 10, 20, 255],
-            }),
-            MouseRecord::CursorShapeMode(CursorShapeModeRecord {
-                shape_id: 1,
                 mode: CursorShapeCompositionMode::AlphaBlend,
-            }),
-            MouseRecord::CursorSample(CursorSampleRecord {
+                shape_rgba: vec![200, 10, 20, 255],
+            }],
+            cursor_frames: vec![crate::mouse::CursorFrameRecord {
                 timestamp_ms: 0,
                 x: 2,
                 y: 1,
                 visible: true,
                 shape_id: Some(1),
-            }),
-        ]);
+            }],
+            clicks: vec![],
+        };
+        let tracks = build_mouse_tracks(&store);
 
         apply_mouse_overlays(
             &mut frame,
@@ -1906,33 +1876,32 @@ mod tests {
                 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
             ],
         };
-        let tracks = build_mouse_tracks(&[
-            MouseRecord::CursorShape(CursorShapeRecord {
+        let store = MouseStore {
+            schema_version: crate::mouse::MOUSE_STORE_SCHEMA_VERSION,
+            cursor_shapes: vec![CursorShapeRecord {
                 shape_id: 5,
-                shape_hash: 5,
                 hotspot_x: 0,
                 hotspot_y: 0,
                 width: 3,
                 height: 1,
+                mode: CursorShapeCompositionMode::MaskedColor,
                 shape_rgba: vec![
                     // alpha=0xFF + zero mask => no-op
                     0, 0, 0, 0xFF, // alpha=0xFF + non-zero mask => XOR
                     0xFF, 0xFF, 0xFF, 0xFF, // alpha=0x00 => source copy
                     5, 6, 7, 0x00,
                 ],
-            }),
-            MouseRecord::CursorShapeMode(CursorShapeModeRecord {
-                shape_id: 5,
-                mode: CursorShapeCompositionMode::MaskedColor,
-            }),
-            MouseRecord::CursorSample(CursorSampleRecord {
+            }],
+            cursor_frames: vec![crate::mouse::CursorFrameRecord {
                 timestamp_ms: 0,
                 x: 0,
                 y: 0,
                 visible: true,
                 shape_id: Some(5),
-            }),
-        ]);
+            }],
+            clicks: vec![],
+        };
+        let tracks = build_mouse_tracks(&store);
 
         apply_mouse_overlays(
             &mut frame,
@@ -1958,29 +1927,35 @@ mod tests {
             height: 32,
             rgba: vec![0; 32 * 32 * 4],
         };
-        let tracks = build_mouse_tracks(&[
-            MouseRecord::CursorSample(CursorSampleRecord {
-                timestamp_ms: 0,
-                x: 10,
-                y: 10,
-                visible: true,
-                shape_id: None,
-            }),
-            MouseRecord::CursorSample(CursorSampleRecord {
-                timestamp_ms: 10,
-                x: 0,
-                y: 0,
-                visible: false,
-                shape_id: None,
-            }),
-            MouseRecord::CursorSample(CursorSampleRecord {
-                timestamp_ms: 20,
-                x: 20,
-                y: 20,
-                visible: true,
-                shape_id: None,
-            }),
-        ]);
+        let store = MouseStore {
+            schema_version: crate::mouse::MOUSE_STORE_SCHEMA_VERSION,
+            cursor_shapes: vec![],
+            cursor_frames: vec![
+                crate::mouse::CursorFrameRecord {
+                    timestamp_ms: 0,
+                    x: 10,
+                    y: 10,
+                    visible: true,
+                    shape_id: None,
+                },
+                crate::mouse::CursorFrameRecord {
+                    timestamp_ms: 10,
+                    x: 0,
+                    y: 0,
+                    visible: false,
+                    shape_id: None,
+                },
+                crate::mouse::CursorFrameRecord {
+                    timestamp_ms: 20,
+                    x: 20,
+                    y: 20,
+                    visible: true,
+                    shape_id: None,
+                },
+            ],
+            clicks: vec![],
+        };
+        let tracks = build_mouse_tracks(&store);
 
         apply_mouse_overlays(
             &mut frame,

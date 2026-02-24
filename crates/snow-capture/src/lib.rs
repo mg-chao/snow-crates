@@ -35,8 +35,8 @@ pub enum CaptureTarget {
 pub use backend::CaptureMode;
 pub use capture_session::{CaptureSession, CaptureSessionBuilder, CaptureSessionConfig};
 pub use frame::{
-    CaptureEvent, ColorSpace, CursorCompositionMode, CursorData, DirtyRect, FrameMetadata,
-    FrameTimestampAnchor,
+    CaptureEvent, ColorSpace, CursorCompositionMode, CursorData, CursorFrameSample, CursorShape,
+    DirtyRect, FrameMetadata, FrameTimestampAnchor,
 };
 pub use monitor::MonitorId;
 pub use region::{CaptureRegion, MonitorLayout};

@@ -12,16 +12,15 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, IDXGIOutput, IDXGIOutput1, IDXGIOutput5,
-    IDXGIOutputDuplication, IDXGIResource,
+    DXGI_OUTDUPL_MOVE_RECT, IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication,
+    IDXGIResource,
 };
 use windows::core::Interface;
 
-use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata, CursorCaptureConfig};
+use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata};
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
-use crate::frame::{CursorCompositionMode, CursorData, DirtyRect, Frame};
+use crate::frame::{DirtyRect, Frame};
 use crate::monitor::MonitorId;
 
 use super::d3d11;
@@ -1397,155 +1396,6 @@ fn should_short_circuit_screenshot_readback(
     capture_mode == CaptureMode::Screenshot && output_matches_source && frame_pixels_unchanged
 }
 
-fn convert_cursor_shape_bgra_to_rgba(
-    shape_buf: &[u8],
-    shape_info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO,
-) -> Vec<u8> {
-    let width = shape_info.Width as usize;
-    let height = shape_info.Height as usize;
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
-
-    let row_bytes = match width.checked_mul(4) {
-        Some(bytes) => bytes,
-        None => return Vec::new(),
-    };
-    let pitch = shape_info.Pitch as usize;
-
-    let pixel_count = match width.checked_mul(height) {
-        Some(count) => count,
-        None => return Vec::new(),
-    };
-    let rgba_len = match pixel_count.checked_mul(4) {
-        Some(len) => len,
-        None => return Vec::new(),
-    };
-    let mut rgba = vec![0u8; rgba_len];
-
-    if pitch == row_bytes {
-        let required = match row_bytes.checked_mul(height) {
-            Some(bytes) => bytes,
-            None => return Vec::new(),
-        };
-        if shape_buf.len() >= required {
-            unsafe {
-                crate::convert::convert_bgra_to_rgba_unchecked(
-                    shape_buf.as_ptr(),
-                    rgba.as_mut_ptr(),
-                    pixel_count,
-                );
-            }
-            return rgba;
-        }
-    }
-
-    if pitch < 4 {
-        return rgba;
-    }
-
-    for row in 0..height {
-        let src_offset = match row.checked_mul(pitch) {
-            Some(offset) => offset,
-            None => break,
-        };
-        if src_offset >= shape_buf.len() {
-            break;
-        }
-
-        let available_bytes = (shape_buf.len() - src_offset).min(pitch).min(row_bytes);
-        let available_pixels = available_bytes / 4;
-        if available_pixels == 0 {
-            continue;
-        }
-
-        let dst_offset = match row.checked_mul(row_bytes) {
-            Some(offset) => offset,
-            None => return Vec::new(),
-        };
-
-        unsafe {
-            crate::convert::convert_bgra_to_rgba_unchecked(
-                shape_buf.as_ptr().add(src_offset),
-                rgba.as_mut_ptr().add(dst_offset),
-                available_pixels,
-            );
-        }
-    }
-
-    rgba
-}
-
-/// Extract cursor shape and position from the DXGI duplication frame.
-/// Returns `None` if cursor data is unavailable or extraction fails.
-fn extract_cursor_data(
-    duplication: &IDXGIOutputDuplication,
-    info: &DXGI_OUTDUPL_FRAME_INFO,
-) -> Option<CursorData> {
-    let visible = info.PointerPosition.Visible.as_bool();
-    let position_x = info.PointerPosition.Position.x;
-    let position_y = info.PointerPosition.Position.y;
-
-    // Try to get pointer shape if it was updated this frame.
-    let (hotspot_x, hotspot_y, shape_width, shape_height, composition_mode, shape_rgba) =
-        if info.PointerShapeBufferSize > 0 {
-            let buf_size = info.PointerShapeBufferSize as usize;
-            let mut shape_buf = vec![0u8; buf_size];
-            let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
-            let mut required_size = 0u32;
-            let hr = unsafe {
-                duplication.GetFramePointerShape(
-                    buf_size as u32,
-                    shape_buf.as_mut_ptr() as *mut _,
-                    &mut required_size,
-                    &mut shape_info,
-                )
-            };
-            if hr.is_ok() {
-                let w = shape_info.Width;
-                let h = shape_info.Height;
-                let hotx = shape_info.HotSpot.x as u32;
-                let hoty = shape_info.HotSpot.y as u32;
-
-                if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 {
-                    let rgba = convert_cursor_shape_bgra_to_rgba(&shape_buf, &shape_info);
-                    (hotx, hoty, w, h, CursorCompositionMode::AlphaBlend, rgba)
-                } else if shape_info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
-                    // Keep DXGI masked-color alpha values intact. Downstream composition
-                    // handles `0x00 => copy` and `0xFF => XOR`.
-                    let rgba = convert_cursor_shape_bgra_to_rgba(&shape_buf, &shape_info);
-                    (hotx, hoty, w, h, CursorCompositionMode::MaskedColor, rgba)
-                } else {
-                    // Monochrome or unknown -- skip shape data.
-                    (
-                        hotx,
-                        hoty,
-                        w,
-                        h,
-                        CursorCompositionMode::AlphaBlend,
-                        Vec::new(),
-                    )
-                }
-            } else {
-                (0, 0, 0, 0, CursorCompositionMode::AlphaBlend, Vec::new())
-            }
-        } else {
-            (0, 0, 0, 0, CursorCompositionMode::AlphaBlend, Vec::new())
-        };
-
-    Some(CursorData {
-        hotspot_x,
-        hotspot_y,
-        position_x,
-        position_y,
-        visible,
-        shape_width,
-        shape_height,
-        composition_mode,
-        shape_rgba,
-    })
-}
-
 struct OutputCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -1599,8 +1449,6 @@ struct OutputCapturer {
     needs_presented_first_frame: bool,
     /// Last present time from DXGI, used for duplicate frame detection.
     last_present_time: i64,
-    /// Whether to capture cursor shape and position data.
-    cursor_config: CursorCaptureConfig,
     /// Capture intent controls whether recording-oriented buffering
     /// should be enabled.
     capture_mode: CaptureMode,
@@ -1649,7 +1497,6 @@ impl OutputCapturer {
             gpu_f16_converter,
             needs_presented_first_frame: true,
             last_present_time: 0,
-            cursor_config: CursorCaptureConfig::default(),
             capture_mode: CaptureMode::Screenshot,
         })
     }
@@ -2057,18 +1904,6 @@ impl OutputCapturer {
             self.last_present_time = source_present_time_qpc;
         }
 
-        if self.cursor_config.capture_cursor
-            && let Some(cursor) = extract_cursor_data(&self.duplication, &frame_info)
-        {
-            let should_replace = match destination.metadata.cursor.as_ref() {
-                Some(existing) => !existing.visible || cursor.visible,
-                None => true,
-            };
-            if should_replace {
-                destination.metadata.cursor = Some(cursor);
-            }
-        }
-
         let mut region_dirty_rects = std::mem::take(&mut self.region_dirty_rects_scratch);
         let mut region_move_rects = std::mem::take(&mut self.region_move_rects_scratch);
         let capture_result = (|| -> CaptureResult<CaptureSampleMetadata> {
@@ -2403,11 +2238,6 @@ impl OutputCapturer {
             false
         };
 
-        // Extract cursor data if configured.
-        if self.cursor_config.capture_cursor {
-            frame.metadata.cursor = extract_cursor_data(&self.duplication, &frame_info);
-        }
-
         // Use cached source descriptor when available -- avoids a COM
         // GetDesc() call on every frame.  Invalidated on AccessLost.
         let src_desc = match self.cached_src_desc {
@@ -2686,7 +2516,6 @@ pub(crate) struct WindowsMonitorCapturer {
     resolver: Arc<MonitorResolver>,
     _com: super::com::CoInitGuard,
     output: OutputCapturer,
-    cursor_config: CursorCaptureConfig,
     capture_mode: CaptureMode,
 }
 
@@ -2700,7 +2529,6 @@ impl WindowsMonitorCapturer {
             resolver,
             _com: com,
             output,
-            cursor_config: CursorCaptureConfig::default(),
             capture_mode: CaptureMode::Screenshot,
         })
     }
@@ -2733,7 +2561,6 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
                     &self.monitor,
                     "reinitialize",
                 )?;
-                self.output.cursor_config = self.cursor_config;
                 self.output.set_capture_mode(self.capture_mode);
                 self.output.capture(None)
             }
@@ -2763,7 +2590,6 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
                     &self.monitor,
                     "reinitialize",
                 )?;
-                self.output.cursor_config = self.cursor_config;
                 self.output.set_capture_mode(self.capture_mode);
                 let retry_prefer_low_latency =
                     should_prefer_monitor_region_low_latency(self.capture_mode, blit);
@@ -2783,11 +2609,6 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.capture_mode = mode;
         self.output.set_capture_mode(mode);
-    }
-
-    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
-        self.cursor_config = config;
-        self.output.cursor_config = config;
     }
 }
 
@@ -2874,7 +2695,6 @@ pub(crate) struct WindowsDxgiWindowCapturer {
     current_hmon: SendHmon,
     /// Cached monitor desktop bounds. Avoids `GetMonitorInfoW` on every frame.
     current_monitor_rect: RECT,
-    cursor_config: CursorCaptureConfig,
     capture_mode: CaptureMode,
 }
 
@@ -2916,7 +2736,6 @@ impl WindowsDxgiWindowCapturer {
             output,
             current_hmon: SendHmon(hmon),
             current_monitor_rect,
-            cursor_config: CursorCaptureConfig::default(),
             capture_mode: CaptureMode::Screenshot,
         })
     }
@@ -2927,7 +2746,6 @@ impl WindowsDxgiWindowCapturer {
         let monitor_id = hmonitor_to_monitor_id(hmon, &self.resolver)?;
         let resolved = self.resolver.resolve_monitor(&monitor_id)?;
         self.output = OutputCapturer::new(&resolved)?;
-        self.output.cursor_config = self.cursor_config;
         self.output.set_capture_mode(self.capture_mode);
         self.current_hmon = SendHmon(hmon);
         self.current_monitor_rect = monitor_rect(hmon)?;
@@ -3085,11 +2903,6 @@ impl crate::backend::MonitorCapturer for WindowsDxgiWindowCapturer {
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.capture_mode = mode;
         self.output.set_capture_mode(mode);
-    }
-
-    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
-        self.cursor_config = config;
-        self.output.cursor_config = config;
     }
 }
 
@@ -3576,88 +3389,6 @@ mod tests {
             normalize_dirty_rects_reference_in_place(&mut reference, 1920, 1080);
             assert_eq!(optimized, reference);
         }
-    }
-
-    #[test]
-    fn cursor_shape_bgra_to_rgba_converts_contiguous_rows() {
-        let shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
-            Width: 2,
-            Height: 1,
-            Pitch: 8,
-            ..Default::default()
-        };
-        let src = vec![
-            0x10, 0x20, 0x30, 0x40, // BGRA
-            0x50, 0x60, 0x70, 0x80, // BGRA
-        ];
-        let rgba = convert_cursor_shape_bgra_to_rgba(&src, &shape);
-        assert_eq!(
-            rgba,
-            vec![
-                0x30, 0x20, 0x10, 0x40, //
-                0x70, 0x60, 0x50, 0x80
-            ]
-        );
-    }
-
-    #[test]
-    fn cursor_shape_bgra_to_rgba_converts_with_row_padding() {
-        let shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
-            Width: 2,
-            Height: 2,
-            Pitch: 12,
-            ..Default::default()
-        };
-        let src = vec![
-            0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xEE, 0, 0, 0, 0, // row 0
-            0x70, 0x80, 0x90, 0xDD, 0xA0, 0xB0, 0xC0, 0xCC, 0, 0, 0, 0, // row 1
-        ];
-        let rgba = convert_cursor_shape_bgra_to_rgba(&src, &shape);
-        assert_eq!(
-            rgba,
-            vec![
-                0x30, 0x20, 0x10, 0xFF, 0x60, 0x50, 0x40, 0xEE, //
-                0x90, 0x80, 0x70, 0xDD, 0xC0, 0xB0, 0xA0, 0xCC
-            ]
-        );
-    }
-
-    #[test]
-    fn cursor_shape_bgra_to_rgba_handles_truncated_buffer() {
-        let shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
-            Width: 2,
-            Height: 1,
-            Pitch: 8,
-            ..Default::default()
-        };
-        let src = vec![
-            0x10, 0x20, 0x30, 0xAA, // full pixel
-            0x40, 0x50, // partial pixel (ignored)
-        ];
-        let rgba = convert_cursor_shape_bgra_to_rgba(&src, &shape);
-        assert_eq!(rgba, vec![0x30, 0x20, 0x10, 0xAA, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn cursor_shape_bgra_to_rgba_handles_pitch_smaller_than_row() {
-        let shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
-            Width: 2,
-            Height: 2,
-            Pitch: 4,
-            ..Default::default()
-        };
-        let src = vec![
-            0x10, 0x20, 0x30, 0xAA, // row 0: one pixel available
-            0x40, 0x50, 0x60, 0xBB, // row 1: one pixel available
-        ];
-        let rgba = convert_cursor_shape_bgra_to_rgba(&src, &shape);
-        assert_eq!(
-            rgba,
-            vec![
-                0x30, 0x20, 0x10, 0xAA, 0, 0, 0, 0, //
-                0x60, 0x50, 0x40, 0xBB, 0, 0, 0, 0
-            ]
-        );
     }
 
     #[test]

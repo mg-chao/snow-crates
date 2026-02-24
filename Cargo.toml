@@ -1,8 +1,9 @@
-[workspace]
+﻿[workspace]
 members = [
     "crates/snow-capture",
     "crates/snow-audio-recorder",
     "crates/snow-screen-recorder",
+    "crates/snow-cursor-capture",
 ]
 resolver = "3"
 
