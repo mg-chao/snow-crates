@@ -189,9 +189,15 @@ impl Default for AudioEditConfig {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct MouseEditConfig {
     pub visible: bool,
     pub trail_enabled: bool,
+    pub trail_window_ms: u64,
+    pub trail_smooth_step_px: f32,
+    pub trail_max_alpha: u8,
+    pub trail_color: [u8; 3],
+    pub trail_thickness: i32,
     pub click_enabled: bool,
 }
 
@@ -200,6 +206,11 @@ impl Default for MouseEditConfig {
         Self {
             visible: true,
             trail_enabled: false,
+            trail_window_ms: 128,
+            trail_smooth_step_px: 2.0,
+            trail_max_alpha: 180,
+            trail_color: [255, 32, 32],
+            trail_thickness: 2,
             click_enabled: false,
         }
     }
@@ -265,6 +276,18 @@ impl EditConfig {
             return Err("microphone_audio.volume must be in 0.0..=2.0".to_string());
         }
 
+        if self.mouse.trail_window_ms == 0 {
+            return Err("mouse.trail_window_ms must be > 0".to_string());
+        }
+
+        if !self.mouse.trail_smooth_step_px.is_finite() || self.mouse.trail_smooth_step_px <= 0.0 {
+            return Err("mouse.trail_smooth_step_px must be finite and > 0".to_string());
+        }
+
+        if self.mouse.trail_thickness < 0 {
+            return Err("mouse.trail_thickness must be >= 0".to_string());
+        }
+
         if self.export.output_path.as_os_str().is_empty() {
             return Err("export.output_path must not be empty".to_string());
         }
@@ -291,6 +314,18 @@ mod tests {
 
         cfg = EditConfig::default();
         cfg.microphone_audio.volume = 2.5;
+        assert!(cfg.validate().is_err());
+
+        cfg = EditConfig::default();
+        cfg.mouse.trail_window_ms = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg = EditConfig::default();
+        cfg.mouse.trail_smooth_step_px = 0.0;
+        assert!(cfg.validate().is_err());
+
+        cfg = EditConfig::default();
+        cfg.mouse.trail_thickness = -1;
         assert!(cfg.validate().is_err());
 
         cfg = EditConfig::default();

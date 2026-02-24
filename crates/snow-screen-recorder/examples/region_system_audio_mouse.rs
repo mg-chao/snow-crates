@@ -52,7 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stop_duration_start = std::time::Instant::now();
     let artifact = recording.stop()?;
-    println!("Recording stopped in {} ms", stop_duration_start.elapsed().as_millis());
+    println!(
+        "Recording stopped in {} ms",
+        stop_duration_start.elapsed().as_millis()
+    );
 
     let mut editing = EditingSession::open(artifact)?;
     let mut edit_config = EditConfig::default();
@@ -62,6 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         visible: true,
         trail_enabled: true,
         click_enabled: true,
+        ..MouseEditConfig::default()
     };
     edit_config.export = ExportConfig {
         format: ExportFormat::Mp4,

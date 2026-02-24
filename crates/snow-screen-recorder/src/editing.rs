@@ -578,7 +578,7 @@ fn apply_mouse_overlays(frame: &mut StoredFrame, tracks: &MouseTracks, config: &
     let current = &tracks.samples[cursor_idx - 1];
 
     if config.trail_enabled {
-        draw_mouse_trail(frame, &tracks.samples[..cursor_idx], ts);
+        draw_mouse_trail(frame, &tracks.samples[..cursor_idx], ts, config);
     }
     if config.click_enabled {
         draw_click_ripples(frame, &tracks.click_downs, ts);
@@ -588,15 +588,20 @@ fn apply_mouse_overlays(frame: &mut StoredFrame, tracks: &MouseTracks, config: &
     }
 }
 
-fn draw_mouse_trail(frame: &mut StoredFrame, samples: &[MouseSample], ts: u64) {
-    let trail_window_ms = 128u64;
+fn draw_mouse_trail(
+    frame: &mut StoredFrame,
+    samples: &[MouseSample],
+    ts: u64,
+    config: &MouseEditConfig,
+) {
+    let trail_window_ms = config.trail_window_ms.max(1);
     let cutoff = ts.saturating_sub(trail_window_ms);
     let visible = collect_visible_trail_window(samples, cutoff);
     if visible.len() < 2 {
         return;
     }
 
-    let smoothed = build_smoothed_trail_points(&visible, 2.0);
+    let smoothed = build_smoothed_trail_points(&visible, config.trail_smooth_step_px);
     if smoothed.len() < 2 {
         return;
     }
@@ -606,7 +611,9 @@ fn draw_mouse_trail(frame: &mut StoredFrame, samples: &[MouseSample], ts: u64) {
         let b = segment[1];
         let b_ts_ms = b.ts_ms.max(0.0).round() as u64;
         let age = ts.saturating_sub(b_ts_ms).min(trail_window_ms);
-        let alpha = ((1.0 - age as f32 / trail_window_ms as f32) * 180.0).round() as u8;
+        let alpha = ((1.0 - age as f32 / trail_window_ms as f32) * config.trail_max_alpha as f32)
+            .round()
+            .clamp(0.0, 255.0) as u8;
         if alpha == 0 {
             continue;
         }
@@ -616,8 +623,13 @@ fn draw_mouse_trail(frame: &mut StoredFrame, samples: &[MouseSample], ts: u64) {
             a.y.round() as i32,
             b.x.round() as i32,
             b.y.round() as i32,
-            [255, 32, 32, alpha],
-            2,
+            [
+                config.trail_color[0],
+                config.trail_color[1],
+                config.trail_color[2],
+                alpha,
+            ],
+            config.trail_thickness.max(0),
         );
     }
 }
@@ -2010,6 +2022,7 @@ mod tests {
                 visible: true,
                 trail_enabled: false,
                 click_enabled: false,
+                ..MouseEditConfig::default()
             },
         );
 
@@ -2057,6 +2070,7 @@ mod tests {
                 visible: true,
                 trail_enabled: false,
                 click_enabled: false,
+                ..MouseEditConfig::default()
             },
         );
 
@@ -2114,6 +2128,7 @@ mod tests {
                 visible: true,
                 trail_enabled: false,
                 click_enabled: false,
+                ..MouseEditConfig::default()
             },
         );
 
@@ -2160,6 +2175,7 @@ mod tests {
                 visible: true,
                 trail_enabled: false,
                 click_enabled: false,
+                ..MouseEditConfig::default()
             },
         );
 
@@ -2216,6 +2232,7 @@ mod tests {
                 visible: false,
                 trail_enabled: true,
                 click_enabled: false,
+                ..MouseEditConfig::default()
             },
         );
 
