@@ -644,6 +644,11 @@ fn draw_cursor(frame: &mut StoredFrame, current: &MouseSample, tracks: &MouseTra
             .and_then(|px| px.checked_mul(4))
             .unwrap_or(0);
         if expected_len > 0 && shape.shape_rgba.len() >= expected_len {
+            let shape_rgba = &shape.shape_rgba[..expected_len];
+            if !cursor_shape_is_renderable(shape.mode, shape_rgba) {
+                draw_fallback_cursor(frame, current.x, current.y);
+                return;
+            }
             draw_cursor_shape(
                 frame,
                 current.x.saturating_sub(shape.hotspot_x as i32),
@@ -651,13 +656,23 @@ fn draw_cursor(frame: &mut StoredFrame, current: &MouseSample, tracks: &MouseTra
                 width,
                 height,
                 shape.mode,
-                &shape.shape_rgba[..expected_len],
+                shape_rgba,
             );
             return;
         }
     }
 
     draw_fallback_cursor(frame, current.x, current.y);
+}
+
+fn cursor_shape_is_renderable(mode: CursorShapeCompositionMode, rgba: &[u8]) -> bool {
+    match mode {
+        // Some Windows color cursors report a shape with fully transparent alpha.
+        // In that case rendering the sampled bitmap is a no-op, so we should
+        // fall back to the synthetic cursor.
+        CursorShapeCompositionMode::AlphaBlend => rgba.chunks_exact(4).any(|px| px[3] != 0),
+        CursorShapeCompositionMode::MaskedColor => !rgba.is_empty(),
+    }
 }
 
 fn draw_cursor_shape(
@@ -1861,6 +1876,56 @@ mod tests {
 
         let px = (1usize * 4 + 2usize) * 4;
         assert_eq!(&frame.rgba[px..px + 4], &[200, 10, 20, 255]);
+    }
+
+    #[test]
+    fn apply_mouse_overlays_uses_fallback_for_fully_transparent_alpha_shape() {
+        let mut frame = StoredFrame {
+            timestamp_ms: 0,
+            duration_ms: 16,
+            width: 16,
+            height: 16,
+            rgba: vec![0; 16 * 16 * 4],
+        };
+        let store = MouseStore {
+            schema_version: crate::mouse::MOUSE_STORE_SCHEMA_VERSION,
+            cursor_shapes: vec![CursorShapeRecord {
+                shape_id: 99,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                width: 2,
+                height: 2,
+                mode: CursorShapeCompositionMode::AlphaBlend,
+                shape_rgba: vec![
+                    255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0,
+                ],
+            }],
+            cursor_frames: vec![crate::mouse::CursorFrameRecord {
+                timestamp_ms: 0,
+                x: 8,
+                y: 8,
+                visible: true,
+                shape_id: Some(99),
+            }],
+            clicks: vec![],
+        };
+        let tracks = build_mouse_tracks(&store);
+
+        apply_mouse_overlays(
+            &mut frame,
+            &tracks,
+            &MouseEditConfig {
+                visible: true,
+                trail_enabled: false,
+                click_enabled: false,
+            },
+        );
+
+        let cursor_pixel = (8usize * 16 + 8usize) * 4;
+        assert!(
+            frame.rgba[cursor_pixel + 3] > 0,
+            "fallback cursor should draw even when sampled shape is fully transparent"
+        );
     }
 
     #[test]

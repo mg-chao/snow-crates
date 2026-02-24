@@ -87,26 +87,21 @@ fn extract_color_shape(
     mask: HBITMAP,
 ) -> Option<ShapePayload> {
     let (width, height, mut rgba) = read_bitmap_rgba(color)?;
+    let mut composition_mode = CursorCompositionMode::AlphaBlend;
 
     if rgba.chunks_exact(4).all(|px| px[3] == 0)
         && !mask.is_invalid()
         && let Some((mask_width, mask_height, mask_rgba)) = read_bitmap_rgba(mask)
+        && apply_color_mask_as_masked_composition(
+            &mut rgba,
+            width,
+            height,
+            mask_width,
+            mask_height,
+            &mask_rgba,
+        )
     {
-        let and_height = if mask_height >= height.saturating_mul(2) {
-            height
-        } else {
-            mask_height.min(height)
-        };
-        let rows = and_height.min(height);
-        let cols = mask_width.min(width);
-        for y in 0..rows {
-            for x in 0..cols {
-                let idx = ((y * mask_width + x) * 4) as usize;
-                let mask_set = pixel_is_set(&mask_rgba[idx..idx + 4]);
-                let dst = ((y * width + x) * 4 + 3) as usize;
-                rgba[dst] = if mask_set { 0 } else { 255 };
-            }
-        }
+        composition_mode = CursorCompositionMode::MaskedColor;
     }
 
     Some(ShapePayload {
@@ -114,7 +109,7 @@ fn extract_color_shape(
         hotspot_y,
         width,
         height,
-        composition_mode: CursorCompositionMode::AlphaBlend,
+        composition_mode,
         shape_rgba: rgba,
     })
 }
@@ -167,6 +162,46 @@ fn extract_monochrome_shape(hotspot_x: u32, hotspot_y: u32, mask: HBITMAP) -> Op
 
 fn pixel_is_set(pixel: &[u8]) -> bool {
     pixel[0] > 127 || pixel[1] > 127 || pixel[2] > 127
+}
+
+fn apply_color_mask_as_masked_composition(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    mask_width: u32,
+    mask_height: u32,
+    mask_rgba: &[u8],
+) -> bool {
+    let and_height = if mask_height >= height.saturating_mul(2) {
+        height
+    } else {
+        mask_height.min(height)
+    };
+    let rows = and_height.min(height);
+    let cols = mask_width.min(width);
+    if rows == 0 || cols == 0 {
+        return false;
+    }
+
+    for y in 0..rows {
+        for x in 0..cols {
+            let idx = ((y * mask_width + x) * 4) as usize;
+            if idx + 3 >= mask_rgba.len() {
+                return false;
+            }
+            let mask_set = pixel_is_set(&mask_rgba[idx..idx + 4]);
+            let dst = ((y * width + x) * 4 + 3) as usize;
+            if dst >= rgba.len() {
+                return false;
+            }
+            // DrawIconEx non-alpha path: dst = (dst & AND) XOR XOR.
+            // We encode this into MaskedColor convention:
+            // alpha=0x00 => copy XOR color (AND=0), alpha=0xFF => XOR (AND=1).
+            rgba[dst] = if mask_set { 255 } else { 0 };
+        }
+    }
+
+    true
 }
 
 fn read_bitmap_rgba(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
@@ -232,4 +267,32 @@ fn read_bitmap_rgba(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     }
 
     Some((width, height, rgba))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_color_mask_as_masked_composition_maps_and_bits_to_alpha_ops() {
+        let mut rgba = vec![
+            // row 0
+            10, 20, 30, 0, 40, 50, 60, 0, // row 1
+            70, 80, 90, 0, 100, 110, 120, 0,
+        ];
+        let mask_rgba = vec![
+            // row 0: set, clear
+            255, 255, 255, 255, 0, 0, 0, 255, // row 1: clear, set
+            0, 0, 0, 255, 255, 255, 255, 255,
+        ];
+
+        let ok = apply_color_mask_as_masked_composition(&mut rgba, 2, 2, 2, 2, &mask_rgba);
+        assert!(ok, "mask conversion should succeed");
+
+        // AND=1 -> XOR op -> alpha=255, AND=0 -> copy op -> alpha=0.
+        assert_eq!(rgba[3], 255);
+        assert_eq!(rgba[7], 0);
+        assert_eq!(rgba[11], 0);
+        assert_eq!(rgba[15], 255);
+    }
 }
