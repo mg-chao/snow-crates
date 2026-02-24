@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -9,21 +8,19 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_next as ffmpeg;
 use snow_audio_recorder::{
-    AudioEvent, AudioFormat, AudioPacket, AudioSampleFormat, AudioSession, AudioSourceKind,
+    AudioEvent, AudioFormat, AudioPacket, AudioSampleFormat, AudioSession,
     AudioStreamConfig, AudioTimestampAnchor, DeviceSelector, SourceConfig, align_packet_frames,
 };
 use snow_capture::{
-    CaptureEvent, CaptureMode, CaptureSession, CaptureTarget, CursorCompositionMode, StreamConfig,
+    CaptureEvent, CaptureMode, CaptureSession, CaptureTarget, StreamConfig,
 };
 use uuid::Uuid;
 
 use crate::artifact::{RecordingArtifact, SessionManifest};
 use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat, VideoEncodeConfig};
 use crate::error::{Result, ScreenRecorderError};
-use crate::mouse::{
-    CursorFrameRecord, CursorShapeCompositionMode, CursorShapeRecord, MouseStore,
-    write_mouse_records,
-};
+use crate::mouse::write_mouse_records;
+use crate::processor::{AudioProcessor, CursorProcessor, VideoProcessor};
 use crate::temp::TempLayout;
 use crate::timeline::PauseTimeline;
 use crate::video_quality::{quality_to_h264_crf, smart_quality_bitrate_bps};
@@ -68,12 +65,12 @@ struct RuntimeHandles {
 }
 
 #[derive(Debug)]
-struct WorkerOutcome {
-    width: u32,
-    height: u32,
-    pause_intervals: Vec<crate::artifact::PauseInterval>,
-    recorded_system_audio: bool,
-    recorded_microphone_audio: bool,
+pub(crate) struct WorkerOutcome {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pause_intervals: Vec<crate::artifact::PauseInterval>,
+    pub(crate) recorded_system_audio: bool,
+    pub(crate) recorded_microphone_audio: bool,
 }
 
 pub struct RecordingSession {
@@ -111,7 +108,7 @@ impl RecordingSession {
             ));
         }
 
-        let capture_target = recording_target_to_capture_target(&self.config.target);
+        let capture_target = recording_target_to_capture_target(&self.config.target)?;
         let origin = resolve_capture_origin(&self.config.target)?;
         {
             let mut guard = self.capture_origin.lock().map_err(|_| {
@@ -301,13 +298,8 @@ impl RecordingSession {
     }
 }
 
-fn recording_target_to_capture_target(target: &RecordingTarget) -> CaptureTarget {
-    match target {
-        RecordingTarget::PrimaryMonitor => CaptureTarget::PrimaryMonitor,
-        RecordingTarget::Monitor(id) => CaptureTarget::Monitor(id.clone()),
-        RecordingTarget::Window(id) => CaptureTarget::Window(*id),
-        RecordingTarget::Region(region) => CaptureTarget::Region(*region),
-    }
+fn recording_target_to_capture_target(target: &RecordingTarget) -> Result<CaptureTarget> {
+    crate::adapter::video::resolve_capture_target(target)
 }
 
 fn start_audio_stream_if_enabled(
@@ -353,13 +345,13 @@ fn start_audio_stream_if_enabled(
 fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
     match target {
         RecordingTarget::Region(region) => Ok((region.x, region.y)),
-        RecordingTarget::Window(window) => {
+        RecordingTarget::Window(selector) => {
             #[cfg(target_os = "windows")]
             {
                 use windows::Win32::Foundation::{HWND, RECT};
                 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
-                let hwnd = HWND(window.raw_handle() as *mut std::ffi::c_void);
+                let hwnd = HWND(selector.raw_handle as *mut std::ffi::c_void);
                 let mut rect = RECT::default();
                 unsafe { GetWindowRect(hwnd, &mut rect) }.map_err(|e| {
                     ScreenRecorderError::Capture(snow_capture::error::CaptureError::InvalidConfig(
@@ -370,7 +362,7 @@ fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
             }
             #[cfg(not(target_os = "windows"))]
             {
-                let _ = window;
+                let _ = selector;
                 Ok((0, 0))
             }
         }
@@ -388,15 +380,15 @@ fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
                             ),
                         )
                     })?,
-                RecordingTarget::Monitor(selected) => layout
+                RecordingTarget::Monitor(selector) => layout
                     .monitors
                     .iter()
-                    .find(|m| m.monitor.stable_id() == selected.stable_id())
+                    .find(|m| m.monitor.stable_id() == selector.stable_id)
                     .ok_or_else(|| {
                         ScreenRecorderError::Capture(
                             snow_capture::error::CaptureError::InvalidTarget(format!(
-                                "monitor {} not found",
-                                selected.stable_id()
+                                "monitor with stable_id '{}' not found",
+                                selector.stable_id
                             )),
                         )
                     })?,
@@ -407,7 +399,7 @@ fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
     }
 }
 
-struct PcmTrackWriter {
+pub(crate) struct PcmTrackWriter {
     writer: BufWriter<File>,
     sample_rate_hz: u32,
     channels: u16,
@@ -416,7 +408,7 @@ struct PcmTrackWriter {
 }
 
 impl PcmTrackWriter {
-    fn create(
+    pub(crate) fn create(
         path: &std::path::Path,
         sample_rate_hz: u32,
         channels: u16,
@@ -432,7 +424,7 @@ impl PcmTrackWriter {
         })
     }
 
-    fn append_silence_frames(&mut self, frames: u64) -> Result<()> {
+    pub(crate) fn append_silence_frames(&mut self, frames: u64) -> Result<()> {
         if frames == 0 {
             return Ok(());
         }
@@ -453,7 +445,7 @@ impl PcmTrackWriter {
         Ok(())
     }
 
-    fn append_i16_bytes(&mut self, bytes: &[u8]) -> Result<u64> {
+    pub(crate) fn append_i16_bytes(&mut self, bytes: &[u8]) -> Result<u64> {
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -471,7 +463,7 @@ impl PcmTrackWriter {
         Ok(frames)
     }
 
-    fn write_packet(
+    pub(crate) fn write_packet(
         &mut self,
         packet: &AudioPacket,
         bytes: &[u8],
@@ -522,13 +514,13 @@ impl PcmTrackWriter {
         self.append_i16_bytes(&bytes[skip_bytes..])
     }
 
-    fn finish(mut self) -> Result<()> {
+    pub(crate) fn finish(mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
     }
 }
 
-struct LiveVideoEncoder {
+pub(crate) struct LiveVideoEncoder {
     output: ffmpeg::format::context::Output,
     encoder: ffmpeg::encoder::video::Encoder,
     stream_index: usize,
@@ -543,7 +535,7 @@ struct LiveVideoEncoder {
 }
 
 impl LiveVideoEncoder {
-    fn create(
+    pub(crate) fn create(
         path: &std::path::Path,
         width: u32,
         height: u32,
@@ -693,14 +685,14 @@ impl LiveVideoEncoder {
         })
     }
 
-    fn encode_frame(&mut self, rgba: &[u8], timestamp_ms: u64) -> Result<()> {
+    pub(crate) fn encode_frame(&mut self, rgba: &[u8], timestamp_ms: u64) -> Result<()> {
         let pts = self
             .timestamp_to_pts(timestamp_ms)
             .max(self.last_pts.unwrap_or(-1).saturating_add(1));
         self.encode_frame_at_pts(rgba, pts)
     }
 
-    fn finalize(mut self, final_timestamp_ms: u64, tail_rgba: Option<&[u8]>) -> Result<()> {
+    pub(crate) fn finalize(mut self, final_timestamp_ms: u64, tail_rgba: Option<&[u8]>) -> Result<()> {
         if let (Some(last_pts), Some(rgba)) = (self.last_pts, tail_rgba) {
             let final_pts = self.timestamp_to_pts(final_timestamp_ms);
             if final_pts > last_pts {
@@ -837,26 +829,13 @@ fn copy_rgba_into_frame(frame: &mut ffmpeg::frame::Video, width: u32, rgba: &[u8
 struct WorkerContext {
     layout: TempLayout,
     frame_interval_ms: u32,
-    target_fps: u32,
-    video_format: RecordingVideoFormat,
-    video_config: VideoEncodeConfig,
     timeline: PauseTimeline,
-    capture_origin_x: i32,
-    capture_origin_y: i32,
-    width: u32,
-    height: u32,
-    last_encoded_rgba: Option<Vec<u8>>,
     last_observed_ts_ms: Option<u64>,
-    mouse_store: MouseStore,
-    cursor_shapes_emitted: HashSet<u64>,
-    last_cursor_frame: Option<CursorFrameRecord>,
-    system_audio: Option<PcmTrackWriter>,
-    mic_audio: Option<PcmTrackWriter>,
-    preview_encoder: Option<LiveVideoEncoder>,
+    video: VideoProcessor,
+    audio: AudioProcessor,
+    cursor: CursorProcessor,
     capture_ended: bool,
     audio_ended: bool,
-    recorded_system_audio: bool,
-    recorded_microphone_audio: bool,
 }
 
 impl WorkerContext {
@@ -871,7 +850,7 @@ impl WorkerContext {
         let sample_rate_hz = config.audio.sample_rate_hz.max(1);
         let channels = config.audio.channels.channels().max(1);
 
-        let system_audio = if config.audio.system_audio_enabled {
+        let system_writer = if config.audio.system_audio_enabled {
             Some(PcmTrackWriter::create(
                 &layout.audio_system_path,
                 sample_rate_hz,
@@ -882,7 +861,7 @@ impl WorkerContext {
             None
         };
 
-        let mic_audio = if config.audio.microphone_enabled {
+        let mic_writer = if config.audio.microphone_enabled {
             Some(PcmTrackWriter::create(
                 &layout.audio_mic_path,
                 sample_rate_hz,
@@ -893,29 +872,26 @@ impl WorkerContext {
             None
         };
 
+        let video = VideoProcessor::new(
+            config.fps.max(1),
+            config.video_format,
+            config.video.clone(),
+            layout.video_temp_path.clone(),
+        );
+
+        let audio = AudioProcessor::new(system_writer, mic_writer);
+        let cursor = CursorProcessor::new(capture_origin_x, capture_origin_y);
+
         Ok(Self {
             layout,
             frame_interval_ms,
-            target_fps: config.fps.max(1),
-            video_format: config.video_format,
-            video_config: config.video.clone(),
             timeline: PauseTimeline::new(started_at),
-            capture_origin_x,
-            capture_origin_y,
-            width: 0,
-            height: 0,
-            last_encoded_rgba: None,
             last_observed_ts_ms: None,
-            mouse_store: MouseStore::new(),
-            cursor_shapes_emitted: HashSet::new(),
-            last_cursor_frame: None,
-            system_audio,
-            mic_audio,
-            preview_encoder: None,
+            video,
+            audio,
+            cursor,
             capture_ended: false,
             audio_ended: false,
-            recorded_system_audio: false,
-            recorded_microphone_audio: false,
         })
     }
 
@@ -933,38 +909,12 @@ impl WorkerContext {
         self.last_observed_ts_ms = Some(ts_ms);
     }
 
-    fn record_cursor_frame(&mut self, ts_ms: u64, cursor: &snow_capture::CursorData) {
-        if let Some(shape) = cursor.shape.as_ref()
-            && self.cursor_shapes_emitted.insert(shape.shape_id)
-        {
-            self.mouse_store.cursor_shapes.push(CursorShapeRecord {
-                shape_id: shape.shape_id,
-                hotspot_x: shape.hotspot_x,
-                hotspot_y: shape.hotspot_y,
-                width: shape.width,
-                height: shape.height,
-                mode: map_cursor_composition_mode(shape.composition_mode),
-                shape_rgba: shape.shape_rgba.clone(),
-            });
-        }
-
-        let frame = CursorFrameRecord {
-            timestamp_ms: ts_ms,
-            x: cursor.position_x - self.capture_origin_x,
-            y: cursor.position_y - self.capture_origin_y,
-            visible: cursor.visible,
-            shape_id: cursor.shape_id,
-        };
-        self.last_cursor_frame = Some(frame.clone());
-        self.mouse_store.cursor_frames.push(frame);
+    fn record_cursor_frame(&mut self, ts_ms: u64, cursor: &snow_cursor_capture::CursorFrameSample) {
+        self.cursor.record_frame(ts_ms, cursor);
     }
 
     fn synthesize_cursor_frame_for_drop(&mut self, ts_ms: u64) {
-        if let Some(mut last) = self.last_cursor_frame.clone() {
-            last.timestamp_ms = ts_ms;
-            self.last_cursor_frame = Some(last.clone());
-            self.mouse_store.cursor_frames.push(last);
-        }
+        self.cursor.synthesize_frame_for_drop(ts_ms);
     }
 
     fn handle_capture_event(&mut self, event: CaptureEvent) -> Result<()> {
@@ -999,45 +949,23 @@ impl WorkerContext {
 
     fn handle_frame(&mut self, frame: snow_capture::frame::Frame) -> Result<()> {
         let (width, height) = frame.dimensions();
-        if self.width == 0 || self.height == 0 {
-            self.width = width;
-            self.height = height;
-        } else if self.width != width || self.height != height {
-            return Err(ScreenRecorderError::Encode(format!(
-                "dynamic resolution is unsupported (expected {}x{}, got {}x{})",
-                self.width, self.height, width, height
-            )));
-        }
+        self.video.handle_resolution_change(width, height)?;
 
         let capture_at = frame.metadata.capture_time.unwrap_or_else(Instant::now);
         let ts_ms = self.timeline.active_elapsed_ms(capture_at);
         self.observe_video_time(ts_ms);
 
+        #[cfg(feature = "cursor")]
         if let Some(cursor) = frame.metadata.cursor.as_ref() {
             self.record_cursor_frame(ts_ms, cursor);
         }
 
         if frame.metadata.is_duplicate {
-            return Ok(());
+            return self.video.handle_duplicate();
         }
 
         let rgba = frame.as_rgba_bytes().to_vec();
-
-        if self.preview_encoder.is_none() {
-            self.preview_encoder = Some(LiveVideoEncoder::create(
-                &self.layout.video_temp_path,
-                width,
-                height,
-                self.target_fps,
-                self.video_format,
-                &self.video_config,
-            )?);
-        }
-        if let Some(encoder) = self.preview_encoder.as_mut() {
-            encoder.encode_frame(&rgba, ts_ms)?;
-        }
-        self.last_encoded_rgba = Some(rgba);
-        Ok(())
+        self.video.encode_frame(rgba, width, height, ts_ms)
     }
 
     fn handle_audio_event(&mut self, event: AudioEvent) -> Result<()> {
@@ -1047,49 +975,14 @@ impl WorkerContext {
                 if bytes.is_empty() {
                     return Ok(());
                 }
-
-                match packet.source {
-                    AudioSourceKind::System => {
-                        if let Some(writer) = self.system_audio.as_mut() {
-                            let appended = writer.write_packet(&packet, &bytes, &self.timeline)?;
-                            if appended > 0 {
-                                self.recorded_system_audio = true;
-                            }
-                        }
-                    }
-                    AudioSourceKind::Microphone => {
-                        if let Some(writer) = self.mic_audio.as_mut() {
-                            let appended = writer.write_packet(&packet, &bytes, &self.timeline)?;
-                            if appended > 0 {
-                                self.recorded_microphone_audio = true;
-                            }
-                        }
-                    }
-                }
+                self.audio.write_packet(packet.source, &packet, &bytes, &self.timeline)?;
                 Ok(())
             }
             AudioEvent::PacketDropped {
                 source,
                 dropped_frames,
             } => {
-                match source {
-                    AudioSourceKind::System => {
-                        if let Some(writer) = self.system_audio.as_mut() {
-                            writer.append_silence_frames(dropped_frames)?;
-                            if dropped_frames > 0 {
-                                self.recorded_system_audio = true;
-                            }
-                        }
-                    }
-                    AudioSourceKind::Microphone => {
-                        if let Some(writer) = self.mic_audio.as_mut() {
-                            writer.append_silence_frames(dropped_frames)?;
-                            if dropped_frames > 0 {
-                                self.recorded_microphone_audio = true;
-                            }
-                        }
-                    }
-                }
+                self.audio.write_silence(source, dropped_frames)?;
                 Ok(())
             }
             AudioEvent::StreamEnded => {
@@ -1106,32 +999,30 @@ impl WorkerContext {
         let final_ts_ms = self.timeline.active_elapsed_ms(at);
         self.observe_video_time(final_ts_ms);
 
-        if let Some(encoder) = self.preview_encoder.take() {
-            let tail_rgba = self.last_encoded_rgba.as_deref();
+        if let Some(encoder) = self.video.take_preview_encoder() {
+            let tail_rgba = self.video.last_encoded_rgba();
             encoder.finalize(final_ts_ms, tail_rgba)?;
         }
 
-        if self.last_encoded_rgba.is_none() {
+        if self.video.last_encoded_rgba().is_none() {
             return Err(ScreenRecorderError::Encode(
                 "recording ended without any video frames".to_string(),
             ));
         }
 
-        write_mouse_records(&self.layout.mouse_path, &self.mouse_store)?;
+        let mouse_store = self.cursor.mouse_store();
+        write_mouse_records(&self.layout.mouse_path, mouse_store)?;
 
-        if let Some(writer) = self.system_audio.take() {
-            writer.finish()?;
-        }
-        if let Some(writer) = self.mic_audio.take() {
-            writer.finish()?;
-        }
+        let recorded_system_audio = self.audio.recorded_system();
+        let recorded_microphone_audio = self.audio.recorded_mic();
+        self.audio.finish()?;
 
         Ok(WorkerOutcome {
-            width: self.width,
-            height: self.height,
+            width: self.video.width(),
+            height: self.video.height(),
             pause_intervals: self.timeline.intervals().to_vec(),
-            recorded_system_audio: self.recorded_system_audio,
-            recorded_microphone_audio: self.recorded_microphone_audio,
+            recorded_system_audio,
+            recorded_microphone_audio,
         })
     }
 }
@@ -1247,14 +1138,7 @@ fn duration_between_timestamps_ms(start_ts: u64, end_ts: u64, fallback_ms: u32) 
     delta.min(u64::from(u32::MAX)) as u32
 }
 
-fn map_cursor_composition_mode(mode: CursorCompositionMode) -> CursorShapeCompositionMode {
-    match mode {
-        CursorCompositionMode::AlphaBlend => CursorShapeCompositionMode::AlphaBlend,
-        CursorCompositionMode::MaskedColor => CursorShapeCompositionMode::MaskedColor,
-    }
-}
-
-fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPacket) -> Result<Vec<u8>> {
+pub(crate) fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPacket) -> Result<Vec<u8>> {
     match packet.format.sample_format {
         AudioSampleFormat::I16 => {
             if packet.data.len() % 2 != 0 {
@@ -1285,6 +1169,7 @@ fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPacket) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snow_cursor_capture::CursorCompositionMode;
     use std::path::PathBuf;
 
     #[test]
@@ -1310,18 +1195,6 @@ mod tests {
         assert_eq!(duration_between_timestamps_ms(2_000, 1_500, 42), 42);
     }
 
-    #[test]
-    fn map_cursor_composition_mode_maps_known_modes() {
-        assert_eq!(
-            map_cursor_composition_mode(CursorCompositionMode::AlphaBlend),
-            CursorShapeCompositionMode::AlphaBlend
-        );
-        assert_eq!(
-            map_cursor_composition_mode(CursorCompositionMode::MaskedColor),
-            CursorShapeCompositionMode::MaskedColor
-        );
-    }
-
     fn test_worker_context() -> WorkerContext {
         WorkerContext {
             layout: TempLayout {
@@ -1334,38 +1207,30 @@ mod tests {
                 mouse_path: PathBuf::from("mouse.bin"),
             },
             frame_interval_ms: 16,
-            target_fps: 60,
-            video_format: RecordingVideoFormat::H264Lossless,
-            video_config: VideoEncodeConfig::default(),
             timeline: PauseTimeline::new(Instant::now()),
-            capture_origin_x: 10,
-            capture_origin_y: 20,
-            width: 0,
-            height: 0,
-            last_encoded_rgba: None,
             last_observed_ts_ms: None,
-            mouse_store: MouseStore::new(),
-            cursor_shapes_emitted: HashSet::new(),
-            last_cursor_frame: None,
-            system_audio: None,
-            mic_audio: None,
-            preview_encoder: None,
+            video: VideoProcessor::new(
+                60,
+                RecordingVideoFormat::H264Lossless,
+                VideoEncodeConfig::default(),
+                PathBuf::from("video.mp4"),
+            ),
+            audio: AudioProcessor::new(None, None),
+            cursor: CursorProcessor::new(10, 20),
             capture_ended: false,
             audio_ended: false,
-            recorded_system_audio: false,
-            recorded_microphone_audio: false,
         }
     }
 
     #[test]
     fn recording_accepts_shape_updates_and_references_by_shape_id() {
         let mut ctx = test_worker_context();
-        let cursor = snow_capture::CursorData {
+        let cursor = snow_cursor_capture::CursorFrameSample {
             position_x: 100,
             position_y: 200,
             visible: true,
             shape_id: Some(7),
-            shape: Some(snow_capture::CursorShape {
+            shape: Some(snow_cursor_capture::CursorShape {
                 shape_id: 7,
                 hotspot_x: 1,
                 hotspot_y: 2,
@@ -1377,7 +1242,7 @@ mod tests {
         };
         ctx.record_cursor_frame(20, &cursor);
 
-        let cursor_same_shape = snow_capture::CursorData {
+        let cursor_same_shape = snow_cursor_capture::CursorFrameSample {
             position_x: 104,
             position_y: 206,
             visible: true,
@@ -1386,29 +1251,34 @@ mod tests {
         };
         ctx.record_cursor_frame(40, &cursor_same_shape);
 
-        assert_eq!(ctx.mouse_store.cursor_shapes.len(), 1);
-        assert_eq!(ctx.mouse_store.cursor_frames.len(), 2);
-        assert_eq!(ctx.mouse_store.cursor_frames[0].shape_id, Some(7));
-        assert_eq!(ctx.mouse_store.cursor_frames[0].x, 90);
-        assert_eq!(ctx.mouse_store.cursor_frames[0].y, 180);
+        let mouse_store = ctx.cursor.mouse_store();
+        assert_eq!(mouse_store.cursor_shapes.len(), 1);
+        assert_eq!(mouse_store.cursor_frames.len(), 2);
+        assert_eq!(mouse_store.cursor_frames[0].shape_id, Some(7));
+        assert_eq!(mouse_store.cursor_frames[0].x, 90);
+        assert_eq!(mouse_store.cursor_frames[0].y, 180);
     }
 
     #[test]
     fn frame_dropped_generates_synthetic_cursor_frame() {
         let mut ctx = test_worker_context();
-        ctx.last_cursor_frame = Some(CursorFrameRecord {
-            timestamp_ms: 10,
-            x: 12,
-            y: 34,
+        // Seed the cursor processor with a last frame by recording one first
+        let seed_cursor = snow_cursor_capture::CursorFrameSample {
+            position_x: 22,
+            position_y: 54,
             visible: false,
             shape_id: Some(5),
-        });
+            shape: None,
+        };
+        ctx.record_cursor_frame(10, &seed_cursor);
 
         ctx.synthesize_cursor_frame_for_drop(26);
-        assert_eq!(ctx.mouse_store.cursor_frames.len(), 1);
-        assert_eq!(ctx.mouse_store.cursor_frames[0].timestamp_ms, 26);
-        assert_eq!(ctx.mouse_store.cursor_frames[0].x, 12);
-        assert_eq!(ctx.mouse_store.cursor_frames[0].y, 34);
-        assert_eq!(ctx.mouse_store.cursor_frames[0].shape_id, Some(5));
+        let mouse_store = ctx.cursor.mouse_store();
+        // 1 from the seed + 1 from the synthesized drop
+        assert_eq!(mouse_store.cursor_frames.len(), 2);
+        assert_eq!(mouse_store.cursor_frames[1].timestamp_ms, 26);
+        assert_eq!(mouse_store.cursor_frames[1].x, 12);
+        assert_eq!(mouse_store.cursor_frames[1].y, 34);
+        assert_eq!(mouse_store.cursor_frames[1].shape_id, Some(5));
     }
 }

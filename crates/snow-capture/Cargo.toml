@@ -1,14 +1,15 @@
 ﻿[package]
 name = "snow-capture"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["cursor"]
+cursor = ["dep:snow-cursor-capture"]
 tokio-stream = ["dep:tokio"]
 
 [dependencies]
-snow-cursor-capture = { path = "../snow-cursor-capture" }
+snow-cursor-capture = { path = "../snow-cursor-capture", optional = true }
 anyhow.workspace = true
 rustc-hash.workspace = true
 half.workspace = true

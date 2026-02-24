@@ -2,12 +2,68 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Identifies a monitor by its stable ID string.
+///
+/// The stable ID has the format `"{adapter_luid:016x}-{output_id:016x}"`,
+/// matching the format produced by `snow_capture::MonitorId::stable_id()`.
+/// This decouples the recorder's public API from `snow_capture` internals.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MonitorSelector {
+    pub stable_id: String,
+}
+
+impl MonitorSelector {
+    pub fn new(stable_id: impl Into<String>) -> Self {
+        Self {
+            stable_id: stable_id.into(),
+        }
+    }
+}
+
+/// Identifies a window by its raw OS handle.
+///
+/// Wraps the platform-specific window handle (HWND on Windows) without
+/// exposing `snow_capture::WindowId`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WindowSelector {
+    pub raw_handle: isize,
+}
+
+impl WindowSelector {
+    pub const fn new(raw_handle: isize) -> Self {
+        Self { raw_handle }
+    }
+}
+
+/// A rectangular region in virtual desktop coordinates.
+///
+/// Decoupled from `snow_capture::CaptureRegion` so the recorder's
+/// public API doesn't depend on capture backend types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordingRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl RecordingRegion {
+    pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum RecordingTarget {
     PrimaryMonitor,
-    Monitor(snow_capture::MonitorId),
-    Window(snow_capture::WindowId),
-    Region(snow_capture::CaptureRegion),
+    Monitor(MonitorSelector),
+    Window(WindowSelector),
+    Region(RecordingRegion),
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

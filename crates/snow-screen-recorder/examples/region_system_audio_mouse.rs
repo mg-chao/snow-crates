@@ -1,10 +1,10 @@
 use std::thread;
 use std::time::Duration;
 
-use snow_capture::CaptureRegion;
 use snow_screen_recorder::{
     EditConfig, EditingSession, ExportConfig, ExportFormat, MouseEditConfig, RecordingAudioConfig,
-    RecordingConfig, RecordingSession, RecordingTarget, VideoEncodeConfig, VideoEncodingSpeed,
+    RecordingConfig, RecordingRegion, RecordingSession, RecordingTarget, VideoEncodeConfig,
+    VideoEncodingSpeed,
 };
 
 const REGION_X: i32 = 0;
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = std::env::current_dir()?.join("recordings");
     let export_path = output_dir.join("region_0_0_2000_2000_fps24.mp4");
 
-    let region = CaptureRegion::new(REGION_X, REGION_Y, REGION_WIDTH, REGION_HEIGHT)?;
+    let region = RecordingRegion::new(REGION_X, REGION_Y, REGION_WIDTH, REGION_HEIGHT);
     let recording_config = RecordingConfig {
         target: RecordingTarget::Region(region),
         output_dir: output_dir.clone(),

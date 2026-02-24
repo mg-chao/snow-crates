@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cursor")]
 pub use snow_cursor_capture::{CursorCompositionMode, CursorFrameSample, CursorShape};
 
 use crate::error::{CaptureError, CaptureResult};
@@ -36,6 +37,7 @@ pub struct DirtyRect {
 }
 
 /// Cursor data captured alongside the frame.
+#[cfg(feature = "cursor")]
 pub type CursorData = CursorFrameSample;
 
 /// Metadata attached to each captured frame for recording pipelines.
@@ -63,6 +65,7 @@ pub struct FrameMetadata {
     pub dirty_rects: Vec<DirtyRect>,
     /// Cursor shape and position at the time of capture. `None` when
     /// cursor capture is not enabled or not supported by the backend.
+    #[cfg(feature = "cursor")]
     pub cursor: Option<CursorData>,
     /// Monotonic sequence number incremented for each capture call.
     /// Useful for correlating frames across threads.
@@ -432,7 +435,8 @@ impl Frame {
         self.metadata.capture_duration = None;
         self.metadata.is_duplicate = false;
         self.metadata.dirty_rects.clear();
-        self.metadata.cursor = None;
+        #[cfg(feature = "cursor")]
+        { self.metadata.cursor = None; }
         self.metadata.color_space = ColorSpace::default();
         // sequence is set by the session, not reset here
     }

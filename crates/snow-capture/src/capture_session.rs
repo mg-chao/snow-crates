@@ -12,6 +12,7 @@ use crate::monitor::{MonitorId, MonitorKey};
 use crate::region::{CaptureRegion, MonitorLayout};
 use crate::streaming::{StreamConfig, StreamHandle};
 use crate::window::{WindowId, WindowKey};
+#[cfg(feature = "cursor")]
 use snow_cursor_capture::CursorSampler;
 
 #[derive(Clone, Debug)]
@@ -213,7 +214,9 @@ impl CaptureSessionBuilder {
             region_desktop_direct_support: FxHashMap::default(),
             region_fallback_frames: FxHashMap::default(),
             region_output_history_valid: false,
+            #[cfg(feature = "cursor")]
             cursor_sampler: None,
+            #[cfg(feature = "cursor")]
             cursor_sampler_init_attempted: false,
         })
     }
@@ -242,7 +245,9 @@ pub struct CaptureSession {
     region_desktop_direct_support: FxHashMap<MonitorKey, bool>,
     region_fallback_frames: FxHashMap<MonitorKey, Frame>,
     region_output_history_valid: bool,
+    #[cfg(feature = "cursor")]
     cursor_sampler: Option<CursorSampler>,
+    #[cfg(feature = "cursor")]
     cursor_sampler_init_attempted: bool,
 }
 
@@ -336,6 +341,7 @@ impl CaptureSession {
         }
     }
 
+    #[cfg(feature = "cursor")]
     fn attach_cursor_metadata(&mut self, frame: &mut Frame) {
         if !self.config.capture_cursor {
             frame.metadata.cursor = None;
@@ -355,6 +361,11 @@ impl CaptureSession {
         } else {
             frame.metadata.cursor = None;
         }
+    }
+
+    #[cfg(not(feature = "cursor"))]
+    fn attach_cursor_metadata(&mut self, _frame: &mut Frame) {
+        // No-op when cursor feature is disabled.
     }
 
     fn resolve_target(&self, target: &CaptureTarget) -> CaptureResult<MonitorId> {
@@ -999,6 +1010,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cursor")]
     #[test]
     fn capture_session_attaches_cursor_when_enabled() -> CaptureResult<()> {
         let history_hints = Arc::new(Mutex::new(Vec::new()));
@@ -1021,6 +1033,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cursor")]
     #[test]
     fn capture_session_omits_cursor_when_disabled() -> CaptureResult<()> {
         let history_hints = Arc::new(Mutex::new(Vec::new()));

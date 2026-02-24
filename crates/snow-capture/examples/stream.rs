@@ -57,9 +57,15 @@ fn main() -> Result<()> {
                     let stream_ts = ts_anchor.stream_relative(&frame.metadata);
                     let snap = stats.snapshot();
                     let dirty = frame.metadata.dirty_rects.len();
+                    #[cfg(feature = "cursor")]
                     let has_cursor = frame.metadata.cursor.is_some();
+                    #[cfg(not(feature = "cursor"))]
+                    let has_cursor = false;
+                    #[cfg(feature = "cursor")]
                     let cursor_visible =
                         frame.metadata.cursor.as_ref().map_or(false, |c| c.visible);
+                    #[cfg(not(feature = "cursor"))]
+                    let cursor_visible = false;
                     let cap_lat = frame
                         .metadata
                         .capture_duration
