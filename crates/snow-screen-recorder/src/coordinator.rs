@@ -7,7 +7,7 @@ use crate::event::{
 };
 use crate::mouse::MouseStore;
 use crate::processor::{AudioProcessor, CursorProcessor, VideoProcessor};
-use crate::recording::{audio_packet_to_i16_le_bytes, WorkerOutcome};
+use crate::recording::{WorkerOutcome, audio_packet_to_i16_le_bytes};
 use crate::timeline::PauseTimeline;
 
 /// Coordinates the recording pipeline.
@@ -139,51 +139,49 @@ impl RecordingCoordinator {
         }
     }
 
+    #[cfg(test)]
     /// Read-only access to the last observed timestamp.
     pub(crate) fn last_observed_ts_ms(&self) -> Option<u64> {
         self.last_observed_ts_ms
     }
 
+    #[cfg(test)]
     /// Read-only access to the timeline.
     pub(crate) fn timeline(&self) -> &PauseTimeline {
         &self.timeline
     }
 
-    /// Mutable access to the timeline (for finalization).
-    pub(crate) fn timeline_mut(&mut self) -> &mut PauseTimeline {
-        &mut self.timeline
-    }
-
+    #[cfg(test)]
     /// Read-only access to the video processor.
     pub(crate) fn video(&self) -> &VideoProcessor {
         &self.video
     }
 
-    /// Mutable access to the video processor.
-    pub(crate) fn video_mut(&mut self) -> &mut VideoProcessor {
-        &mut self.video
-    }
-
+    #[cfg(test)]
     /// Read-only access to the audio processor.
     pub(crate) fn audio(&self) -> &AudioProcessor {
         &self.audio
     }
 
+    #[cfg(test)]
     /// Read-only access to the cursor processor.
     pub(crate) fn cursor(&self) -> &CursorProcessor {
         &self.cursor
     }
 
+    #[cfg(test)]
     /// Whether the capture (video) stream has ended.
     pub(crate) fn capture_ended(&self) -> bool {
         self.capture_ended
     }
 
+    #[cfg(test)]
     /// Whether the audio stream has ended.
     pub(crate) fn audio_ended(&self) -> bool {
         self.audio_ended
     }
 
+    #[cfg(test)]
     /// Whether the cursor stream has ended.
     pub(crate) fn cursor_ended(&self) -> bool {
         self.cursor_ended
@@ -240,6 +238,7 @@ impl RecordingCoordinator {
                 is_duplicate,
             } => {
                 self.video.handle_resolution_change(width, height)?;
+                let _ = timestamp.qpc_100ns;
 
                 let ts_ms = self.timeline.active_elapsed_ms(timestamp.instant);
                 self.observe_video_time(ts_ms);
@@ -258,7 +257,8 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            VideoCaptureEvent::Resumed { at, gap: _ } => {
+            VideoCaptureEvent::Resumed { at, gap } => {
+                let _ = gap;
                 self.timeline.mark_resume(at);
                 Ok(())
             }
@@ -275,7 +275,8 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            VideoCaptureEvent::FrameDropped { sequence: _ } => {
+            VideoCaptureEvent::FrameDropped { sequence } => {
+                let _ = sequence;
                 if let Some(last) = self.last_observed_ts_ms {
                     let next_ts = last.saturating_add(u64::from(self.frame_interval_ms));
                     self.observe_video_time(next_ts);
@@ -285,11 +286,12 @@ impl RecordingCoordinator {
             }
 
             VideoCaptureEvent::ResolutionChanged {
-                old_width: _,
-                old_height: _,
+                old_width,
+                old_height,
                 new_width,
                 new_height,
             } => {
+                let _ = (old_width, old_height);
                 self.video.handle_resolution_change(new_width, new_height)
             }
         }
@@ -304,6 +306,7 @@ impl RecordingCoordinator {
                 format,
                 timestamp,
             } => {
+                let _ = (timestamp.instant, timestamp.qpc_100ns);
                 // Build a temporary AudioPacket for the processor.
                 let packet = snow_audio_recorder::AudioPacket {
                     source,
@@ -341,20 +344,38 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            // Diagnostics-only events — no state mutation.
-            AudioCaptureEvent::Paused { .. }
-            | AudioCaptureEvent::Resumed { .. }
-            | AudioCaptureEvent::SourceRestarted { .. }
-            | AudioCaptureEvent::BufferPressure { .. } => Ok(()),
+            // Diagnostics-only events – no state mutation.
+            AudioCaptureEvent::Paused { at } => {
+                let _ = at;
+                Ok(())
+            }
+            AudioCaptureEvent::Resumed { at, gap } => {
+                let _ = (at, gap);
+                Ok(())
+            }
+            AudioCaptureEvent::SourceRestarted {
+                source,
+                old_device_id,
+                new_device_id,
+                downtime,
+            } => {
+                let _ = (source, old_device_id, new_device_id, downtime);
+                Ok(())
+            }
+            AudioCaptureEvent::BufferPressure {
+                fill_ratio,
+                buffer_depth,
+            } => {
+                let _ = (fill_ratio, buffer_depth);
+                Ok(())
+            }
         }
     }
 
     fn handle_cursor(&mut self, event: CursorCaptureEvent) -> Result<()> {
         match event {
             CursorCaptureEvent::Sample(sample) => {
-                let ts_ms = self
-                    .last_observed_ts_ms
-                    .unwrap_or(0);
+                let ts_ms = self.last_observed_ts_ms.unwrap_or(0);
                 self.cursor.record_frame(ts_ms, &sample);
                 Ok(())
             }
@@ -416,7 +437,10 @@ mod tests {
         let mut coord = test_coordinator();
 
         // No conditions → Continue
-        assert!(matches!(coord.evaluate_termination(), EventAction::Continue));
+        assert!(matches!(
+            coord.evaluate_termination(),
+            EventAction::Continue
+        ));
 
         // AllStreamsEnded → Stop
         coord.capture_ended = true;
@@ -648,7 +672,10 @@ mod tests {
         let coord = test_coordinator();
         let at = Instant::now() + Duration::from_secs(1);
         let result = coord.finalize(at);
-        assert!(result.is_err(), "finalize should error when no frames were encoded");
+        assert!(
+            result.is_err(),
+            "finalize should error when no frames were encoded"
+        );
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
             err_msg.contains("without any video frames"),
@@ -977,5 +1004,4 @@ mod tests {
                 "should Stop when all three streams have ended");
         }
     }
-
 }

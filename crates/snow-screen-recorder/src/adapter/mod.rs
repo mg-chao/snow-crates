@@ -1,13 +1,7 @@
 pub(crate) mod audio;
+#[cfg(not(feature = "cursor"))]
 pub(crate) mod cursor;
-#[cfg(test)]
-pub(crate) mod testing;
-#[cfg(test)]
-mod testing_tests;
 pub(crate) mod video;
-
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use crate::error::Result;
 use crate::event::{ControlCommand, RecordingEvent};
@@ -18,44 +12,6 @@ pub(crate) const VIDEO_CHANNEL_CAPACITY: usize = 8;
 pub(crate) const AUDIO_CHANNEL_CAPACITY: usize = 4;
 /// Channel capacity for cursor events.
 pub(crate) const CURSOR_CHANNEL_CAPACITY: usize = 4;
-
-/// Overflow behavior when a per-adapter channel is full.
-///
-/// Configured at startup for each data channel. The default policy is
-/// `RetryUntilStop` — no events are silently dropped.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) enum OverflowPolicy {
-    /// Retry sending with backpressure until a stop command is received.
-    /// This is the default — no events are silently dropped.
-    #[default]
-    RetryUntilStop,
-}
-
-/// Per-subsystem diagnostics counters for adapter forwarding threads.
-///
-/// Shared between the forwarding thread (which increments counters) and
-/// the adapter object (which exposes them for observability).
-#[derive(Debug, Default)]
-pub(crate) struct AdapterDiagnostics {
-    /// Number of times `send_timeout` expired and the adapter retried.
-    pub timeout_retries: AtomicU64,
-    /// Number of events successfully forwarded.
-    pub events_forwarded: AtomicU64,
-}
-
-impl AdapterDiagnostics {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub(crate) fn record_timeout_retry(&self) {
-        self.timeout_retries.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_event_forwarded(&self) {
-        self.events_forwarded.fetch_add(1, Ordering::Relaxed);
-    }
-}
 
 /// Commands sent to adapter forwarding threads via a command channel.
 ///
@@ -149,6 +105,28 @@ pub(crate) struct RecordingAdapters {
 }
 
 impl RecordingAdapters {
+    /// Signal all active adapters to pause. Non-blocking.
+    pub(crate) fn pause_all(&self) {
+        let _ = self.video_adapter.pause();
+        if let Some(ref a) = self.audio_adapter {
+            let _ = a.pause();
+        }
+        if let Some(ref a) = self.cursor_adapter {
+            let _ = a.pause();
+        }
+    }
+
+    /// Signal all active adapters to resume. Non-blocking.
+    pub(crate) fn resume_all(&self) {
+        let _ = self.video_adapter.resume();
+        if let Some(ref a) = self.audio_adapter {
+            let _ = a.resume();
+        }
+        if let Some(ref a) = self.cursor_adapter {
+            let _ = a.resume();
+        }
+    }
+
     /// Signal all active adapters to stop. Non-blocking.
     pub(crate) fn stop_all(&self) {
         let _ = self.video_adapter.stop();

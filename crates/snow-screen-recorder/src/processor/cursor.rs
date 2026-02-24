@@ -65,11 +65,13 @@ impl CursorProcessor {
         }
     }
 
+    #[cfg(test)]
     /// Return a reference to the accumulated mouse store.
     pub(crate) fn mouse_store(&self) -> &MouseStore {
         &self.mouse_store
     }
 
+    #[cfg(test)]
     /// Return a reference to the last recorded cursor frame, if any.
     pub(crate) fn last_frame(&self) -> Option<&CursorFrameRecord> {
         self.last_frame.as_ref()
@@ -125,10 +127,7 @@ mod tests {
     /// pairs. `shape_id` is drawn from a small pool so repeats are
     /// likely, exercising the deduplication logic.
     fn arb_cursor_sequence() -> impl Strategy<Value = Vec<(u64, bool)>> {
-        prop::collection::vec(
-            (1u64..=8, prop::bool::ANY),
-            1..=30,
-        )
+        prop::collection::vec((1u64..=8, prop::bool::ANY), 1..=30)
     }
 
     // **Validates: Requirements 4.7, 4.8**

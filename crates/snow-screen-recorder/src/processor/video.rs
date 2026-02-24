@@ -11,6 +11,7 @@ use crate::recording::LiveVideoEncoder;
 /// `preview_encoder` field that is preserved here; it is used for
 /// generating a low-latency preview stream during recording.
 pub(crate) struct VideoProcessor {
+    #[cfg(test)]
     encoder: Option<LiveVideoEncoder>,
     preview_encoder: Option<LiveVideoEncoder>,
     width: u32,
@@ -33,6 +34,7 @@ impl VideoProcessor {
         video_temp_path: PathBuf,
     ) -> Self {
         Self {
+            #[cfg(test)]
             encoder: None,
             preview_encoder: None,
             width: 0,
@@ -47,11 +49,7 @@ impl VideoProcessor {
 
     /// Validate and lock the resolution on the first frame, or return
     /// an error if a subsequent frame has a different resolution.
-    pub(crate) fn handle_resolution_change(
-        &mut self,
-        width: u32,
-        height: u32,
-    ) -> Result<()> {
+    pub(crate) fn handle_resolution_change(&mut self, width: u32, height: u32) -> Result<()> {
         if self.width == 0 || self.height == 0 {
             self.width = width;
             self.height = height;
@@ -75,7 +73,13 @@ impl VideoProcessor {
     /// Lazily creates the preview encoder on the first real frame.
     /// After encoding, the RGBA buffer is stored as `last_encoded_rgba`
     /// so it can be used as a tail frame during finalization.
-    pub(crate) fn encode_frame(&mut self, rgba: Vec<u8>, width: u32, height: u32, ts_ms: u64) -> Result<()> {
+    pub(crate) fn encode_frame(
+        &mut self,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        ts_ms: u64,
+    ) -> Result<()> {
         if self.preview_encoder.is_none() {
             self.preview_encoder = Some(LiveVideoEncoder::create(
                 &self.video_temp_path,
@@ -114,17 +118,17 @@ impl VideoProcessor {
     }
 
     /// Take ownership of the primary encoder for finalization.
+    #[cfg(test)]
     pub(crate) fn take_encoder(&mut self) -> Option<LiveVideoEncoder> {
         self.encoder.take()
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::config::{RecordingVideoFormat, VideoEncodeConfig};
+    use std::path::PathBuf;
 
     fn make_processor() -> VideoProcessor {
         VideoProcessor::new(

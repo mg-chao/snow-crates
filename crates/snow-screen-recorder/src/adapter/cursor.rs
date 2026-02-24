@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use snow_cursor_capture::CursorSampler;
 
-use crate::adapter::{AdapterCommand, AdapterDiagnostics, StreamAdapter};
+use crate::adapter::{AdapterCommand, StreamAdapter};
 use crate::error::{Result, ScreenRecorderError};
 use crate::event::{CursorCaptureEvent, RecordingEvent};
 
@@ -20,7 +20,6 @@ pub(crate) struct CursorStreamAdapter {
     cmd_tx: crossbeam_channel::Sender<AdapterCommand>,
     running: Arc<AtomicBool>,
     forward_thread: Option<std::thread::JoinHandle<Result<()>>>,
-    diagnostics: Arc<AdapterDiagnostics>,
 }
 
 impl CursorStreamAdapter {
@@ -38,13 +37,11 @@ impl CursorStreamAdapter {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AdapterCommand>();
         let running = Arc::new(AtomicBool::new(true));
         let running_flag = running.clone();
-        let diagnostics = AdapterDiagnostics::new();
-        let diag = diagnostics.clone();
 
         let forward_thread = std::thread::Builder::new()
             .name("snow-cursor-adapter".into())
             .spawn(move || {
-                let result = cursor_forward_loop(sampler, cursor_tx, cmd_rx, target_fps, &diag);
+                let result = cursor_forward_loop(sampler, cursor_tx, cmd_rx, target_fps);
                 running_flag.store(false, Ordering::Release);
                 result
             })
@@ -54,39 +51,27 @@ impl CursorStreamAdapter {
             cmd_tx,
             running,
             forward_thread: Some(forward_thread),
-            diagnostics,
         })
-    }
-
-    /// Returns the diagnostics counters for this adapter.
-    pub(crate) fn diagnostics(&self) -> &Arc<AdapterDiagnostics> {
-        &self.diagnostics
     }
 }
 
 impl StreamAdapter for CursorStreamAdapter {
     fn pause(&self) -> Result<()> {
-        self.cmd_tx
-            .send(AdapterCommand::Pause)
-            .map_err(|_| {
-                ScreenRecorderError::Encode("cursor adapter command channel closed".into())
-            })
+        self.cmd_tx.send(AdapterCommand::Pause).map_err(|_| {
+            ScreenRecorderError::Encode("cursor adapter command channel closed".into())
+        })
     }
 
     fn resume(&self) -> Result<()> {
-        self.cmd_tx
-            .send(AdapterCommand::Resume)
-            .map_err(|_| {
-                ScreenRecorderError::Encode("cursor adapter command channel closed".into())
-            })
+        self.cmd_tx.send(AdapterCommand::Resume).map_err(|_| {
+            ScreenRecorderError::Encode("cursor adapter command channel closed".into())
+        })
     }
 
     fn stop(&self) -> Result<()> {
-        self.cmd_tx
-            .send(AdapterCommand::Stop)
-            .map_err(|_| {
-                ScreenRecorderError::Encode("cursor adapter command channel closed".into())
-            })
+        self.cmd_tx.send(AdapterCommand::Stop).map_err(|_| {
+            ScreenRecorderError::Encode("cursor adapter command channel closed".into())
+        })
     }
 
     fn is_running(&self) -> bool {
@@ -97,9 +82,7 @@ impl StreamAdapter for CursorStreamAdapter {
         if let Some(handle) = self.forward_thread.take() {
             handle
                 .join()
-                .map_err(|_| {
-                    ScreenRecorderError::Encode("cursor adapter thread panicked".into())
-                })?
+                .map_err(|_| ScreenRecorderError::Encode("cursor adapter thread panicked".into()))?
         } else {
             Ok(())
         }
@@ -118,7 +101,6 @@ fn cursor_forward_loop(
     cursor_tx: Sender<RecordingEvent>,
     cmd_rx: crossbeam_channel::Receiver<AdapterCommand>,
     target_fps: u32,
-    diagnostics: &AdapterDiagnostics,
 ) -> Result<()> {
     let poll_interval = Duration::from_secs(1) / target_fps;
     let mut paused = false;
@@ -140,20 +122,14 @@ fn cursor_forward_loop(
 
         match sampler.sample() {
             Ok(sample) => {
-                let event =
-                    RecordingEvent::Cursor(CursorCaptureEvent::Sample(sample));
-                if send_with_backpressure(&cursor_tx, event, &cmd_rx, &mut paused, diagnostics)
-                    .is_break()
-                {
+                let event = RecordingEvent::Cursor(CursorCaptureEvent::Sample(sample));
+                if send_with_backpressure(&cursor_tx, event, &cmd_rx, &mut paused).is_break() {
                     break;
                 }
             }
             Err(err) => {
-                let event = RecordingEvent::Cursor(CursorCaptureEvent::Error(
-                    Box::new(err),
-                ));
-                let _ =
-                    send_with_backpressure(&cursor_tx, event, &cmd_rx, &mut paused, diagnostics);
+                let event = RecordingEvent::Cursor(CursorCaptureEvent::Error(Box::new(err)));
+                let _ = send_with_backpressure(&cursor_tx, event, &cmd_rx, &mut paused);
                 break;
             }
         }
@@ -216,23 +192,17 @@ impl SendOutcome {
 /// Uses `send_timeout` (10ms) and polls the command channel between
 /// retries. Returns `Break` if the channel disconnected or a stop
 /// command was received during backpressure.
-/// Increments diagnostics counters on timeout retries and successful sends.
 fn send_with_backpressure(
     tx: &Sender<RecordingEvent>,
     event: RecordingEvent,
     cmd_rx: &crossbeam_channel::Receiver<AdapterCommand>,
     paused: &mut bool,
-    diagnostics: &AdapterDiagnostics,
 ) -> SendOutcome {
     let mut event = event;
     loop {
         match tx.send_timeout(event, SEND_TIMEOUT) {
-            Ok(()) => {
-                diagnostics.record_event_forwarded();
-                return SendOutcome::Sent;
-            }
+            Ok(()) => return SendOutcome::Sent,
             Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
-                diagnostics.record_timeout_retry();
                 event = returned;
                 // Poll command channel during backpressure.
                 match drain_commands(cmd_rx, paused) {

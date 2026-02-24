@@ -1,16 +1,16 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use snow_capture::{CaptureEvent, StreamHandle};
 
-use crate::adapter::{AdapterCommand, AdapterDiagnostics, StreamAdapter};
+use crate::adapter::{AdapterCommand, StreamAdapter};
 use crate::config::RecordingTarget;
 use crate::error::{Result, ScreenRecorderError};
-use crate::event::{RecordingEvent, StreamTimestamp, VideoCaptureEvent};
 #[cfg(feature = "cursor")]
 use crate::event::CursorCaptureEvent;
+use crate::event::{RecordingEvent, StreamTimestamp, VideoCaptureEvent};
 
 /// Default send timeout for backpressure handling (10ms).
 const SEND_TIMEOUT: Duration = Duration::from_millis(10);
@@ -23,7 +23,6 @@ pub(crate) struct VideoStreamAdapter {
     cmd_tx: crossbeam_channel::Sender<AdapterCommand>,
     running: Arc<AtomicBool>,
     forward_thread: Option<std::thread::JoinHandle<Result<()>>>,
-    diagnostics: Arc<AdapterDiagnostics>,
 }
 
 impl VideoStreamAdapter {
@@ -42,14 +41,11 @@ impl VideoStreamAdapter {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AdapterCommand>();
         let running = Arc::new(AtomicBool::new(true));
         let running_flag = running.clone();
-        let diagnostics = AdapterDiagnostics::new();
-        let diag = diagnostics.clone();
 
         let forward_thread = std::thread::Builder::new()
             .name("snow-video-adapter".into())
             .spawn(move || {
-                let result =
-                    video_forward_loop(stream_handle, video_tx, cursor_tx, cmd_rx, &diag);
+                let result = video_forward_loop(stream_handle, video_tx, cursor_tx, cmd_rx);
                 running_flag.store(false, Ordering::Release);
                 result
             })
@@ -59,13 +55,7 @@ impl VideoStreamAdapter {
             cmd_tx,
             running,
             forward_thread: Some(forward_thread),
-            diagnostics,
         })
-    }
-
-    /// Returns the diagnostics counters for this adapter.
-    pub(crate) fn diagnostics(&self) -> &Arc<AdapterDiagnostics> {
-        &self.diagnostics
     }
 }
 
@@ -88,12 +78,10 @@ pub(crate) fn resolve_monitor_selector(
         .find(|m| m.monitor.stable_id() == selector.stable_id)
         .map(|m| m.monitor.clone())
         .ok_or_else(|| {
-            ScreenRecorderError::Capture(
-                snow_capture::error::CaptureError::InvalidConfig(format!(
-                    "monitor with stable_id '{}' not found or disconnected",
-                    selector.stable_id
-                )),
-            )
+            ScreenRecorderError::Capture(snow_capture::error::CaptureError::InvalidConfig(format!(
+                "monitor with stable_id '{}' not found or disconnected",
+                selector.stable_id
+            )))
         })
 }
 
@@ -128,12 +116,8 @@ pub(crate) fn resolve_capture_target(
             Ok(snow_capture::CaptureTarget::Window(window_id))
         }
         RecordingTarget::Region(region) => {
-            let capture_region = snow_capture::CaptureRegion::new(
-                region.x,
-                region.y,
-                region.width,
-                region.height,
-            )?;
+            let capture_region =
+                snow_capture::CaptureRegion::new(region.x, region.y, region.width, region.height)?;
             Ok(snow_capture::CaptureTarget::Region(capture_region))
         }
     }
@@ -186,7 +170,6 @@ fn video_forward_loop(
     video_tx: Sender<RecordingEvent>,
     cursor_tx: Option<Sender<RecordingEvent>>,
     cmd_rx: crossbeam_channel::Receiver<AdapterCommand>,
-    diagnostics: &AdapterDiagnostics,
 ) -> Result<()> {
     // When cursor feature is disabled, cursor_tx is unused since cursor
     // data is not embedded in frames.
@@ -213,9 +196,8 @@ fn video_forward_loop(
                 #[cfg(feature = "cursor")]
                 if let Some(ref ctx) = cursor_tx {
                     if let Some(cursor_data) = &frame.metadata.cursor {
-                        let cursor_event = RecordingEvent::Cursor(
-                            CursorCaptureEvent::Sample(cursor_data.clone()),
-                        );
+                        let cursor_event =
+                            RecordingEvent::Cursor(CursorCaptureEvent::Sample(cursor_data.clone()));
                         // Best-effort send for cursor — don't block video pipeline.
                         let _ = ctx.send_timeout(cursor_event, SEND_TIMEOUT);
                     }
@@ -237,14 +219,8 @@ fn video_forward_loop(
                     is_duplicate: frame.metadata.is_duplicate,
                 });
 
-                if send_with_backpressure(
-                    &video_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &stream_handle,
-                    diagnostics,
-                )
-                .is_break()
+                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
+                    .is_break()
                 {
                     break;
                 }
@@ -256,21 +232,14 @@ fn video_forward_loop(
                 new_width,
                 new_height,
             } => {
-                let recording_event =
-                    RecordingEvent::Video(VideoCaptureEvent::ResolutionChanged {
-                        old_width,
-                        old_height,
-                        new_width,
-                        new_height,
-                    });
-                if send_with_backpressure(
-                    &video_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &stream_handle,
-                    diagnostics,
-                )
-                .is_break()
+                let recording_event = RecordingEvent::Video(VideoCaptureEvent::ResolutionChanged {
+                    old_width,
+                    old_height,
+                    new_width,
+                    new_height,
+                });
+                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
+                    .is_break()
                 {
                     break;
                 }
@@ -279,74 +248,57 @@ fn video_forward_loop(
             CaptureEvent::FrameDropped { sequence } => {
                 let recording_event =
                     RecordingEvent::Video(VideoCaptureEvent::FrameDropped { sequence });
-                if send_with_backpressure(
-                    &video_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &stream_handle,
-                    diagnostics,
-                )
-                .is_break()
+                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
+                    .is_break()
                 {
                     break;
                 }
             }
 
             CaptureEvent::Paused { at } => {
-                let recording_event =
-                    RecordingEvent::Video(VideoCaptureEvent::Paused { at });
-                if send_with_backpressure(
-                    &video_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &stream_handle,
-                    diagnostics,
-                )
-                .is_break()
+                let recording_event = RecordingEvent::Video(VideoCaptureEvent::Paused { at });
+                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
+                    .is_break()
                 {
                     break;
                 }
             }
 
             CaptureEvent::Resumed { at, gap } => {
-                let recording_event =
-                    RecordingEvent::Video(VideoCaptureEvent::Resumed { at, gap });
-                if send_with_backpressure(
-                    &video_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &stream_handle,
-                    diagnostics,
-                )
-                .is_break()
+                let recording_event = RecordingEvent::Video(VideoCaptureEvent::Resumed { at, gap });
+                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
+                    .is_break()
                 {
                     break;
                 }
             }
 
             CaptureEvent::StreamEnded => {
-                let recording_event =
-                    RecordingEvent::Video(VideoCaptureEvent::StreamEnded);
-                let _ = send_with_backpressure(
-                    &video_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &stream_handle,
-                    diagnostics,
-                );
+                #[cfg(feature = "cursor")]
+                if let Some(ref ctx) = cursor_tx {
+                    let _ = ctx.send_timeout(
+                        RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded),
+                        SEND_TIMEOUT,
+                    );
+                }
+                let recording_event = RecordingEvent::Video(VideoCaptureEvent::StreamEnded);
+                let _ = send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle);
                 break;
             }
 
             CaptureEvent::Error(err) => {
+                #[cfg(feature = "cursor")]
+                if let Some(ref ctx) = cursor_tx {
+                    let _ = ctx.send_timeout(
+                        RecordingEvent::Cursor(CursorCaptureEvent::Error(Box::new(
+                            std::io::Error::other("video stream failed"),
+                        ))),
+                        SEND_TIMEOUT,
+                    );
+                }
                 let recording_event =
                     RecordingEvent::Video(VideoCaptureEvent::Error(Box::new(err)));
-                let _ = send_with_backpressure(
-                    &video_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &stream_handle,
-                    diagnostics,
-                );
+                let _ = send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle);
                 break;
             }
         }
@@ -398,23 +350,17 @@ impl SendOutcome {
 /// Uses `send_timeout` (10ms) and polls the command channel between
 /// retries. Returns `Break` if the channel disconnected or a stop
 /// command was received during backpressure.
-/// Increments diagnostics counters on timeout retries and successful sends.
 fn send_with_backpressure(
     tx: &Sender<RecordingEvent>,
     event: RecordingEvent,
     cmd_rx: &crossbeam_channel::Receiver<AdapterCommand>,
     stream_handle: &StreamHandle,
-    diagnostics: &AdapterDiagnostics,
 ) -> SendOutcome {
     let mut event = event;
     loop {
         match tx.send_timeout(event, SEND_TIMEOUT) {
-            Ok(()) => {
-                diagnostics.record_event_forwarded();
-                return SendOutcome::Sent;
-            }
+            Ok(()) => return SendOutcome::Sent,
             Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
-                diagnostics.record_timeout_retry();
                 event = returned;
                 // Poll command channel during backpressure.
                 match drain_commands(cmd_rx, stream_handle) {
@@ -449,9 +395,13 @@ mod tests {
 
     /// Strategy for video frame fields (small RGBA to keep memory bounded).
     fn arb_video_frame_fields()
-        -> impl Strategy<Value = (u32, u32, Vec<u8>, bool, Instant, Option<i64>)>
-    {
-        (1u32..64, 1u32..64, proptest::bool::ANY, arb_stream_timestamp())
+    -> impl Strategy<Value = (u32, u32, Vec<u8>, bool, Instant, Option<i64>)> {
+        (
+            1u32..64,
+            1u32..64,
+            proptest::bool::ANY,
+            arb_stream_timestamp(),
+        )
             .prop_flat_map(|(w, h, is_dup, (instant, qpc))| {
                 let len = (w * h * 4) as usize;
                 (

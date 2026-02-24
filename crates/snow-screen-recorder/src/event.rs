@@ -112,13 +112,3 @@ impl EventAction {
         matches!(self, EventAction::Stop)
     }
 }
-
-
-/// Coordinator stop reason evaluated in precedence order.
-/// Higher variants take priority over lower ones.
-pub(crate) enum TerminationCondition {
-    FatalVideoError,
-    ControlStop,
-    AllStreamsEnded,
-    AllChannelsDisconnected,
-}

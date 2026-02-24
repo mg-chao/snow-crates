@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use snow_audio_recorder::AudioStreamHandle;
 
-use crate::adapter::{AdapterCommand, AdapterDiagnostics, StreamAdapter};
+use crate::adapter::{AdapterCommand, StreamAdapter};
 use crate::error::{Result, ScreenRecorderError};
 use crate::event::{AudioCaptureEvent, RecordingEvent, StreamTimestamp};
 
@@ -20,7 +20,6 @@ pub(crate) struct AudioStreamAdapter {
     cmd_tx: crossbeam_channel::Sender<AdapterCommand>,
     running: Arc<AtomicBool>,
     forward_thread: Option<std::thread::JoinHandle<Result<()>>>,
-    diagnostics: Arc<AdapterDiagnostics>,
 }
 
 impl AudioStreamAdapter {
@@ -36,13 +35,11 @@ impl AudioStreamAdapter {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AdapterCommand>();
         let running = Arc::new(AtomicBool::new(true));
         let running_flag = running.clone();
-        let diagnostics = AdapterDiagnostics::new();
-        let diag = diagnostics.clone();
 
         let forward_thread = std::thread::Builder::new()
             .name("snow-audio-adapter".into())
             .spawn(move || {
-                let result = audio_forward_loop(audio_handle, audio_tx, cmd_rx, &diag);
+                let result = audio_forward_loop(audio_handle, audio_tx, cmd_rx);
                 running_flag.store(false, Ordering::Release);
                 result
             })
@@ -52,13 +49,7 @@ impl AudioStreamAdapter {
             cmd_tx,
             running,
             forward_thread: Some(forward_thread),
-            diagnostics,
         })
-    }
-
-    /// Returns the diagnostics counters for this adapter.
-    pub(crate) fn diagnostics(&self) -> &Arc<AdapterDiagnostics> {
-        &self.diagnostics
     }
 }
 
@@ -107,7 +98,6 @@ fn audio_forward_loop(
     audio_handle: AudioStreamHandle,
     audio_tx: Sender<RecordingEvent>,
     cmd_rx: crossbeam_channel::Receiver<AdapterCommand>,
-    diagnostics: &AdapterDiagnostics,
 ) -> Result<()> {
     use snow_audio_recorder::{AudioEvent, RecvTimeoutError};
 
@@ -143,14 +133,8 @@ fn audio_forward_loop(
                     timestamp: ts,
                 });
 
-                if send_with_backpressure(
-                    &audio_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &audio_handle,
-                    diagnostics,
-                )
-                .is_break()
+                if send_with_backpressure(&audio_tx, recording_event, &cmd_rx, &audio_handle)
+                    .is_break()
                 {
                     break;
                 }
@@ -160,19 +144,12 @@ fn audio_forward_loop(
                 source,
                 dropped_frames,
             } => {
-                let recording_event =
-                    RecordingEvent::Audio(AudioCaptureEvent::PacketDropped {
-                        source,
-                        dropped_frames,
-                    });
-                if send_with_backpressure(
-                    &audio_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &audio_handle,
-                    diagnostics,
-                )
-                .is_break()
+                let recording_event = RecordingEvent::Audio(AudioCaptureEvent::PacketDropped {
+                    source,
+                    dropped_frames,
+                });
+                if send_with_backpressure(&audio_tx, recording_event, &cmd_rx, &audio_handle)
+                    .is_break()
                 {
                     break;
                 }
@@ -184,53 +161,32 @@ fn audio_forward_loop(
                 new_device_id,
                 downtime,
             } => {
-                let recording_event =
-                    RecordingEvent::Audio(AudioCaptureEvent::SourceRestarted {
-                        source,
-                        old_device_id,
-                        new_device_id,
-                        downtime,
-                    });
-                if send_with_backpressure(
-                    &audio_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &audio_handle,
-                    diagnostics,
-                )
-                .is_break()
+                let recording_event = RecordingEvent::Audio(AudioCaptureEvent::SourceRestarted {
+                    source,
+                    old_device_id,
+                    new_device_id,
+                    downtime,
+                });
+                if send_with_backpressure(&audio_tx, recording_event, &cmd_rx, &audio_handle)
+                    .is_break()
                 {
                     break;
                 }
             }
 
             AudioEvent::Paused { at } => {
-                let recording_event =
-                    RecordingEvent::Audio(AudioCaptureEvent::Paused { at });
-                if send_with_backpressure(
-                    &audio_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &audio_handle,
-                    diagnostics,
-                )
-                .is_break()
+                let recording_event = RecordingEvent::Audio(AudioCaptureEvent::Paused { at });
+                if send_with_backpressure(&audio_tx, recording_event, &cmd_rx, &audio_handle)
+                    .is_break()
                 {
                     break;
                 }
             }
 
             AudioEvent::Resumed { at, gap } => {
-                let recording_event =
-                    RecordingEvent::Audio(AudioCaptureEvent::Resumed { at, gap });
-                if send_with_backpressure(
-                    &audio_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &audio_handle,
-                    diagnostics,
-                )
-                .is_break()
+                let recording_event = RecordingEvent::Audio(AudioCaptureEvent::Resumed { at, gap });
+                if send_with_backpressure(&audio_tx, recording_event, &cmd_rx, &audio_handle)
+                    .is_break()
                 {
                     break;
                 }
@@ -240,47 +196,27 @@ fn audio_forward_loop(
                 fill_ratio,
                 buffer_depth,
             } => {
-                let recording_event =
-                    RecordingEvent::Audio(AudioCaptureEvent::BufferPressure {
-                        fill_ratio,
-                        buffer_depth,
-                    });
-                if send_with_backpressure(
-                    &audio_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &audio_handle,
-                    diagnostics,
-                )
-                .is_break()
+                let recording_event = RecordingEvent::Audio(AudioCaptureEvent::BufferPressure {
+                    fill_ratio,
+                    buffer_depth,
+                });
+                if send_with_backpressure(&audio_tx, recording_event, &cmd_rx, &audio_handle)
+                    .is_break()
                 {
                     break;
                 }
             }
 
             AudioEvent::StreamEnded => {
-                let recording_event =
-                    RecordingEvent::Audio(AudioCaptureEvent::StreamEnded);
-                let _ = send_with_backpressure(
-                    &audio_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &audio_handle,
-                    diagnostics,
-                );
+                let recording_event = RecordingEvent::Audio(AudioCaptureEvent::StreamEnded);
+                let _ = send_with_backpressure(&audio_tx, recording_event, &cmd_rx, &audio_handle);
                 break;
             }
 
             AudioEvent::Error(err) => {
                 let recording_event =
                     RecordingEvent::Audio(AudioCaptureEvent::Error(Box::new(err)));
-                let _ = send_with_backpressure(
-                    &audio_tx,
-                    recording_event,
-                    &cmd_rx,
-                    &audio_handle,
-                    diagnostics,
-                );
+                let _ = send_with_backpressure(&audio_tx, recording_event, &cmd_rx, &audio_handle);
                 break;
             }
         }
@@ -335,23 +271,17 @@ impl SendOutcome {
 /// Uses `send_timeout` (10ms) and polls the command channel between
 /// retries. Returns `Break` if the channel disconnected or a stop
 /// command was received during backpressure.
-/// Increments diagnostics counters on timeout retries and successful sends.
 fn send_with_backpressure(
     tx: &Sender<RecordingEvent>,
     event: RecordingEvent,
     cmd_rx: &crossbeam_channel::Receiver<AdapterCommand>,
     audio_handle: &AudioStreamHandle,
-    diagnostics: &AdapterDiagnostics,
 ) -> SendOutcome {
     let mut event = event;
     loop {
         match tx.send_timeout(event, SEND_TIMEOUT) {
-            Ok(()) => {
-                diagnostics.record_event_forwarded();
-                return SendOutcome::Sent;
-            }
+            Ok(()) => return SendOutcome::Sent,
             Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
-                diagnostics.record_timeout_retry();
                 event = returned;
                 // Poll command channel during backpressure.
                 match drain_commands(cmd_rx, audio_handle) {

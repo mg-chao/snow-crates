@@ -12,7 +12,8 @@ const REGION_Y: i32 = 0;
 const REGION_WIDTH: u32 = 2000;
 const REGION_HEIGHT: u32 = 2000;
 const TARGET_FPS: u32 = 60;
-const RECORD_SECONDS: u64 = 5;
+const RECORD_SECONDS: u64 = 3;
+const PAUSE_SECONDS: u64 = 3;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = std::env::current_dir()?.join("recordings");
@@ -28,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             speed: VideoEncodingSpeed::UltraFast,
         },
         audio: RecordingAudioConfig {
-            microphone_enabled: true,
+            microphone_enabled: false,
             system_audio_enabled: true,
             ..RecordingAudioConfig::default()
         },
@@ -40,14 +41,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     recording.start()?;
 
     println!(
-        "Recording region ({}, {})-({}, {}) at {} FPS for {} seconds...",
+        "Recording region ({}, {})-({}, {}) at {} FPS: record {}s -> pause {}s -> record {}s...",
         REGION_X,
         REGION_Y,
         REGION_X + REGION_WIDTH as i32,
         REGION_Y + REGION_HEIGHT as i32,
         TARGET_FPS,
+        RECORD_SECONDS,
+        PAUSE_SECONDS,
         RECORD_SECONDS
     );
+    thread::sleep(Duration::from_secs(RECORD_SECONDS));
+    println!("Pausing recording for {} seconds...", PAUSE_SECONDS);
+    recording.pause()?;
+    thread::sleep(Duration::from_secs(PAUSE_SECONDS));
+    println!("Resuming recording for {} seconds...", RECORD_SECONDS);
+    recording.resume()?;
     thread::sleep(Duration::from_secs(RECORD_SECONDS));
 
     let stop_duration_start = std::time::Instant::now();

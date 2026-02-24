@@ -94,6 +94,11 @@ pub(crate) fn run_event_loop(
                 if idx == control_idx {
                     match oper.recv(&adapters.control_rx) {
                         Ok(cmd) => {
+                            match &cmd {
+                                crate::event::ControlCommand::Pause => adapters.pause_all(),
+                                crate::event::ControlCommand::Resume => adapters.resume_all(),
+                                crate::event::ControlCommand::Stop => {}
+                            }
                             if coordinator.handle_control(cmd)?.is_stop() {
                                 return Ok(coordinator);
                             }
@@ -199,7 +204,9 @@ fn drain_all_channels(
     // Audio-first: drain all available audio events first.
     loop {
         match adapters.audio_rx.try_recv() {
-            Ok(event) => { let _ = coordinator.handle_event(event)?; }
+            Ok(event) => {
+                let _ = coordinator.handle_event(event)?;
+            }
             Err(_) => break,
         }
     }
@@ -207,7 +214,9 @@ fn drain_all_channels(
     // Then drain video events.
     loop {
         match adapters.video_rx.try_recv() {
-            Ok(event) => { let _ = coordinator.handle_event(event)?; }
+            Ok(event) => {
+                let _ = coordinator.handle_event(event)?;
+            }
             Err(_) => break,
         }
     }
@@ -215,7 +224,9 @@ fn drain_all_channels(
     // Then drain cursor events.
     loop {
         match adapters.cursor_rx.try_recv() {
-            Ok(event) => { let _ = coordinator.handle_event(event)?; }
+            Ok(event) => {
+                let _ = coordinator.handle_event(event)?;
+            }
             Err(_) => break,
         }
     }
@@ -223,14 +234,15 @@ fn drain_all_channels(
     // Also drain control channel (though it's less critical during shutdown).
     loop {
         match adapters.control_rx.try_recv() {
-            Ok(cmd) => { let _ = coordinator.handle_control(cmd)?; }
+            Ok(cmd) => {
+                let _ = coordinator.handle_control(cmd)?;
+            }
             Err(_) => break,
         }
     }
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -315,7 +327,10 @@ mod tests {
         let adapters = test_adapters(video_rx, audio_rx, cursor_rx, control_rx);
 
         let result = run_event_loop(coordinator, &adapters);
-        assert!(result.is_ok(), "event loop should exit cleanly when all channels disconnect");
+        assert!(
+            result.is_ok(),
+            "event loop should exit cleanly when all channels disconnect"
+        );
     }
 
     #[test]
@@ -384,9 +399,9 @@ mod tests {
 
     #[test]
     fn audio_error_is_non_fatal_loop_continues() {
-        let (video_tx, video_rx) = crossbeam_channel::bounded(4);
+        let (_video_tx, video_rx) = crossbeam_channel::bounded(4);
         let (audio_tx, audio_rx) = crossbeam_channel::bounded(4);
-        let (cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
+        let (_cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
         // Audio error is non-fatal — loop should continue.
@@ -476,8 +491,8 @@ mod tests {
 
     // ── Graceful shutdown tests ─────────────────────────────────
 
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A controllable adapter for testing shutdown behavior.
     /// `is_running()` returns the value of the shared `running` flag.
@@ -486,8 +501,12 @@ mod tests {
     }
 
     impl crate::adapter::StreamAdapter for ControllableAdapter {
-        fn pause(&self) -> Result<()> { Ok(()) }
-        fn resume(&self) -> Result<()> { Ok(()) }
+        fn pause(&self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&self) -> Result<()> {
+            Ok(())
+        }
         fn stop(&self) -> Result<()> {
             self.running.store(false, Ordering::SeqCst);
             Ok(())
@@ -495,7 +514,9 @@ mod tests {
         fn is_running(&self) -> bool {
             self.running.load(Ordering::SeqCst)
         }
-        fn join(&mut self) -> Result<()> { Ok(()) }
+        fn join(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -531,9 +552,18 @@ mod tests {
         assert!(result.is_ok(), "graceful_shutdown should succeed");
 
         // All stream-ended events should have been drained and processed.
-        assert!(coordinator.capture_ended(), "video StreamEnded should be processed");
-        assert!(coordinator.audio_ended(), "audio StreamEnded should be processed");
-        assert!(coordinator.cursor_ended(), "cursor StreamEnded should be processed");
+        assert!(
+            coordinator.capture_ended(),
+            "video StreamEnded should be processed"
+        );
+        assert!(
+            coordinator.audio_ended(),
+            "audio StreamEnded should be processed"
+        );
+        assert!(
+            coordinator.cursor_ended(),
+            "cursor StreamEnded should be processed"
+        );
     }
 
     #[test]
@@ -563,7 +593,10 @@ mod tests {
         assert!(result.is_ok());
 
         // Audio should be processed (drained first due to audio-first priority).
-        assert!(coordinator.audio_ended(), "audio events should be drained first");
+        assert!(
+            coordinator.audio_ended(),
+            "audio events should be drained first"
+        );
     }
 
     #[test]
@@ -591,7 +624,9 @@ mod tests {
             audio_rx,
             cursor_rx,
             control_rx,
-            video_adapter: Box::new(ControllableAdapter { running: running.clone() }),
+            video_adapter: Box::new(ControllableAdapter {
+                running: running.clone(),
+            }),
             audio_adapter: None,
             cursor_adapter: None,
         };
@@ -603,7 +638,10 @@ mod tests {
         assert!(!running.load(Ordering::SeqCst), "adapter should be stopped");
         // Events should have been drained during the while-loop.
         assert!(coordinator.audio_ended(), "audio events should be drained");
-        assert!(coordinator.capture_ended(), "video events should be drained");
+        assert!(
+            coordinator.capture_ended(),
+            "video events should be drained"
+        );
     }
 
     // ── Property-based tests ────────────────────────────────────
