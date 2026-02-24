@@ -21,7 +21,6 @@ use uuid::Uuid;
 use crate::artifact::{RecordingArtifact, SessionManifest};
 use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat, VideoEncodeConfig};
 use crate::error::{Result, ScreenRecorderError};
-use crate::model::{StoredFrame, write_frames};
 use crate::mouse::{
     CursorSampleRecord, CursorShapeCompositionMode, CursorShapeModeRecord, CursorShapeRecord,
     MouseRecord, write_mouse_records,
@@ -259,8 +258,8 @@ impl RecordingSession {
             session_id: self.session_id.clone(),
             output_dir: self.layout.output_dir.clone(),
             temp_dir: self.layout.session_dir.clone(),
+            keep_temp_files: self.config.keep_temp_files,
             video_temp_path: self.layout.video_temp_path.clone(),
-            frame_cache_path: self.layout.frame_cache_path.clone(),
             audio_system_path: self
                 .config
                 .audio
@@ -847,8 +846,7 @@ struct WorkerContext {
     capture_origin_y: i32,
     width: u32,
     height: u32,
-    frames: Vec<StoredFrame>,
-    pending_frame: Option<StoredFrame>,
+    last_encoded_rgba: Option<Vec<u8>>,
     last_observed_ts_ms: Option<u64>,
     mouse_records: Vec<MouseRecord>,
     cursor_shape_ids: HashMap<u64, u32>,
@@ -908,8 +906,7 @@ impl WorkerContext {
             capture_origin_y,
             width: 0,
             height: 0,
-            frames: Vec::new(),
-            pending_frame: None,
+            last_encoded_rgba: None,
             last_observed_ts_ms: None,
             mouse_records: Vec::new(),
             cursor_shape_ids: HashMap::new(),
@@ -937,13 +934,6 @@ impl WorkerContext {
 
     fn observe_video_time(&mut self, ts_ms: u64) {
         self.last_observed_ts_ms = Some(ts_ms);
-        if let Some(frame) = self.pending_frame.as_mut() {
-            frame.duration_ms = duration_between_timestamps_ms(
-                frame.timestamp_ms,
-                ts_ms,
-                self.frame_interval_ms.max(1),
-            );
-        }
     }
 
     fn remember_cursor_shape(&mut self, cursor: &snow_capture::CursorData) -> Option<u32> {
@@ -1056,18 +1046,7 @@ impl WorkerContext {
         if let Some(encoder) = self.preview_encoder.as_mut() {
             encoder.encode_frame(&rgba, ts_ms)?;
         }
-
-        if let Some(done) = self.pending_frame.take() {
-            self.frames.push(done);
-        }
-
-        self.pending_frame = Some(StoredFrame {
-            timestamp_ms: ts_ms,
-            duration_ms: self.frame_interval_ms,
-            width,
-            height,
-            rgba,
-        });
+        self.last_encoded_rgba = Some(rgba);
         Ok(())
     }
 
@@ -1138,24 +1117,16 @@ impl WorkerContext {
         self.observe_video_time(final_ts_ms);
 
         if let Some(encoder) = self.preview_encoder.take() {
-            let tail_rgba = self
-                .pending_frame
-                .as_ref()
-                .map(|frame| frame.rgba.as_slice());
+            let tail_rgba = self.last_encoded_rgba.as_deref();
             encoder.finalize(final_ts_ms, tail_rgba)?;
         }
 
-        if let Some(done) = self.pending_frame.take() {
-            self.frames.push(done);
-        }
-
-        if self.frames.is_empty() {
+        if self.last_encoded_rgba.is_none() {
             return Err(ScreenRecorderError::Encode(
                 "recording ended without any video frames".to_string(),
             ));
         }
 
-        write_frames(&self.layout.frame_cache_path, &self.frames)?;
         write_mouse_records(&self.layout.mouse_path, &self.mouse_records)?;
 
         if let Some(writer) = self.system_audio.take() {
@@ -1276,6 +1247,7 @@ fn recording_worker(
     ctx.finalize(finalize_at)
 }
 
+#[cfg(test)]
 fn duration_between_timestamps_ms(start_ts: u64, end_ts: u64, fallback_ms: u32) -> u32 {
     let delta = end_ts.saturating_sub(start_ts);
     if delta == 0 {

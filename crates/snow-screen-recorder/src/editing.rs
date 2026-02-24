@@ -11,7 +11,7 @@ use crate::artifact::{RecordingArtifact, SessionManifest};
 use crate::config::{EditConfig, ExportFormat, MouseEditConfig, VideoEncodeConfig};
 use crate::error::{Result, ScreenRecorderError};
 use crate::export::ExportResult;
-use crate::model::{StoredFrame, read_frames};
+use crate::model::StoredFrame;
 use crate::mouse::{
     ClickEventRecord, CursorSampleRecord, CursorShapeCompositionMode, CursorShapeModeRecord,
     CursorShapeRecord, MouseRecord, read_mouse_records,
@@ -68,8 +68,9 @@ impl EditingSession {
             .map_err(ScreenRecorderError::InvalidConfig)?;
 
         let temp_dir = self.artifact.temp_dir.clone();
+        let keep_temp_files = self.manifest.keep_temp_files;
         let result = self.export_inner();
-        if result.is_ok() {
+        if result.is_ok() && !keep_temp_files {
             fs::remove_dir_all(&temp_dir).map_err(|err| {
                 ScreenRecorderError::Export(format!(
                     "export succeeded but failed to cleanup temp directory {}: {err}",
@@ -87,7 +88,7 @@ impl EditingSession {
             fs::create_dir_all(parent)?;
         }
 
-        let source_frames = read_frames(&self.manifest.frame_cache_path)?;
+        let source_frames = decode_video_frames(&self.manifest.video_temp_path, self.manifest.fps)?;
         if source_frames.is_empty() {
             return Err(ScreenRecorderError::Export(
                 "no frames available for export".to_string(),
@@ -193,6 +194,260 @@ fn output_dimensions(src_w: u32, src_h: u32, force_even: bool) -> (u32, u32) {
     }
 
     (w, h)
+}
+
+fn decode_video_frames(path: &Path, fallback_fps: u32) -> Result<Vec<StoredFrame>> {
+    ensure_ffmpeg_initialized()?;
+
+    let mut input = ffmpeg::format::input(path).map_err(|err| {
+        ScreenRecorderError::Export(format!(
+            "failed to open temporary recording video {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    let video_stream = input
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or_else(|| {
+            ScreenRecorderError::Export(format!(
+                "temporary recording video {} has no video stream",
+                path.display()
+            ))
+        })?;
+    let stream_index = video_stream.index();
+    let stream_time_base = video_stream.time_base();
+
+    let context = ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())
+        .map_err(|err| {
+            ScreenRecorderError::Export(format!(
+                "failed to create decoder context for {}: {err}",
+                path.display()
+            ))
+        })?;
+    let mut decoder = context.decoder().video().map_err(|err| {
+        ScreenRecorderError::Export(format!(
+            "failed to open temporary recording video decoder for {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    let nominal_duration_ms = ((1000.0 / fallback_fps.max(1) as f64).round() as u32).max(1);
+    let mut scaler = None::<ffmpeg::software::scaling::Context>;
+    let mut rgba_frame = None::<ffmpeg::frame::Video>;
+    let mut last_timestamp_ms = None::<u64>;
+    let mut frames = Vec::<StoredFrame>::new();
+
+    let mut decoded = ffmpeg::frame::Video::empty();
+    for (stream, packet) in input.packets() {
+        if stream.index() != stream_index {
+            continue;
+        }
+
+        decoder.send_packet(&packet).map_err(|err| {
+            ScreenRecorderError::Export(format!(
+                "failed to feed packet into temporary recording video decoder: {err}"
+            ))
+        })?;
+
+        loop {
+            match decoder.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    push_decoded_video_frame(
+                        &decoded,
+                        stream_time_base,
+                        nominal_duration_ms,
+                        &mut scaler,
+                        &mut rgba_frame,
+                        &mut last_timestamp_ms,
+                        &mut frames,
+                    )?;
+                }
+                Err(err) if is_eagain(&err) => break,
+                Err(err) if err == ffmpeg::Error::Eof => break,
+                Err(err) => {
+                    return Err(ScreenRecorderError::Export(format!(
+                        "failed to decode temporary recording video frame: {err}"
+                    )));
+                }
+            }
+        }
+    }
+
+    decoder.send_eof().map_err(|err| {
+        ScreenRecorderError::Export(format!(
+            "failed to flush temporary recording video decoder: {err}"
+        ))
+    })?;
+    loop {
+        match decoder.receive_frame(&mut decoded) {
+            Ok(()) => {
+                push_decoded_video_frame(
+                    &decoded,
+                    stream_time_base,
+                    nominal_duration_ms,
+                    &mut scaler,
+                    &mut rgba_frame,
+                    &mut last_timestamp_ms,
+                    &mut frames,
+                )?;
+            }
+            Err(err) if is_eagain(&err) => continue,
+            Err(err) if err == ffmpeg::Error::Eof => break,
+            Err(err) => {
+                return Err(ScreenRecorderError::Export(format!(
+                    "failed to drain temporary recording video decoder: {err}"
+                )));
+            }
+        }
+    }
+
+    if frames.is_empty() {
+        return Err(ScreenRecorderError::Export(format!(
+            "temporary recording video {} contains no decodable frames",
+            path.display()
+        )));
+    }
+
+    stamp_frame_durations(&mut frames, nominal_duration_ms);
+    Ok(frames)
+}
+
+fn push_decoded_video_frame(
+    decoded: &ffmpeg::frame::Video,
+    stream_time_base: ffmpeg::Rational,
+    nominal_duration_ms: u32,
+    scaler: &mut Option<ffmpeg::software::scaling::Context>,
+    rgba_frame: &mut Option<ffmpeg::frame::Video>,
+    last_timestamp_ms: &mut Option<u64>,
+    frames: &mut Vec<StoredFrame>,
+) -> Result<()> {
+    let width = decoded.width();
+    let height = decoded.height();
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+
+    let needs_reset = scaler.is_none()
+        || rgba_frame
+            .as_ref()
+            .map(|frame| frame.width() != width || frame.height() != height)
+            .unwrap_or(false);
+    if needs_reset {
+        *scaler = Some(
+            ffmpeg::software::scaling::Context::get(
+                decoded.format(),
+                width,
+                height,
+                ffmpeg::format::Pixel::RGBA,
+                width,
+                height,
+                ffmpeg::software::scaling::flag::Flags::BILINEAR,
+            )
+            .map_err(|err| {
+                ScreenRecorderError::Export(format!(
+                    "failed to create temporary video decode scaler: {err}"
+                ))
+            })?,
+        );
+        *rgba_frame = Some(ffmpeg::frame::Video::new(
+            ffmpeg::format::Pixel::RGBA,
+            width,
+            height,
+        ));
+    }
+
+    let scaler_ref = scaler
+        .as_mut()
+        .ok_or_else(|| ScreenRecorderError::Export("video scaler is uninitialized".to_string()))?;
+    let rgba_ref = rgba_frame.as_mut().ok_or_else(|| {
+        ScreenRecorderError::Export("video frame buffer is uninitialized".to_string())
+    })?;
+    scaler_ref.run(decoded, rgba_ref).map_err(|err| {
+        ScreenRecorderError::Export(format!(
+            "failed to convert decoded temporary video frame into RGBA: {err}"
+        ))
+    })?;
+
+    let mut timestamp_ms = decoded
+        .timestamp()
+        .or_else(|| decoded.pts())
+        .map(|pts| pts_to_millis(pts, stream_time_base))
+        .unwrap_or_else(|| {
+            last_timestamp_ms
+                .unwrap_or(0)
+                .saturating_add(u64::from(nominal_duration_ms))
+        });
+    if let Some(previous) = *last_timestamp_ms
+        && timestamp_ms <= previous
+    {
+        timestamp_ms = previous.saturating_add(1);
+    }
+    *last_timestamp_ms = Some(timestamp_ms);
+
+    frames.push(StoredFrame {
+        timestamp_ms,
+        duration_ms: nominal_duration_ms.max(1),
+        width,
+        height,
+        rgba: extract_rgba_from_frame(rgba_ref, width, height)?,
+    });
+
+    Ok(())
+}
+
+fn extract_rgba_from_frame(
+    frame: &ffmpeg::frame::Video,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    let stride = frame.stride(0);
+    let row_bytes = width as usize * 4;
+    let height_usize = height as usize;
+    let src = frame.data(0);
+
+    let mut rgba = vec![0u8; row_bytes * height_usize];
+    for y in 0..height_usize {
+        let src_start = y * stride;
+        let src_end = src_start + row_bytes;
+        if src_end > src.len() {
+            return Err(ScreenRecorderError::Export(
+                "decoded RGBA frame stride exceeds available data".to_string(),
+            ));
+        }
+        let dst_start = y * row_bytes;
+        let dst_end = dst_start + row_bytes;
+        rgba[dst_start..dst_end].copy_from_slice(&src[src_start..src_end]);
+    }
+
+    Ok(rgba)
+}
+
+fn pts_to_millis(pts: i64, time_base: ffmpeg::Rational) -> u64 {
+    let numerator = i128::from(time_base.numerator().max(1));
+    let denominator = i128::from(time_base.denominator().max(1));
+    let millis = i128::from(pts)
+        .saturating_mul(numerator)
+        .saturating_mul(1_000)
+        / denominator;
+    millis.clamp(0, i128::from(u64::MAX)) as u64
+}
+
+fn stamp_frame_durations(frames: &mut [StoredFrame], nominal_duration_ms: u32) {
+    if frames.is_empty() {
+        return;
+    }
+
+    for idx in 0..frames.len().saturating_sub(1) {
+        let delta = frames[idx + 1]
+            .timestamp_ms
+            .saturating_sub(frames[idx].timestamp_ms);
+        frames[idx].duration_ms = delta.max(1).min(u64::from(u32::MAX)) as u32;
+    }
+
+    if let Some(last) = frames.last_mut() {
+        last.duration_ms = nominal_duration_ms.max(1);
+    }
 }
 
 fn retime_frames(
@@ -1414,7 +1669,7 @@ fn encode_audio_samples(
 }
 
 fn validate_manifest_paths(manifest: &SessionManifest) -> Result<()> {
-    validate_file_exists(&manifest.frame_cache_path)?;
+    validate_file_exists(&manifest.video_temp_path)?;
     validate_file_exists(&manifest.mouse_path)?;
 
     if manifest.recorded_system_audio {
@@ -1472,8 +1727,8 @@ mod tests {
                 session_id: "session".to_string(),
                 output_dir: PathBuf::from("recordings"),
                 temp_dir: PathBuf::from("recordings/tmp"),
+                keep_temp_files: false,
                 video_temp_path: PathBuf::from("recordings/tmp/video.h264"),
-                frame_cache_path: PathBuf::from("recordings/tmp/frames.bin"),
                 audio_system_path: Some(PathBuf::from("recordings/tmp/system.pcm")),
                 audio_mic_path: Some(PathBuf::from("recordings/tmp/mic.pcm")),
                 mouse_path: PathBuf::from("recordings/tmp/mouse.jsonl"),

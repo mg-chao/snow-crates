@@ -7,11 +7,9 @@ use crate::error::Result;
 #[derive(Clone, Debug)]
 pub struct TempLayout {
     pub output_dir: PathBuf,
-    pub root_tmp_dir: PathBuf,
     pub session_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub video_temp_path: PathBuf,
-    pub frame_cache_path: PathBuf,
     pub audio_system_path: PathBuf,
     pub audio_mic_path: PathBuf,
     pub mouse_path: PathBuf,
@@ -20,20 +18,15 @@ pub struct TempLayout {
 impl TempLayout {
     pub fn create(config: &RecordingConfig, session_id: &str) -> Result<Self> {
         fs::create_dir_all(&config.output_dir)?;
-        let root_tmp_dir = config.output_dir.join(".snowtmp");
-        fs::create_dir_all(&root_tmp_dir)?;
-
-        let session_dir = root_tmp_dir.join(session_id);
+        let session_dir = config.output_dir.join(format!(".snowtmp-{session_id}"));
         fs::create_dir_all(&session_dir)?;
 
         Ok(Self {
             output_dir: config.output_dir.clone(),
-            root_tmp_dir,
             session_dir: session_dir.clone(),
             manifest_path: session_dir.join("manifest.json"),
             // Reserved path for debugging/intermediate outputs.
             video_temp_path: session_dir.join("video_preview.mp4"),
-            frame_cache_path: session_dir.join("frames.bin"),
             audio_system_path: session_dir.join("audio_system.pcm"),
             audio_mic_path: session_dir.join("audio_mic.pcm"),
             mouse_path: session_dir.join("mouse.bin"),

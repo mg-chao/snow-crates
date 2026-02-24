@@ -124,6 +124,7 @@ impl Default for RecordingAudioConfig {
 pub struct RecordingConfig {
     pub target: RecordingTarget,
     pub output_dir: PathBuf,
+    pub keep_temp_files: bool,
     pub fps: u32,
     pub video_format: RecordingVideoFormat,
     pub video: VideoEncodeConfig,
@@ -163,6 +164,7 @@ impl Default for RecordingConfig {
         Self {
             target: RecordingTarget::PrimaryMonitor,
             output_dir: PathBuf::from("."),
+            keep_temp_files: false,
             fps: 60,
             video_format: RecordingVideoFormat::H264Lossless,
             video: VideoEncodeConfig::default(),

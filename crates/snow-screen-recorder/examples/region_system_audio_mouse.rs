@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             system_audio_enabled: true,
             ..RecordingAudioConfig::default()
         },
+        keep_temp_files: true,
         ..RecordingConfig::default()
     };
 
