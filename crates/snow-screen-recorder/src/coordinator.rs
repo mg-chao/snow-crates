@@ -306,15 +306,7 @@ impl RecordingCoordinator {
                 format,
                 timestamp,
             } => {
-                let _ = (timestamp.instant, timestamp.qpc_100ns);
-                // Build a temporary AudioPacket for the processor.
-                let packet = snow_audio_recorder::AudioPacket {
-                    source,
-                    format,
-                    frames,
-                    data,
-                    metadata: snow_audio_recorder::AudioPacketMetadata::default(),
-                };
+                let packet = build_audio_packet(source, format, frames, data, timestamp);
                 let bytes = audio_packet_to_i16_le_bytes(&packet)?;
                 if bytes.is_empty() {
                     return Ok(());
@@ -391,6 +383,27 @@ impl RecordingCoordinator {
                 Ok(())
             }
         }
+    }
+}
+
+fn build_audio_packet(
+    source: snow_audio_recorder::AudioSourceKind,
+    format: snow_audio_recorder::AudioFormat,
+    frames: u32,
+    data: Vec<u8>,
+    timestamp: crate::event::StreamTimestamp,
+) -> snow_audio_recorder::AudioPacket {
+    // Keep adapter timing metadata so alignment stays stable under load.
+    snow_audio_recorder::AudioPacket {
+        source,
+        format,
+        frames,
+        data,
+        metadata: snow_audio_recorder::AudioPacketMetadata {
+            capture_time: Some(timestamp.instant),
+            qpc_position_100ns: timestamp.qpc_100ns,
+            ..snow_audio_recorder::AudioPacketMetadata::default()
+        },
     }
 }
 
@@ -725,6 +738,29 @@ mod tests {
         // We can't inspect the timeline after finalize consumes self,
         // but the fact that finalize doesn't panic on an open pause
         // confirms timeline.finalize(at) was called.
+    }
+
+    #[test]
+    fn build_audio_packet_preserves_timing_metadata() {
+        let instant = Instant::now();
+        let qpc_100ns = Some(123_456_i64);
+        let packet = build_audio_packet(
+            snow_audio_recorder::AudioSourceKind::System,
+            snow_audio_recorder::AudioFormat::new(
+                48_000,
+                2,
+                snow_audio_recorder::AudioSampleFormat::I16,
+            ),
+            480,
+            vec![0u8; 1_920],
+            StreamTimestamp {
+                instant,
+                qpc_100ns,
+            },
+        );
+
+        assert_eq!(packet.metadata.capture_time, Some(instant));
+        assert_eq!(packet.metadata.qpc_position_100ns, qpc_100ns);
     }
 
     // ── Property-based tests ────────────────────────────────────
