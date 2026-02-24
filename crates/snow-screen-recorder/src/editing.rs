@@ -1728,7 +1728,7 @@ mod tests {
                 output_dir: PathBuf::from("recordings"),
                 temp_dir: PathBuf::from("recordings/tmp"),
                 keep_temp_files: false,
-                video_temp_path: PathBuf::from("recordings/tmp/video.h264"),
+                video_temp_path: PathBuf::from("recordings/tmp/video_recording.mp4"),
                 audio_system_path: Some(PathBuf::from("recordings/tmp/system.pcm")),
                 audio_mic_path: Some(PathBuf::from("recordings/tmp/mic.pcm")),
                 mouse_path: PathBuf::from("recordings/tmp/mouse.jsonl"),

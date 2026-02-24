@@ -25,8 +25,8 @@ impl TempLayout {
             output_dir: config.output_dir.clone(),
             session_dir: session_dir.clone(),
             manifest_path: session_dir.join("manifest.json"),
-            // Reserved path for debugging/intermediate outputs.
-            video_temp_path: session_dir.join("video_preview.mp4"),
+            // Primary recording video written incrementally during capture.
+            video_temp_path: session_dir.join("video_recording.mp4"),
             audio_system_path: session_dir.join("audio_system.pcm"),
             audio_mic_path: session_dir.join("audio_mic.pcm"),
             mouse_path: session_dir.join("mouse.bin"),
