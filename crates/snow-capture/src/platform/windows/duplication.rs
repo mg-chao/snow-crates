@@ -2050,6 +2050,18 @@ impl OutputCapturer {
             self.last_present_time = source_present_time_qpc;
         }
 
+        if self.cursor_config.capture_cursor
+            && let Some(cursor) = extract_cursor_data(&self.duplication, &frame_info)
+        {
+            let should_replace = match destination.metadata.cursor.as_ref() {
+                Some(existing) => !existing.visible || cursor.visible,
+                None => true,
+            };
+            if should_replace {
+                destination.metadata.cursor = Some(cursor);
+            }
+        }
+
         let mut region_dirty_rects = std::mem::take(&mut self.region_dirty_rects_scratch);
         let mut region_move_rects = std::mem::take(&mut self.region_move_rects_scratch);
         let capture_result = (|| -> CaptureResult<CaptureSampleMetadata> {

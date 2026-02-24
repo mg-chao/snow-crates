@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -8,7 +8,7 @@ use crate::backend::{
     CursorCaptureConfig, MonitorCapturer,
 };
 use crate::error::{CaptureError, CaptureResult};
-use crate::frame::Frame;
+use crate::frame::{CursorData, Frame};
 use crate::monitor::{MonitorId, MonitorKey};
 use crate::region::{CaptureRegion, MonitorLayout};
 use crate::streaming::{StreamConfig, StreamHandle};
@@ -112,6 +112,17 @@ fn copy_region_rgba(src: &Frame, blit: CaptureBlitRegion, dst: &mut Frame) -> Ca
             .ok_or(CaptureError::BufferOverflow)?;
     }
     Ok(())
+}
+
+fn merge_region_cursor(target: &mut Option<CursorData>, candidate: Option<&CursorData>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+
+    match target {
+        Some(existing) if existing.visible && !candidate.visible => {}
+        _ => *target = Some(candidate.clone()),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -677,6 +688,10 @@ impl CaptureSession {
                 };
 
                 copy_region_rgba(&monitor_frame, entry.blit, &mut out_frame)?;
+                merge_region_cursor(
+                    &mut out_frame.metadata.cursor,
+                    monitor_frame.metadata.cursor.as_ref(),
+                );
                 let sample = CaptureSampleMetadata {
                     capture_time: monitor_frame.metadata.capture_time,
                     present_time_qpc: monitor_frame.metadata.present_time_qpc,
@@ -911,6 +926,58 @@ mod tests {
         }
     }
 
+    struct RegionCursorFallbackBackend {
+        monitor: MonitorId,
+    }
+
+    struct RegionCursorFallbackCapturer;
+
+    impl MonitorCapturer for RegionCursorFallbackCapturer {
+        fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
+            let mut frame = reuse.unwrap_or_else(Frame::empty);
+            frame.ensure_rgba_capacity(32, 32)?;
+            frame.reset_metadata();
+            frame.metadata.capture_time = Some(Instant::now());
+            frame.metadata.cursor = Some(CursorData {
+                hotspot_x: 1,
+                hotspot_y: 2,
+                position_x: 20,
+                position_y: 10,
+                visible: true,
+                shape_width: 2,
+                shape_height: 2,
+                shape_rgba: vec![255; 16],
+            });
+            Ok(frame)
+        }
+
+        fn capture_region_into(
+            &mut self,
+            _blit: CaptureBlitRegion,
+            _destination: &mut Frame,
+            _destination_has_history: bool,
+        ) -> CaptureResult<Option<CaptureSampleMetadata>> {
+            Ok(None)
+        }
+    }
+
+    impl CaptureBackend for RegionCursorFallbackBackend {
+        fn enumerate_monitors(&self) -> CaptureResult<Vec<MonitorId>> {
+            Ok(vec![self.monitor.clone()])
+        }
+
+        fn primary_monitor(&self) -> CaptureResult<MonitorId> {
+            Ok(self.monitor.clone())
+        }
+
+        fn create_monitor_capturer(
+            &self,
+            _monitor: &MonitorId,
+        ) -> CaptureResult<Box<dyn MonitorCapturer>> {
+            Ok(Box::new(RegionCursorFallbackCapturer))
+        }
+    }
+
     fn mock_layout(monitor: &MonitorId, x: i32, y: i32, width: u32, height: u32) -> MonitorLayout {
         MonitorLayout {
             monitors: vec![crate::region::MonitorGeometry {
@@ -1026,6 +1093,28 @@ mod tests {
 
         assert_eq!(*desktop_calls.lock().unwrap(), 1);
         assert_eq!(*region_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn region_capture_fallback_preserves_cursor_metadata() -> CaptureResult<()> {
+        let monitor = MonitorId::from_parts(1, 2, 0, "cursor-monitor", true);
+        let backend: Arc<dyn CaptureBackend> = Arc::new(RegionCursorFallbackBackend {
+            monitor: monitor.clone(),
+        });
+        let mut session = CaptureSession::builder().with_backend(backend).build()?;
+        session.layout = Some(mock_layout(&monitor, 0, 0, 32, 32));
+
+        let target = CaptureTarget::Region(CaptureRegion::new(0, 0, 32, 32)?);
+        let frame = session.capture_frame(&target)?;
+        let cursor = frame
+            .metadata
+            .cursor
+            .as_ref()
+            .expect("region capture should keep fallback cursor metadata");
+        assert!(cursor.visible);
+        assert_eq!(cursor.position_x, 20);
+        assert_eq!(cursor.position_y, 10);
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -11,7 +12,9 @@ use crate::config::{EditConfig, ExportFormat, MouseEditConfig};
 use crate::error::{Result, ScreenRecorderError};
 use crate::export::ExportResult;
 use crate::model::{StoredFrame, read_frames};
-use crate::mouse::{ClickEventRecord, CursorSampleRecord, MouseRecord, read_mouse_records};
+use crate::mouse::{
+    ClickEventRecord, CursorSampleRecord, CursorShapeRecord, MouseRecord, read_mouse_records,
+};
 
 pub struct EditingSession {
     artifact: RecordingArtifact,
@@ -41,20 +44,16 @@ impl EditingSession {
         })
     }
 
-    pub fn set_config(&mut self, config: EditConfig) -> Result<()> {
+    pub fn set_config(&mut self, mut config: EditConfig) -> Result<()> {
         config
             .validate()
             .map_err(ScreenRecorderError::InvalidConfig)?;
 
         if config.system_audio.enabled && !self.manifest.recorded_system_audio {
-            return Err(ScreenRecorderError::InvalidConfig(
-                "system audio cannot be enabled because it was not recorded".to_string(),
-            ));
+            config.system_audio.enabled = false;
         }
         if config.microphone_audio.enabled && !self.manifest.recorded_microphone_audio {
-            return Err(ScreenRecorderError::InvalidConfig(
-                "microphone audio cannot be enabled because it was not recorded".to_string(),
-            ));
+            config.microphone_audio.enabled = false;
         }
 
         self.config = config;
@@ -279,6 +278,7 @@ struct MouseSample {
     x: i32,
     y: i32,
     visible: bool,
+    shape_id: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +292,7 @@ struct MouseClickDown {
 struct MouseTracks {
     samples: Vec<MouseSample>,
     click_downs: Vec<MouseClickDown>,
+    cursor_shapes: HashMap<u32, CursorShapeRecord>,
 }
 
 fn build_mouse_tracks(records: &[MouseRecord]) -> MouseTracks {
@@ -304,14 +305,21 @@ fn build_mouse_tracks(records: &[MouseRecord]) -> MouseTracks {
                 x,
                 y,
                 visible,
-                ..
+                shape_id,
             }) => {
                 tracks.samples.push(MouseSample {
                     ts_ms: *timestamp_ms,
                     x: *x,
                     y: *y,
                     visible: *visible,
+                    shape_id: *shape_id,
                 });
+            }
+            MouseRecord::CursorShape(shape) => {
+                tracks
+                    .cursor_shapes
+                    .entry(shape.shape_id)
+                    .or_insert_with(|| shape.clone());
             }
             MouseRecord::Click(ClickEventRecord {
                 timestamp_ms,
@@ -354,7 +362,7 @@ fn apply_mouse_overlays(frame: &mut StoredFrame, tracks: &MouseTracks, config: &
         draw_click_ripples(frame, &tracks.click_downs, ts);
     }
     if config.visible && current.visible {
-        draw_cursor(frame, current.x, current.y);
+        draw_cursor(frame, current, tracks);
     }
 }
 
@@ -394,7 +402,61 @@ fn draw_click_ripples(frame: &mut StoredFrame, clicks: &[MouseClickDown], ts: u6
     }
 }
 
-fn draw_cursor(frame: &mut StoredFrame, x: i32, y: i32) {
+fn draw_cursor(frame: &mut StoredFrame, current: &MouseSample, tracks: &MouseTracks) {
+    if let Some(shape_id) = current.shape_id
+        && let Some(shape) = tracks.cursor_shapes.get(&shape_id)
+    {
+        let width = shape.width as usize;
+        let height = shape.height as usize;
+        let expected_len = width
+            .checked_mul(height)
+            .and_then(|px| px.checked_mul(4))
+            .unwrap_or(0);
+        if expected_len > 0 && shape.shape_rgba.len() >= expected_len {
+            draw_cursor_shape(
+                frame,
+                current.x.saturating_sub(shape.hotspot_x as i32),
+                current.y.saturating_sub(shape.hotspot_y as i32),
+                width,
+                height,
+                &shape.shape_rgba[..expected_len],
+            );
+            return;
+        }
+    }
+
+    draw_fallback_cursor(frame, current.x, current.y);
+}
+
+fn draw_cursor_shape(
+    frame: &mut StoredFrame,
+    origin_x: i32,
+    origin_y: i32,
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) {
+    for y in 0..height {
+        let dst_y = origin_y.saturating_add(y as i32);
+        for x in 0..width {
+            let idx = (y * width + x) * 4;
+            let alpha = rgba[idx + 3];
+            if alpha == 0 {
+                continue;
+            }
+            set_pixel_blended(
+                &mut frame.rgba,
+                frame.width,
+                frame.height,
+                origin_x.saturating_add(x as i32),
+                dst_y,
+                [rgba[idx], rgba[idx + 1], rgba[idx + 2], alpha],
+            );
+        }
+    }
+}
+
+fn draw_fallback_cursor(frame: &mut StoredFrame, x: i32, y: i32) {
     let points = [(x, y), (x + 12, y + 4), (x + 4, y + 12)];
     fill_triangle(frame, points, [255, 255, 255, 235]);
     draw_line(frame, x, y, x + 12, y + 4, [0, 0, 0, 200], 1);
@@ -1279,6 +1341,75 @@ fn validate_file_exists(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn test_editing_session(
+        recorded_system_audio: bool,
+        recorded_microphone_audio: bool,
+    ) -> EditingSession {
+        EditingSession {
+            artifact: RecordingArtifact {
+                session_id: "session".to_string(),
+                output_dir: PathBuf::from("recordings"),
+                temp_dir: PathBuf::from("recordings/tmp"),
+                manifest_path: PathBuf::from("recordings/manifest.json"),
+                recorded_system_audio,
+                recorded_microphone_audio,
+            },
+            manifest: SessionManifest {
+                session_id: "session".to_string(),
+                output_dir: PathBuf::from("recordings"),
+                temp_dir: PathBuf::from("recordings/tmp"),
+                video_temp_path: PathBuf::from("recordings/tmp/video.h264"),
+                frame_cache_path: PathBuf::from("recordings/tmp/frames.bin"),
+                audio_system_path: Some(PathBuf::from("recordings/tmp/system.pcm")),
+                audio_mic_path: Some(PathBuf::from("recordings/tmp/mic.pcm")),
+                mouse_path: PathBuf::from("recordings/tmp/mouse.jsonl"),
+                fps: 30,
+                width: 1920,
+                height: 1080,
+                capture_origin_x: 0,
+                capture_origin_y: 0,
+                recorded_system_audio,
+                recorded_microphone_audio,
+                audio_sample_rate_hz: 48_000,
+                audio_channels: 2,
+                audio_bitrate_kbps: 192,
+                pause_intervals: Vec::new(),
+            },
+            config: EditConfig::default(),
+        }
+    }
+
+    #[test]
+    fn set_config_disables_unrecorded_audio_tracks() {
+        let mut editing = test_editing_session(false, false);
+        let mut config = EditConfig::default();
+        config.system_audio.enabled = true;
+        config.microphone_audio.enabled = true;
+
+        editing
+            .set_config(config)
+            .expect("set_config should gracefully disable unavailable audio tracks");
+
+        assert!(!editing.config.system_audio.enabled);
+        assert!(!editing.config.microphone_audio.enabled);
+    }
+
+    #[test]
+    fn set_config_keeps_recorded_audio_tracks_enabled() {
+        let mut editing = test_editing_session(true, true);
+        let mut config = EditConfig::default();
+        config.system_audio.enabled = true;
+        config.microphone_audio.enabled = true;
+
+        editing
+            .set_config(config)
+            .expect("set_config should keep recorded audio tracks enabled");
+
+        assert!(editing.config.system_audio.enabled);
+        assert!(editing.config.microphone_audio.enabled);
+    }
 
     #[test]
     fn quality_endpoints_match_plan() {
@@ -1307,5 +1438,74 @@ mod tests {
         let truncated =
             align_i16_interleaved_to_duration(vec![1; 40], 10, 2, Duration::from_millis(1_500));
         assert_eq!(truncated.len(), 30);
+    }
+
+    #[test]
+    fn build_mouse_tracks_keeps_shape_binding() {
+        let records = vec![
+            MouseRecord::CursorShape(CursorShapeRecord {
+                shape_id: 7,
+                shape_hash: 99,
+                hotspot_x: 3,
+                hotspot_y: 4,
+                width: 8,
+                height: 8,
+                shape_rgba: vec![255; 8 * 8 * 4],
+            }),
+            MouseRecord::CursorSample(CursorSampleRecord {
+                timestamp_ms: 12,
+                x: 100,
+                y: 200,
+                visible: true,
+                shape_id: Some(7),
+            }),
+        ];
+
+        let tracks = build_mouse_tracks(&records);
+        assert_eq!(tracks.samples.len(), 1);
+        assert_eq!(tracks.samples[0].shape_id, Some(7));
+        assert!(tracks.cursor_shapes.contains_key(&7));
+    }
+
+    #[test]
+    fn apply_mouse_overlays_draws_cursor_shape_pixels() {
+        let mut frame = StoredFrame {
+            timestamp_ms: 0,
+            duration_ms: 16,
+            width: 4,
+            height: 4,
+            rgba: vec![0; 4 * 4 * 4],
+        };
+        let tracks = build_mouse_tracks(&[
+            MouseRecord::CursorShape(CursorShapeRecord {
+                shape_id: 1,
+                shape_hash: 1,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                width: 1,
+                height: 1,
+                shape_rgba: vec![200, 10, 20, 255],
+            }),
+            MouseRecord::CursorSample(CursorSampleRecord {
+                timestamp_ms: 0,
+                x: 2,
+                y: 1,
+                visible: true,
+                shape_id: Some(1),
+            }),
+        ]);
+
+        apply_mouse_overlays(
+            &mut frame,
+            &tracks,
+            &MouseEditConfig {
+                visible: true,
+                trail_enabled: false,
+                click_enabled: false,
+            },
+        );
+
+        let px = (1usize * 4 + 2usize) * 4;
+        assert_eq!(&frame.rgba[px..px + 4], &[200, 10, 20, 255]);
     }
 }

@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,7 +19,7 @@ use crate::artifact::{RecordingArtifact, SessionManifest};
 use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat};
 use crate::error::{Result, ScreenRecorderError};
 use crate::model::{StoredFrame, write_frames};
-use crate::mouse::{CursorSampleRecord, MouseRecord, write_mouse_records};
+use crate::mouse::{CursorSampleRecord, CursorShapeRecord, MouseRecord, write_mouse_records};
 use crate::temp::TempLayout;
 use crate::timeline::PauseTimeline;
 
@@ -537,6 +539,9 @@ struct WorkerContext {
     pending_frame: Option<StoredFrame>,
     last_observed_ts_ms: Option<u64>,
     mouse_records: Vec<MouseRecord>,
+    cursor_shape_ids: HashMap<u64, u32>,
+    next_cursor_shape_id: u32,
+    active_cursor_shape_id: Option<u32>,
     system_audio: Option<PcmTrackWriter>,
     mic_audio: Option<PcmTrackWriter>,
     capture_ended: bool,
@@ -591,6 +596,9 @@ impl WorkerContext {
             pending_frame: None,
             last_observed_ts_ms: None,
             mouse_records: Vec::new(),
+            cursor_shape_ids: HashMap::new(),
+            next_cursor_shape_id: 1,
+            active_cursor_shape_id: None,
             system_audio,
             mic_audio,
             capture_ended: false,
@@ -619,6 +627,36 @@ impl WorkerContext {
                 self.frame_interval_ms.max(1),
             );
         }
+    }
+
+    fn remember_cursor_shape(&mut self, cursor: &snow_capture::CursorData) -> Option<u32> {
+        let Some((shape_hash, shape_bytes_len)) = cursor_shape_hash(cursor) else {
+            return self.active_cursor_shape_id;
+        };
+
+        let shape_id = if let Some(existing) = self.cursor_shape_ids.get(&shape_hash).copied() {
+            existing
+        } else {
+            let shape_id = self.next_cursor_shape_id;
+            if let Some(next_id) = self.next_cursor_shape_id.checked_add(1) {
+                self.next_cursor_shape_id = next_id;
+            }
+            self.cursor_shape_ids.insert(shape_hash, shape_id);
+            self.mouse_records
+                .push(MouseRecord::CursorShape(CursorShapeRecord {
+                    shape_id,
+                    shape_hash,
+                    hotspot_x: cursor.hotspot_x,
+                    hotspot_y: cursor.hotspot_y,
+                    width: cursor.shape_width,
+                    height: cursor.shape_height,
+                    shape_rgba: cursor.shape_rgba[..shape_bytes_len].to_vec(),
+                }));
+            shape_id
+        };
+
+        self.active_cursor_shape_id = Some(shape_id);
+        Some(shape_id)
     }
 
     fn handle_capture_event(&mut self, event: CaptureEvent) -> Result<()> {
@@ -666,13 +704,14 @@ impl WorkerContext {
         self.observe_video_time(ts_ms);
 
         if let Some(cursor) = frame.metadata.cursor.as_ref() {
+            let shape_id = self.remember_cursor_shape(cursor);
             self.mouse_records
                 .push(MouseRecord::CursorSample(CursorSampleRecord {
                     timestamp_ms: ts_ms,
                     x: cursor.position_x - self.capture_origin_x,
                     y: cursor.position_y - self.capture_origin_y,
                     visible: cursor.visible,
-                    shape_id: None,
+                    shape_id,
                 }));
         }
 
@@ -900,6 +939,26 @@ fn duration_between_timestamps_ms(start_ts: u64, end_ts: u64, fallback_ms: u32) 
     delta.min(u64::from(u32::MAX)) as u32
 }
 
+fn cursor_shape_hash(cursor: &snow_capture::CursorData) -> Option<(u64, usize)> {
+    if cursor.shape_width == 0 || cursor.shape_height == 0 {
+        return None;
+    }
+    let width = usize::try_from(cursor.shape_width).ok()?;
+    let height = usize::try_from(cursor.shape_height).ok()?;
+    let shape_bytes_len = width.checked_mul(height)?.checked_mul(4)?;
+    if cursor.shape_rgba.len() < shape_bytes_len {
+        return None;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cursor.hotspot_x.hash(&mut hasher);
+    cursor.hotspot_y.hash(&mut hasher);
+    cursor.shape_width.hash(&mut hasher);
+    cursor.shape_height.hash(&mut hasher);
+    cursor.shape_rgba[..shape_bytes_len].hash(&mut hasher);
+    Some((hasher.finish(), shape_bytes_len))
+}
+
 fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPacket) -> Result<Vec<u8>> {
     match packet.format.sample_format {
         AudioSampleFormat::I16 => {
@@ -953,5 +1012,43 @@ mod tests {
     fn duration_between_timestamps_falls_back_when_delta_is_zero() {
         assert_eq!(duration_between_timestamps_ms(2_000, 2_000, 42), 42);
         assert_eq!(duration_between_timestamps_ms(2_000, 1_500, 42), 42);
+    }
+
+    #[test]
+    fn cursor_shape_hash_requires_valid_rgba_payload() {
+        let cursor = snow_capture::CursorData {
+            hotspot_x: 1,
+            hotspot_y: 2,
+            position_x: 100,
+            position_y: 200,
+            visible: true,
+            shape_width: 8,
+            shape_height: 8,
+            shape_rgba: vec![0; 8 * 8 * 4 - 1],
+        };
+        assert!(cursor_shape_hash(&cursor).is_none());
+    }
+
+    #[test]
+    fn cursor_shape_hash_changes_when_shape_changes() {
+        let mut cursor = snow_capture::CursorData {
+            hotspot_x: 1,
+            hotspot_y: 2,
+            position_x: 100,
+            position_y: 200,
+            visible: true,
+            shape_width: 2,
+            shape_height: 2,
+            shape_rgba: vec![0, 0, 0, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        };
+
+        let first = cursor_shape_hash(&cursor)
+            .expect("shape hash should exist")
+            .0;
+        cursor.shape_rgba[5] ^= 0xFF;
+        let second = cursor_shape_hash(&cursor)
+            .expect("shape hash should exist")
+            .0;
+        assert_ne!(first, second);
     }
 }
