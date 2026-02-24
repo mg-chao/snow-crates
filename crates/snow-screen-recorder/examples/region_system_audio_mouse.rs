@@ -50,8 +50,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     thread::sleep(Duration::from_secs(RECORD_SECONDS));
 
+    let stop_duration_start = std::time::Instant::now();
     let artifact = recording.stop()?;
-    println!("Recording stopped, exporting...");
+    println!("Recording stopped in {} ms", stop_duration_start.elapsed().as_millis());
 
     let mut editing = EditingSession::open(artifact)?;
     let mut edit_config = EditConfig::default();
@@ -72,7 +73,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     editing.set_config(edit_config)?;
 
+    let start_ts = std::time::Instant::now();
     let result = editing.export()?;
+    println!(
+        "Export completed in {} seconds.",
+        start_ts.elapsed().as_secs_f64()
+    );
+
     println!(
         "Export finished: {} (duration: {} ms)",
         result.output_path.display(),
