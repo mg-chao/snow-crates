@@ -624,12 +624,21 @@ fn draw_mouse_trail(frame: &mut StoredFrame, samples: &[MouseSample], ts: u64) {
 
     let mut ordered = recent;
     ordered.reverse();
-    for win in ordered.windows(2) {
-        let a = win[0];
-        let b = win[1];
+
+    let mut prev_visible: Option<&MouseSample> = None;
+    for sample in ordered {
+        if !sample.visible {
+            continue;
+        }
+        let Some(a) = prev_visible else {
+            prev_visible = Some(sample);
+            continue;
+        };
+        let b = sample;
         let age = ts.saturating_sub(b.ts_ms).min(trail_window_ms);
         let alpha = ((1.0 - age as f32 / trail_window_ms as f32) * 180.0).round() as u8;
         draw_line(frame, a.x, a.y, b.x, b.y, [255, 32, 32, alpha], 2);
+        prev_visible = Some(sample);
     }
 }
 
@@ -1938,5 +1947,58 @@ mod tests {
         assert_eq!(&frame.rgba[0..4], &[10, 20, 30, 255]);
         assert_eq!(&frame.rgba[4..8], &[235, 215, 195, 255]);
         assert_eq!(&frame.rgba[8..12], &[5, 6, 7, 255]);
+    }
+
+    #[test]
+    fn apply_mouse_overlays_trail_ignores_hidden_cursor_samples() {
+        let mut frame = StoredFrame {
+            timestamp_ms: 25,
+            duration_ms: 16,
+            width: 32,
+            height: 32,
+            rgba: vec![0; 32 * 32 * 4],
+        };
+        let tracks = build_mouse_tracks(&[
+            MouseRecord::CursorSample(CursorSampleRecord {
+                timestamp_ms: 0,
+                x: 10,
+                y: 10,
+                visible: true,
+                shape_id: None,
+            }),
+            MouseRecord::CursorSample(CursorSampleRecord {
+                timestamp_ms: 10,
+                x: 0,
+                y: 0,
+                visible: false,
+                shape_id: None,
+            }),
+            MouseRecord::CursorSample(CursorSampleRecord {
+                timestamp_ms: 20,
+                x: 20,
+                y: 20,
+                visible: true,
+                shape_id: None,
+            }),
+        ]);
+
+        apply_mouse_overlays(
+            &mut frame,
+            &tracks,
+            &MouseEditConfig {
+                visible: false,
+                trail_enabled: true,
+                click_enabled: false,
+            },
+        );
+
+        let top_left = (1usize * 32 + 1usize) * 4;
+        assert_eq!(&frame.rgba[top_left..top_left + 4], &[0, 0, 0, 0]);
+
+        let mid = (15usize * 32 + 15usize) * 4;
+        assert!(
+            frame.rgba[mid] > 0 || frame.rgba[mid + 1] > 0 || frame.rgba[mid + 2] > 0,
+            "visible cursor samples should still render trail segments"
+        );
     }
 }

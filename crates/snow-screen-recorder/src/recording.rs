@@ -852,6 +852,7 @@ struct WorkerContext {
     cursor_shape_ids: HashMap<u64, u32>,
     next_cursor_shape_id: u32,
     active_cursor_shape_id: Option<u32>,
+    last_visible_cursor_pos: Option<(i32, i32)>,
     system_audio: Option<PcmTrackWriter>,
     mic_audio: Option<PcmTrackWriter>,
     preview_encoder: Option<LiveVideoEncoder>,
@@ -912,6 +913,7 @@ impl WorkerContext {
             cursor_shape_ids: HashMap::new(),
             next_cursor_shape_id: 1,
             active_cursor_shape_id: None,
+            last_visible_cursor_pos: None,
             system_audio,
             mic_audio,
             preview_encoder: None,
@@ -1017,14 +1019,24 @@ impl WorkerContext {
 
         if let Some(cursor) = frame.metadata.cursor.as_ref() {
             let shape_id = self.remember_cursor_shape(cursor);
-            self.mouse_records
-                .push(MouseRecord::CursorSample(CursorSampleRecord {
-                    timestamp_ms: ts_ms,
-                    x: cursor.position_x - self.capture_origin_x,
-                    y: cursor.position_y - self.capture_origin_y,
-                    visible: cursor.visible,
-                    shape_id,
-                }));
+            let (sample_pos, next_last_visible) = choose_cursor_sample_position(
+                cursor.visible,
+                cursor.position_x,
+                cursor.position_y,
+                self.last_visible_cursor_pos,
+            );
+            self.last_visible_cursor_pos = next_last_visible;
+
+            if let Some((sample_x, sample_y)) = sample_pos {
+                self.mouse_records
+                    .push(MouseRecord::CursorSample(CursorSampleRecord {
+                        timestamp_ms: ts_ms,
+                        x: sample_x - self.capture_origin_x,
+                        y: sample_y - self.capture_origin_y,
+                        visible: cursor.visible,
+                        shape_id,
+                    }));
+            }
         }
 
         if frame.metadata.is_duplicate {
@@ -1264,6 +1276,20 @@ fn map_cursor_composition_mode(mode: CursorCompositionMode) -> CursorShapeCompos
     }
 }
 
+fn choose_cursor_sample_position(
+    visible: bool,
+    position_x: i32,
+    position_y: i32,
+    last_visible: Option<(i32, i32)>,
+) -> (Option<(i32, i32)>, Option<(i32, i32)>) {
+    if visible {
+        let pos = (position_x, position_y);
+        return (Some(pos), Some(pos));
+    }
+
+    (last_visible, last_visible)
+}
+
 fn cursor_shape_hash(cursor: &snow_capture::CursorData) -> Option<(u64, usize)> {
     if cursor.shape_width == 0 || cursor.shape_height == 0 {
         return None;
@@ -1402,5 +1428,26 @@ mod tests {
             .expect("shape hash should exist")
             .0;
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn choose_cursor_sample_position_visible_updates_last_visible() {
+        let (sample, last_visible) = choose_cursor_sample_position(true, 320, 240, None);
+        assert_eq!(sample, Some((320, 240)));
+        assert_eq!(last_visible, Some((320, 240)));
+    }
+
+    #[test]
+    fn choose_cursor_sample_position_hidden_without_history_skips_sample() {
+        let (sample, last_visible) = choose_cursor_sample_position(false, 0, 0, None);
+        assert_eq!(sample, None);
+        assert_eq!(last_visible, None);
+    }
+
+    #[test]
+    fn choose_cursor_sample_position_hidden_reuses_last_visible_position() {
+        let (sample, last_visible) = choose_cursor_sample_position(false, 0, 0, Some((640, 480)));
+        assert_eq!(sample, Some((640, 480)));
+        assert_eq!(last_visible, Some((640, 480)));
     }
 }
