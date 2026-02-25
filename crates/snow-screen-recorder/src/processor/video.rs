@@ -6,14 +6,10 @@ use crate::recording::LiveVideoEncoder;
 
 /// Processes video frames: encoding to H.264 via ffmpeg.
 ///
-/// Owns both the primary encoder (for the recording temp file) and
-/// the optional preview encoder. The current `WorkerContext` has a
-/// `preview_encoder` field that is preserved here; it is used for
-/// generating a low-latency preview stream during recording.
+/// Lazily creates a `LiveVideoEncoder` on the first real frame and
+/// stores the last encoded RGBA buffer for tail-frame finalization.
 pub(crate) struct VideoProcessor {
-    #[cfg(test)]
     encoder: Option<LiveVideoEncoder>,
-    preview_encoder: Option<LiveVideoEncoder>,
     width: u32,
     height: u32,
     target_fps: u32,
@@ -34,9 +30,7 @@ impl VideoProcessor {
         video_temp_path: PathBuf,
     ) -> Self {
         Self {
-            #[cfg(test)]
             encoder: None,
-            preview_encoder: None,
             width: 0,
             height: 0,
             target_fps,
@@ -70,7 +64,7 @@ impl VideoProcessor {
 
     /// Encode a non-duplicate RGBA frame at the given timestamp.
     ///
-    /// Lazily creates the preview encoder on the first real frame.
+    /// Lazily creates the encoder on the first real frame.
     /// After encoding, the RGBA buffer is stored as `last_encoded_rgba`
     /// so it can be used as a tail frame during finalization.
     pub(crate) fn encode_frame(
@@ -80,8 +74,8 @@ impl VideoProcessor {
         height: u32,
         ts_ms: u64,
     ) -> Result<()> {
-        if self.preview_encoder.is_none() {
-            self.preview_encoder = Some(LiveVideoEncoder::create(
+        if self.encoder.is_none() {
+            self.encoder = Some(LiveVideoEncoder::create(
                 &self.video_temp_path,
                 width,
                 height,
@@ -90,7 +84,7 @@ impl VideoProcessor {
                 &self.video_config,
             )?);
         }
-        if let Some(encoder) = self.preview_encoder.as_mut() {
+        if let Some(encoder) = self.encoder.as_mut() {
             encoder.encode_frame(&rgba, ts_ms)?;
         }
         self.last_encoded_rgba = Some(rgba);
@@ -112,13 +106,7 @@ impl VideoProcessor {
         self.last_encoded_rgba.as_deref()
     }
 
-    /// Take ownership of the preview encoder for finalization.
-    pub(crate) fn take_preview_encoder(&mut self) -> Option<LiveVideoEncoder> {
-        self.preview_encoder.take()
-    }
-
-    /// Take ownership of the primary encoder for finalization.
-    #[cfg(test)]
+    /// Take ownership of the encoder for finalization.
     pub(crate) fn take_encoder(&mut self) -> Option<LiveVideoEncoder> {
         self.encoder.take()
     }
@@ -183,12 +171,6 @@ mod tests {
     fn last_encoded_rgba_is_none_initially() {
         let proc = make_processor();
         assert!(proc.last_encoded_rgba().is_none());
-    }
-
-    #[test]
-    fn take_preview_encoder_is_none_initially() {
-        let mut proc = make_processor();
-        assert!(proc.take_preview_encoder().is_none());
     }
 
     #[test]

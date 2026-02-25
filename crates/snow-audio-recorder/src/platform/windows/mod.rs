@@ -17,7 +17,7 @@ use crate::backend::{AudioBackend, AudioBackendKind, AudioRecorderEngine, Engine
 use crate::device::{AudioDeviceInfo, DeviceFlow};
 use crate::error::{AudioError, AudioResult};
 use crate::packet::{AudioEvent, AudioSourceKind};
-use crate::session::AudioStreamConfig;
+use crate::session::{AudioStreamConfig, SourceConfig};
 
 use self::com::{CoInitGuard, EventHandle};
 use self::notification::NotificationClientGuard;
@@ -104,6 +104,45 @@ struct WasapiEngine {
 // boundary via this impl.
 unsafe impl Send for WasapiEngine {}
 
+impl ComState {
+    fn source_mut(&mut self, kind: AudioSourceKind) -> &mut Option<WasapiSource> {
+        match kind {
+            AudioSourceKind::System => &mut self.system_source,
+            AudioSourceKind::Microphone => &mut self.microphone_source,
+        }
+    }
+
+    fn source_ref(&self, kind: AudioSourceKind) -> &Option<WasapiSource> {
+        match kind {
+            AudioSourceKind::System => &self.system_source,
+            AudioSourceKind::Microphone => &self.microphone_source,
+        }
+    }
+}
+
+impl WasapiEngine {
+    fn retry_mut(&mut self, kind: AudioSourceKind) -> &mut Option<SourceRetryState> {
+        match kind {
+            AudioSourceKind::System => &mut self.system_retry,
+            AudioSourceKind::Microphone => &mut self.microphone_retry,
+        }
+    }
+
+    fn retry_ref(&self, kind: AudioSourceKind) -> &Option<SourceRetryState> {
+        match kind {
+            AudioSourceKind::System => &self.system_retry,
+            AudioSourceKind::Microphone => &self.microphone_retry,
+        }
+    }
+
+    fn source_config(&self, kind: AudioSourceKind) -> &SourceConfig {
+        match kind {
+            AudioSourceKind::System => &self.config.system,
+            AudioSourceKind::Microphone => &self.config.microphone,
+        }
+    }
+}
+
 impl SourceRetryState {
     fn new(initial_backoff: Duration, last_error: Option<AudioError>) -> Self {
         let now = Instant::now();
@@ -169,31 +208,13 @@ impl WasapiEngine {
         let notification =
             NotificationClientGuard::register(&enumerator, Arc::clone(&control_event))?;
 
-        let mut system_source = None;
-        if self.config.system.enabled {
-            match WasapiSource::new(
-                AudioSourceKind::System,
-                self.config.system.clone(),
-                enumerator.clone(),
-            ) {
-                Ok(source) => system_source = Some(source),
-                Err(err) if self.config.system.required => return Err(err),
-                Err(_) => {}
-            }
-        }
-
-        let mut microphone_source = None;
-        if self.config.microphone.enabled {
-            match WasapiSource::new(
-                AudioSourceKind::Microphone,
-                self.config.microphone.clone(),
-                enumerator.clone(),
-            ) {
-                Ok(source) => microphone_source = Some(source),
-                Err(err) if self.config.microphone.required => return Err(err),
-                Err(_) => {}
-            }
-        }
+        let system_source =
+            Self::try_init_source(AudioSourceKind::System, &self.config.system, &enumerator)?;
+        let microphone_source = Self::try_init_source(
+            AudioSourceKind::Microphone,
+            &self.config.microphone,
+            &enumerator,
+        )?;
 
         if system_source.is_none() && microphone_source.is_none() {
             return Err(AudioError::DeviceUnavailable(
@@ -214,6 +235,23 @@ impl WasapiEngine {
         Ok(())
     }
 
+    /// Try to initialize a single audio source. Returns `Ok(None)` if the
+    /// source is disabled or if initialization fails on a non-required source.
+    fn try_init_source(
+        kind: AudioSourceKind,
+        config: &SourceConfig,
+        enumerator: &windows::Win32::Media::Audio::IMMDeviceEnumerator,
+    ) -> AudioResult<Option<WasapiSource>> {
+        if !config.enabled {
+            return Ok(None);
+        }
+        match WasapiSource::new(kind, config.clone(), enumerator.clone()) {
+            Ok(source) => Ok(Some(source)),
+            Err(err) if config.required => Err(err),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn process_control_notifications(&mut self) -> AudioResult<Vec<AudioEvent>> {
         let mut events = Vec::new();
 
@@ -232,22 +270,24 @@ impl WasapiEngine {
         let capture_changed = state.take_capture_default_changed();
         let topology_changed = state.take_topology_changed();
 
-        if render_changed && self.config.system.enabled {
-            if matches!(
+        if render_changed
+            && self.config.system.enabled
+            && matches!(
                 self.config.system.device,
                 crate::device::DeviceSelector::DefaultRender
-            ) {
-                self.begin_retry(AudioSourceKind::System, None);
-            }
+            )
+        {
+            self.begin_retry(AudioSourceKind::System, None);
         }
 
-        if capture_changed && self.config.microphone.enabled {
-            if matches!(
+        if capture_changed
+            && self.config.microphone.enabled
+            && matches!(
                 self.config.microphone.device,
                 crate::device::DeviceSelector::DefaultCapture
-            ) {
-                self.begin_retry(AudioSourceKind::Microphone, None);
-            }
+            )
+        {
+            self.begin_retry(AudioSourceKind::Microphone, None);
         }
 
         if topology_changed {
@@ -277,19 +317,13 @@ impl WasapiEngine {
     }
 
     /// Start a deferred retry sequence for the given source. If a retry is
-    /// already in progress it is reset (e.g. a new device-change notification
+    /// already in progress it is reset (e.g. a new device-change notification).
     fn begin_retry(&mut self, kind: AudioSourceKind, last_error: Option<AudioError>) {
         if let Some(com) = self.com.as_mut() {
-            match kind {
-                AudioSourceKind::System => com.system_source = None,
-                AudioSourceKind::Microphone => com.microphone_source = None,
-            }
+            *com.source_mut(kind) = None;
         }
         let state = SourceRetryState::new(self.config.restart_policy.initial_backoff, last_error);
-        match kind {
-            AudioSourceKind::System => self.system_retry = Some(state),
-            AudioSourceKind::Microphone => self.microphone_retry = Some(state),
-        }
+        *self.retry_mut(kind) = Some(state);
     }
 
     /// Non-blocking: attempt one retry tick for each source that has a pending
@@ -306,28 +340,17 @@ impl WasapiEngine {
         kind: AudioSourceKind,
         out: &mut Vec<AudioEvent>,
     ) -> AudioResult<()> {
-        let is_ready = match kind {
-            AudioSourceKind::System => self.system_retry.as_ref().is_some_and(|r| r.is_ready()),
-            AudioSourceKind::Microphone => {
-                self.microphone_retry.as_ref().is_some_and(|r| r.is_ready())
-            }
-        };
-        if !is_ready {
+        if !self.retry_ref(kind).as_ref().is_some_and(|r| r.is_ready()) {
             return Ok(());
         }
 
-        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
-        let enumerator = com.enumerator.clone();
-
-        let (slot, source_config) = match kind {
-            AudioSourceKind::System => (&mut com.system_source, self.config.system.clone()),
-            AudioSourceKind::Microphone => {
-                (&mut com.microphone_source, self.config.microphone.clone())
-            }
-        };
-
+        let source_config = self.source_config(kind).clone();
         let max_attempts = self.config.restart_policy.max_attempts.max(1);
         let max_backoff = self.config.restart_policy.max_backoff;
+
+        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
+        let enumerator = com.enumerator.clone();
+        let slot = com.source_mut(kind);
 
         let result = if let Some(source) = slot.as_mut() {
             source.restart()
@@ -344,16 +367,11 @@ impl WasapiEngine {
 
         match result {
             Ok((old_device_id, new_device_id)) => {
-                let retry_state = match kind {
-                    AudioSourceKind::System => self.system_retry.as_ref(),
-                    AudioSourceKind::Microphone => self.microphone_retry.as_ref(),
-                };
-                let downtime = retry_state.map_or(Duration::ZERO, |r| r.downtime());
-
-                match kind {
-                    AudioSourceKind::System => self.system_retry = None,
-                    AudioSourceKind::Microphone => self.microphone_retry = None,
-                }
+                let downtime = self
+                    .retry_ref(kind)
+                    .as_ref()
+                    .map_or(Duration::ZERO, |r| r.downtime());
+                *self.retry_mut(kind) = None;
                 out.push(AudioEvent::SourceRestarted {
                     source: kind,
                     old_device_id,
@@ -362,31 +380,16 @@ impl WasapiEngine {
                 });
             }
             Err(err) => {
-                let retry_state = match kind {
-                    AudioSourceKind::System => self.system_retry.as_mut(),
-                    AudioSourceKind::Microphone => self.microphone_retry.as_mut(),
-                };
-
-                if let Some(state) = retry_state {
+                if let Some(state) = self.retry_mut(kind).as_mut() {
                     state.record_failure(err.clone(), max_backoff);
 
                     if state.attempts >= max_attempts {
                         let last_err = state.last_error.take().unwrap_or_else(|| err.clone());
                         let required = source_config.required;
 
-                        match kind {
-                            AudioSourceKind::System => {
-                                self.system_retry = None;
-                                if let Some(com) = self.com.as_mut() {
-                                    com.system_source = None;
-                                }
-                            }
-                            AudioSourceKind::Microphone => {
-                                self.microphone_retry = None;
-                                if let Some(com) = self.com.as_mut() {
-                                    com.microphone_source = None;
-                                }
-                            }
+                        *self.retry_mut(kind) = None;
+                        if let Some(com) = self.com.as_mut() {
+                            *com.source_mut(kind) = None;
                         }
 
                         if required {
@@ -405,31 +408,19 @@ impl WasapiEngine {
         kind: AudioSourceKind,
         out: &mut Vec<AudioEvent>,
     ) -> AudioResult<()> {
-        let retry_active = match kind {
-            AudioSourceKind::System => self.system_retry.is_some(),
-            AudioSourceKind::Microphone => self.microphone_retry.is_some(),
-        };
-        if retry_active {
+        if self.retry_ref(kind).is_some() {
             return Ok(());
         }
 
+        let required = self.source_config(kind).required;
+
         let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
-        let source_slot = match kind {
-            AudioSourceKind::System => &mut com.system_source,
-            AudioSourceKind::Microphone => &mut com.microphone_source,
-        };
-        let source = match source_slot.as_mut() {
+        let source = match com.source_mut(kind).as_mut() {
             Some(s) => s,
             None => return Ok(()),
         };
 
         let result = source.drain_packets();
-
-        let source_config = match kind {
-            AudioSourceKind::System => &self.config.system,
-            AudioSourceKind::Microphone => &self.config.microphone,
-        };
-        let required = source_config.required;
 
         match result {
             Ok(packets) => {
@@ -439,23 +430,13 @@ impl WasapiEngine {
             Err(err) if err.is_retryable() || err.requires_worker_reset() => {
                 self.begin_retry(kind, Some(err.clone()));
                 self.tick_source_retry(kind, out)?;
-                let still_retrying = match kind {
-                    AudioSourceKind::System => self.system_retry.is_some(),
-                    AudioSourceKind::Microphone => self.microphone_retry.is_some(),
-                };
-                if still_retrying {
+                if self.retry_ref(kind).is_some() {
                     Ok(())
                 } else {
-                    let source_gone = match kind {
-                        AudioSourceKind::System => self
-                            .com
-                            .as_ref()
-                            .map_or(true, |c| c.system_source.is_none()),
-                        AudioSourceKind::Microphone => self
-                            .com
-                            .as_ref()
-                            .map_or(true, |c| c.microphone_source.is_none()),
-                    };
+                    let source_gone = self
+                        .com
+                        .as_ref()
+                        .is_none_or(|c| c.source_ref(kind).is_none());
                     if source_gone && required {
                         Err(err)
                     } else {

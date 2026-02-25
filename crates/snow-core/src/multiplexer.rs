@@ -158,7 +158,6 @@ impl<O: Send + 'static> StreamMultiplexerBuilder<O> {
     {
         let send_timeout = source.send_timeout;
         let channel_capacity = source.channel_capacity;
-        let source_id = source.source_id;
 
         let spawn_fn = Box::new(move |sid: SourceId| {
             let (tx, rx) = cbc::bounded::<SourceMsg<O>>(channel_capacity);
@@ -173,11 +172,7 @@ impl<O: Send + 'static> StreamMultiplexerBuilder<O> {
         });
 
         self.sources.push(SourceRegistration {
-            config: SourceConfig {
-                source_id,
-                channel_capacity,
-                send_timeout,
-            },
+            config: source,
             spawn_fn,
         });
         self
@@ -292,6 +287,11 @@ impl<O> StreamMultiplexer<O> {
 // Forwarding thread
 // ---------------------------------------------------------------------------
 
+/// How long the forwarding thread waits for an event before checking
+/// for pending commands. Short enough for responsive command handling,
+/// long enough to avoid busy-spinning.
+const FWD_CMD_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 /// Per-source forwarding thread.
 ///
 /// Owns the leaf `StreamHandle` and a bounded channel sender. Reads events
@@ -310,11 +310,6 @@ fn forwarding_thread<E, H, F, O>(
     F: Fn(TaggedEvent<E>) -> SmallVec<[O; 2]> + Send,
     O: Send + 'static,
 {
-    /// How long the forwarding thread waits for an event before checking
-    /// for pending commands. Short enough for responsive command handling,
-    /// long enough to avoid busy-spinning.
-    const CMD_POLL_INTERVAL: Duration = Duration::from_millis(5);
-
     loop {
         // Process any pending commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -326,7 +321,7 @@ fn forwarding_thread<E, H, F, O>(
         }
 
         // Use recv_timeout so we periodically wake up to check for commands.
-        let event = match handle.recv_timeout(CMD_POLL_INTERVAL) {
+        let event = match handle.recv_timeout(FWD_CMD_POLL_INTERVAL) {
             Ok(e) => e,
             Err(e) => {
                 let e: crate::error::RecvTimeoutError = e.into();
@@ -371,18 +366,15 @@ fn forwarding_thread<E, H, F, O>(
 /// Main multiplexer loop.
 fn main_loop<O: Send + 'static>(
     config: MultiplexerConfig,
-    source_receivers: Vec<(SourceId, Receiver<SourceMsg<O>>)>,
-    source_cmd_txs: Vec<(SourceId, Sender<MuxCommand>)>,
-    join_handles: Vec<(SourceId, thread::JoinHandle<()>)>,
+    mut alive: Vec<(SourceId, Receiver<SourceMsg<O>>)>,
+    mut alive_cmd_txs: Vec<(SourceId, Sender<MuxCommand>)>,
+    mut joins: Vec<(SourceId, thread::JoinHandle<()>)>,
     output_tx: Sender<O>,
     cmd_rx: Receiver<MuxCommand>,
     status_tx: Sender<MuxStatus>,
     drop_counter: Arc<AtomicU64>,
 ) {
-    let total_sources = source_receivers.len();
-    let mut alive: Vec<(SourceId, Receiver<SourceMsg<O>>)> = source_receivers;
-    let mut alive_cmd_txs: Vec<(SourceId, Sender<MuxCommand>)> = source_cmd_txs;
-    let mut joins: Vec<(SourceId, thread::JoinHandle<()>)> = join_handles;
+    let total_sources = alive.len();
     let mut terminated_count: usize = 0;
     let mut stop_requested = false;
 
@@ -420,11 +412,7 @@ fn main_loop<O: Send + 'static>(
         // Audio-priority pre-drain.
         if let Some(prio_id) = priority_source {
             if let Some(prio_idx) = alive.iter().position(|(id, _)| *id == prio_id) {
-                let mut drained = 0;
-                loop {
-                    if drained >= config.priority_drain_batch {
-                        break;
-                    }
+                for _ in 0..config.priority_drain_batch {
                     match alive[prio_idx].1.try_recv() {
                         Ok(SourceMsg::Events(events)) => {
                             for item in events {
@@ -435,7 +423,6 @@ fn main_loop<O: Send + 'static>(
                                     &drop_counter,
                                 );
                             }
-                            drained += 1;
                         }
                         Ok(SourceMsg::StreamEnded) => {
                             let _ = status_tx.send(MuxStatus::SourceEnded(prio_id));
@@ -496,7 +483,7 @@ fn main_loop<O: Send + 'static>(
         // Remove terminated sources (reverse order to preserve indices).
         for &idx in to_remove.iter().rev() {
             let (sid, _) = alive.remove(idx);
-            remove_source_cmd_tx(&mut alive_cmd_txs, sid);
+            alive_cmd_txs.retain(|(id, _)| *id != sid);
         }
 
         // Check completion.
@@ -517,20 +504,8 @@ fn remove_source<O>(
     alive_cmd_txs: &mut Vec<(SourceId, Sender<MuxCommand>)>,
     sid: SourceId,
 ) {
-    if let Some(idx) = alive.iter().position(|(id, _)| *id == sid) {
-        alive.remove(idx);
-    }
-    remove_source_cmd_tx(alive_cmd_txs, sid);
-}
-
-/// Remove a source's command sender from the list.
-fn remove_source_cmd_tx(
-    alive_cmd_txs: &mut Vec<(SourceId, Sender<MuxCommand>)>,
-    sid: SourceId,
-) {
-    if let Some(idx) = alive_cmd_txs.iter().position(|(id, _)| *id == sid) {
-        alive_cmd_txs.remove(idx);
-    }
+    alive.retain(|(id, _)| *id != sid);
+    alive_cmd_txs.retain(|(id, _)| *id != sid);
 }
 
 /// Drain remaining events during shutdown, prioritizing the audio source.
@@ -558,7 +533,7 @@ fn shutdown_drain<O: Send + 'static>(
 
     // Phase 2: Drain remaining sources.
     for source in alive.iter() {
-        if config.priority_source.is_some_and(|p| p == source.0) {
+        if config.priority_source == Some(source.0) {
             continue;
         }
         drain_source(
@@ -637,15 +612,20 @@ fn check_panicked_forwarders(
     status_tx: &Sender<MuxStatus>,
     terminated_count: &mut usize,
 ) {
-    let remaining: Vec<(SourceId, thread::JoinHandle<()>)> = joins.drain(..).collect();
-    for (sid, handle) in remaining {
+    // drain(..) yields owned items directly — no intermediate Vec needed.
+    // We must collect unfinished handles to put them back.
+    let mut unfinished = Vec::new();
+    for (sid, handle) in joins.drain(..) {
         if handle.is_finished() {
             if handle.join().is_err() {
                 let _ = status_tx.send(MuxStatus::SourceForwarderPanicked(sid));
                 *terminated_count += 1;
             }
+        } else {
+            unfinished.push((sid, handle));
         }
     }
+    *joins = unfinished;
 }
 
 /// Send an output item with timeout. Drops and increments counter on failure.

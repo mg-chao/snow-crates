@@ -128,8 +128,10 @@ fn query_qpc_frequency() -> i64 {
     #[cfg(target_os = "windows")]
     {
         let mut freq = 0i64;
+        // SAFETY: QueryPerformanceFrequency writes to a valid i64 pointer
+        // and is always safe to call on Windows.
         unsafe {
-            let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&mut freq as *mut i64);
+            let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&raw mut freq);
         }
         freq
     }

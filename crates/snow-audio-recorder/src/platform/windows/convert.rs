@@ -91,14 +91,6 @@ impl AudioConverter {
         output: AudioFormat,
         resampler: Option<ResamplerKind>,
     ) -> AudioResult<Self> {
-        Self::build(input, output, resampler)
-    }
-
-    fn build(
-        input: NativeAudioFormat,
-        output: AudioFormat,
-        resampler: Option<ResamplerKind>,
-    ) -> AudioResult<Self> {
         output.validate()?;
         Ok(Self {
             input,

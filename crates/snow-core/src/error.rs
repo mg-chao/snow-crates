@@ -25,37 +25,33 @@ pub enum RecvTimeoutError {
     Disconnected,
 }
 
-impl std::fmt::Display for RecvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecvError::Disconnected => write!(f, "stream disconnected"),
+/// Implements `Display` and `Error` for a recv error enum.
+macro_rules! impl_recv_error {
+    ($ty:ident { $($variant:ident => $msg:literal),+ $(,)? }) => {
+        impl std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    $( $ty::$variant => write!(f, $msg), )+
+                }
+            }
         }
-    }
+        impl std::error::Error for $ty {}
+    };
 }
 
-impl std::error::Error for RecvError {}
+impl_recv_error!(RecvError {
+    Disconnected => "stream disconnected",
+});
 
-impl std::fmt::Display for TryRecvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TryRecvError::Empty => write!(f, "no events available"),
-            TryRecvError::Disconnected => write!(f, "stream disconnected"),
-        }
-    }
-}
+impl_recv_error!(TryRecvError {
+    Empty => "no events available",
+    Disconnected => "stream disconnected",
+});
 
-impl std::error::Error for TryRecvError {}
-
-impl std::fmt::Display for RecvTimeoutError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecvTimeoutError::Timeout => write!(f, "recv timed out"),
-            RecvTimeoutError::Disconnected => write!(f, "stream disconnected"),
-        }
-    }
-}
-
-impl std::error::Error for RecvTimeoutError {}
+impl_recv_error!(RecvTimeoutError {
+    Timeout => "recv timed out",
+    Disconnected => "stream disconnected",
+});
 
 /// Classification of errors for coordinator decision-making.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,10 +69,10 @@ pub trait Classify {
     fn class(&self) -> ErrorClass;
 }
 
-// From impls: std::sync::mpsc errors -> snow_core error types
+// From impls: channel library errors -> snow_core error types.
 // These live in snow-core (where the target types are defined) to satisfy
-// Rust's orphan rules. Leaf crates that use std::sync::mpsc channels
-// (e.g. snow-capture) get these conversions for free.
+// Rust's orphan rules. Leaf crates that use std::sync::mpsc or
+// crossbeam-channel get these conversions for free.
 
 impl From<std::sync::mpsc::RecvError> for RecvError {
     fn from(_: std::sync::mpsc::RecvError) -> Self {
@@ -101,11 +97,6 @@ impl From<std::sync::mpsc::RecvTimeoutError> for RecvTimeoutError {
         }
     }
 }
-
-// From impls: crossbeam-channel errors -> snow_core error types
-// These live in snow-core (where the target types are defined) to satisfy
-// Rust's orphan rules. Leaf crates that use crossbeam-channel
-// (e.g. snow-cursor-capture) get these conversions for free.
 
 impl From<crossbeam_channel::RecvError> for RecvError {
     fn from(_: crossbeam_channel::RecvError) -> Self {

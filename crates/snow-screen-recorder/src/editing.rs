@@ -130,35 +130,15 @@ impl EditingSession {
             build_mixed_audio(&self.manifest, &self.config, duration_ms)?
         };
 
-        match self.config.export.format {
-            ExportFormat::Mp4 => export_video(
-                &self.config.export.output_path,
-                &frames,
-                export_fps,
-                ExportFormat::Mp4,
-                mixed_audio.as_ref(),
-                self.manifest.audio_bitrate_kbps.max(8),
-                &self.config.export.video,
-            )?,
-            ExportFormat::Avi => export_video(
-                &self.config.export.output_path,
-                &frames,
-                export_fps,
-                ExportFormat::Avi,
-                mixed_audio.as_ref(),
-                self.manifest.audio_bitrate_kbps.max(8),
-                &self.config.export.video,
-            )?,
-            ExportFormat::Gif => export_video(
-                &self.config.export.output_path,
-                &frames,
-                export_fps,
-                ExportFormat::Gif,
-                None,
-                self.manifest.audio_bitrate_kbps.max(8),
-                &self.config.export.video,
-            )?,
-        }
+        export_video(
+            &self.config.export.output_path,
+            &frames,
+            export_fps,
+            self.config.export.format,
+            mixed_audio.as_ref(),
+            self.manifest.audio_bitrate_kbps.max(8),
+            &self.config.export.video,
+        )?;
 
         Ok(ExportResult {
             output_path: self.config.export.output_path,

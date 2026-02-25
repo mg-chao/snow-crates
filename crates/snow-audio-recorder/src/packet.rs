@@ -180,7 +180,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn packet_duration_and_qpc_range_are_consistent() {
         let mut packet = make_packet(960);
         packet.metadata.set_timing(None, Some(1_000_000));

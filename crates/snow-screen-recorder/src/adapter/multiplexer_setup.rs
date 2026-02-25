@@ -1,7 +1,6 @@
 //! Builds a `StreamMultiplexer<RecordingEvent>` from leaf crate stream handles.
 //!
-//! Replaces the per-source `StreamBridge` + crossbeam channel wiring with a
-//! single multiplexer that handles forwarding threads, per-source channels,
+//! The multiplexer handles forwarding threads, per-source channels,
 //! audio-priority drain, and select-based multiplexing internally.
 
 use std::time::Duration;
@@ -29,6 +28,7 @@ const AUDIO_CHANNEL_CAPACITY: usize = 4;
 /// Channel capacity for cursor source (standalone path).
 #[cfg(not(feature = "cursor"))]
 const CURSOR_CHANNEL_CAPACITY: usize = 4;
+
 /// Build a `StreamMultiplexer<RecordingEvent>` from the given leaf stream handles.
 ///
 /// Registers:
@@ -117,50 +117,46 @@ fn video_mapper(te: TaggedEvent<CaptureEvent>) -> SmallVec<[RecordingEvent; 2]> 
     let mut out = SmallVec::new();
 
     #[cfg(feature = "cursor")]
-    {
-        // Extract cursor lifecycle/data events before moving te.
-        let cursor_event: Option<CursorEvent> = match &te.event {
-            CaptureEvent::Frame(frame) => {
-                frame.metadata.cursor.as_ref().map(|cursor_data| {
-                    // Use frame timestamp; fall back to Instant::now() if absent.
-                    let ts = frame
-                        .metadata
-                        .stream_timestamp
-                        .clone()
-                        .unwrap_or_else(|| StreamTimestamp {
-                            instant: std::time::Instant::now(),
-                            raw_os_ticks: None,
-                            tick_format: TickFormat::RawQpc,
-                        });
-                    CursorEvent::Sample {
-                        sample: cursor_data.clone(),
-                        stream_timestamp: ts,
-                    }
-                })
-            }
-            CaptureEvent::Paused { at } => Some(CursorEvent::Paused { at: *at }),
-            CaptureEvent::Resumed { at, gap } => {
-                Some(CursorEvent::Resumed { at: *at, gap: *gap })
-            }
-            CaptureEvent::StreamEnded => Some(CursorEvent::StreamEnded),
-            CaptureEvent::Error(_) => Some(CursorEvent::Error(CursorCaptureError::platform(
-                "video stream failed",
-            ))),
-            // FrameDropped, ResolutionChanged: no cursor event
-            _ => None,
-        };
-
-        if let Some(ce) = cursor_event {
-            out.push(RecordingEvent::Cursor(TaggedEvent {
-                source: CURSOR_SOURCE,
-                event: ce,
-            }));
-        }
+    if let Some(ce) = extract_cursor_event(&te.event) {
+        out.push(RecordingEvent::Cursor(TaggedEvent {
+            source: CURSOR_SOURCE,
+            event: ce,
+        }));
     }
 
-    // Move the original tagged event — no clone of frame data.
     out.push(RecordingEvent::Video(te));
     out
+}
+
+/// Extract a `CursorEvent` from a `CaptureEvent` when the cursor feature
+/// is enabled. Returns `None` for events that carry no cursor information
+/// (e.g. `FrameDropped`, `ResolutionChanged`).
+#[cfg(feature = "cursor")]
+fn extract_cursor_event(event: &CaptureEvent) -> Option<CursorEvent> {
+    match event {
+        CaptureEvent::Frame(frame) => frame.metadata.cursor.as_ref().map(|cursor_data| {
+            let ts = frame
+                .metadata
+                .stream_timestamp
+                .clone()
+                .unwrap_or_else(|| StreamTimestamp {
+                    instant: std::time::Instant::now(),
+                    raw_os_ticks: None,
+                    tick_format: TickFormat::RawQpc,
+                });
+            CursorEvent::Sample {
+                sample: cursor_data.clone(),
+                stream_timestamp: ts,
+            }
+        }),
+        CaptureEvent::Paused { at } => Some(CursorEvent::Paused { at: *at }),
+        CaptureEvent::Resumed { at, gap } => Some(CursorEvent::Resumed { at: *at, gap: *gap }),
+        CaptureEvent::StreamEnded => Some(CursorEvent::StreamEnded),
+        CaptureEvent::Error(_) => Some(CursorEvent::Error(CursorCaptureError::platform(
+            "video stream failed",
+        ))),
+        _ => None,
+    }
 }
 
 /// Audio mapper: simple 1:1 wrapping in `RecordingEvent::Audio`.

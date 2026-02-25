@@ -14,14 +14,7 @@ use windows::core::HSTRING;
 use crate::device::{AudioDeviceInfo, DeviceFlow, DeviceSelector};
 use crate::error::{AudioError, AudioResult};
 
-use super::com::pwstr_to_string_and_free;
-
-fn platform_err<E>(err: E) -> AudioError
-where
-    E: Into<anyhow::Error>,
-{
-    AudioError::platform(err)
-}
+use super::com::{platform_err, pwstr_to_string_and_free};
 
 pub(crate) fn create_device_enumerator() -> AudioResult<IMMDeviceEnumerator> {
     let enumerator =

@@ -99,6 +99,33 @@ impl RecordingSession {
         })
     }
 
+    /// Lock the runtime mutex, mapping poison errors to `InvalidConfig`.
+    fn lock_runtime(&self) -> Result<std::sync::MutexGuard<'_, Option<RuntimeHandles>>> {
+        self.runtime
+            .lock()
+            .map_err(|_| ScreenRecorderError::InvalidConfig("runtime lock poisoned".to_string()))
+    }
+
+    /// Send a control command to the running worker, returning an error
+    /// if the runtime is not initialized or the worker has stopped.
+    fn send_control(&self, cmd: ControlCommand) -> Result<()> {
+        let guard = self.lock_runtime()?;
+        let runtime = guard.as_ref().ok_or_else(|| {
+            ScreenRecorderError::InvalidConfig("recording runtime is not initialized".to_string())
+        })?;
+        runtime
+            .control_tx
+            .send(cmd)
+            .map_err(|_| ScreenRecorderError::Encode("recording worker has stopped".to_string()))
+    }
+
+    /// Lock the capture_origin mutex, mapping poison errors to `InvalidConfig`.
+    fn lock_capture_origin(&self) -> Result<std::sync::MutexGuard<'_, (i32, i32)>> {
+        self.capture_origin
+            .lock()
+            .map_err(|_| ScreenRecorderError::InvalidConfig("capture_origin lock poisoned".to_string()))
+    }
+
     pub fn start(&mut self) -> Result<()> {
         if self.state() != RecordingState::Created {
             return Err(ScreenRecorderError::InvalidConfig(
@@ -108,12 +135,7 @@ impl RecordingSession {
 
         let capture_target = resolve_capture_target(&self.config.target)?;
         let origin = resolve_capture_origin(&self.config.target)?;
-        {
-            let mut guard = self.capture_origin.lock().map_err(|_| {
-                ScreenRecorderError::InvalidConfig("capture_origin lock poisoned".to_string())
-            })?;
-            *guard = origin;
-        }
+        *self.lock_capture_origin()? = origin;
 
         let capture_session = CaptureSession::builder()
             .capture_mode(CaptureMode::ScreenRecording)
@@ -167,10 +189,7 @@ impl RecordingSession {
             worker_handle,
         };
 
-        let mut guard = self
-            .runtime
-            .lock()
-            .map_err(|_| ScreenRecorderError::InvalidConfig("runtime lock poisoned".to_string()))?;
+        let mut guard = self.lock_runtime()?;
         *guard = Some(runtime);
         self.state
             .store(RecordingState::Running.as_u8(), Ordering::Release);
@@ -183,18 +202,7 @@ impl RecordingSession {
                 "pause is only allowed while recording is Running".to_string(),
             ));
         }
-
-        let guard = self
-            .runtime
-            .lock()
-            .map_err(|_| ScreenRecorderError::InvalidConfig("runtime lock poisoned".to_string()))?;
-        let runtime = guard.as_ref().ok_or_else(|| {
-            ScreenRecorderError::InvalidConfig("recording runtime is not initialized".to_string())
-        })?;
-        runtime
-            .control_tx
-            .send(ControlCommand::Pause)
-            .map_err(|_| ScreenRecorderError::Encode("recording worker has stopped".to_string()))?;
+        self.send_control(ControlCommand::Pause)?;
         self.state
             .store(RecordingState::Paused.as_u8(), Ordering::Release);
         Ok(())
@@ -206,28 +214,14 @@ impl RecordingSession {
                 "resume is only allowed while recording is Paused".to_string(),
             ));
         }
-
-        let guard = self
-            .runtime
-            .lock()
-            .map_err(|_| ScreenRecorderError::InvalidConfig("runtime lock poisoned".to_string()))?;
-        let runtime = guard.as_ref().ok_or_else(|| {
-            ScreenRecorderError::InvalidConfig("recording runtime is not initialized".to_string())
-        })?;
-        runtime
-            .control_tx
-            .send(ControlCommand::Resume)
-            .map_err(|_| ScreenRecorderError::Encode("recording worker has stopped".to_string()))?;
+        self.send_control(ControlCommand::Resume)?;
         self.state
             .store(RecordingState::Running.as_u8(), Ordering::Release);
         Ok(())
     }
 
     pub fn stop(self) -> Result<RecordingArtifact> {
-        let mut runtime_guard = self
-            .runtime
-            .lock()
-            .map_err(|_| ScreenRecorderError::InvalidConfig("runtime lock poisoned".to_string()))?;
+        let mut runtime_guard = self.lock_runtime()?;
         let runtime = runtime_guard.take().ok_or_else(|| {
             ScreenRecorderError::InvalidConfig("recording session was not started".to_string())
         })?;
@@ -244,9 +238,7 @@ impl RecordingSession {
 
         let outcome = worker_result?;
 
-        let (capture_origin_x, capture_origin_y) = *self.capture_origin.lock().map_err(|_| {
-            ScreenRecorderError::InvalidConfig("capture_origin lock poisoned".to_string())
-        })?;
+        let (capture_origin_x, capture_origin_y) = *self.lock_capture_origin()?;
 
         let manifest = SessionManifest {
             session_id: self.session_id.clone(),

@@ -41,13 +41,9 @@ pub(crate) fn run_mux_event_loop(
         // Poll multiplexer status (non-blocking) for source lifecycle.
         while let Ok(status) = multiplexer.try_recv_status() {
             match status {
-                MuxStatus::SourceEnded(sid) => {
-                    coordinator.mark_source_ended(sid);
-                }
-                MuxStatus::SourceDisconnected(sid) => {
-                    coordinator.mark_source_ended(sid);
-                }
-                MuxStatus::SourceForwarderPanicked(sid) => {
+                MuxStatus::SourceEnded(sid)
+                | MuxStatus::SourceDisconnected(sid)
+                | MuxStatus::SourceForwarderPanicked(sid) => {
                     coordinator.mark_source_ended(sid);
                 }
                 MuxStatus::Completed => {
@@ -86,19 +82,34 @@ pub(crate) fn run_mux_event_loop(
 
 /// Perform graceful shutdown using the multiplexer.
 ///
-/// Sends a Stop command to the multiplexer, then drains all remaining
-/// output events through the coordinator.
+/// Sends a Stop command, then drains all remaining output events and
+/// status notifications through the coordinator.
 pub(crate) fn mux_graceful_shutdown(
     coordinator: &mut RecordingCoordinator,
     multiplexer: &StreamMultiplexer<RecordingEvent>,
 ) -> Result<()> {
-    // Send stop to all sources via multiplexer.
     let _ = multiplexer.send_command(MuxCommand::Stop);
-
-    // Drain remaining output events.
     drain_mux_output(coordinator, multiplexer)?;
+    drain_mux_status(coordinator, multiplexer);
+    Ok(())
+}
 
-    // Drain any remaining status events.
+/// Drain all remaining events from the multiplexer output channel.
+fn drain_mux_output(
+    coordinator: &mut RecordingCoordinator,
+    multiplexer: &StreamMultiplexer<RecordingEvent>,
+) -> Result<()> {
+    while let Ok(event) = multiplexer.try_recv() {
+        coordinator.handle_event(event)?;
+    }
+    Ok(())
+}
+
+/// Drain remaining status notifications, marking sources as ended.
+fn drain_mux_status(
+    coordinator: &mut RecordingCoordinator,
+    multiplexer: &StreamMultiplexer<RecordingEvent>,
+) {
     while let Ok(status) = multiplexer.try_recv_status() {
         match status {
             MuxStatus::SourceEnded(sid)
@@ -109,17 +120,4 @@ pub(crate) fn mux_graceful_shutdown(
             MuxStatus::Completed => break,
         }
     }
-
-    Ok(())
-}
-
-/// Drain all remaining events from the multiplexer output channel.
-fn drain_mux_output(
-    coordinator: &mut RecordingCoordinator,
-    multiplexer: &StreamMultiplexer<RecordingEvent>,
-) -> Result<()> {
-    while let Ok(event) = multiplexer.try_recv() {
-        let _ = coordinator.handle_event(event)?;
-    }
-    Ok(())
 }

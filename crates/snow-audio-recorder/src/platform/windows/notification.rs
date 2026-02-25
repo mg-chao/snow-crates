@@ -7,17 +7,9 @@ use windows::Win32::Media::Audio::{
 };
 use windows::core::{PCWSTR, implement};
 
-use crate::error::{AudioError, AudioResult};
+use crate::error::AudioResult;
 
-use super::com::EventHandle;
-
-fn platform_err<E>(err: E) -> AudioError
-where
-    E: Into<anyhow::Error>,
-{
-    AudioError::platform(err)
-}
-
+use super::com::{EventHandle, platform_err};
 #[derive(Default)]
 pub(crate) struct NotificationState {
     render_default_changed: AtomicBool,

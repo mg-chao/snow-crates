@@ -1,3 +1,14 @@
+//! Cursor capture for screen recording.
+//!
+//! Provides two APIs:
+//! - [`CursorSampler`] — a synchronous, poll-based sampler for embedding
+//!   cursor data into an existing capture loop.
+//! - [`CursorStreamHandle`] — an asynchronous streaming handle that polls
+//!   on a dedicated thread and delivers [`CursorEvent`]s through a channel.
+//!
+//! Only Windows is currently supported; other platforms return
+//! [`CursorCaptureError::UnsupportedPlatform`].
+
 mod error;
 mod platform;
 pub mod streaming;
@@ -26,6 +37,21 @@ pub struct CursorShape {
     pub height: u32,
     pub composition_mode: CursorCompositionMode,
     pub shape_rgba: Vec<u8>,
+}
+
+impl CursorShape {
+    /// Construct from an internal `ShapePayload` and a precomputed shape id.
+    fn from_payload(shape_id: u64, p: ShapePayload) -> Self {
+        Self {
+            shape_id,
+            hotspot_x: p.hotspot_x,
+            hotspot_y: p.hotspot_y,
+            width: p.width,
+            height: p.height,
+            composition_mode: p.composition_mode,
+            shape_rgba: p.shape_rgba,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +128,11 @@ struct CursorProbe {
     shape: Option<ShapePayload>,
 }
 
+/// Synchronous, poll-based cursor sampler.
+///
+/// Each call to [`sample`](Self::sample) captures the current cursor state.
+/// Shape payloads are deduplicated: a [`CursorShape`] is only included in the
+/// returned [`CursorFrameSample`] the first time a given `shape_id` is seen.
 pub struct CursorSampler {
     inner: platform::CursorSamplerImpl,
     emitted_shape_ids: HashSet<u64>,
@@ -119,26 +150,7 @@ impl CursorSampler {
 
     pub fn sample(&mut self) -> Result<CursorFrameSample, CursorCaptureError> {
         let probe = self.inner.sample_cursor()?;
-        let mut shape_id = self.last_shape_id;
-        let mut shape = None;
-
-        if let Some(payload) = probe.shape {
-            let id = hash_shape_payload(&payload);
-            shape_id = Some(id);
-            self.last_shape_id = Some(id);
-
-            if self.emitted_shape_ids.insert(id) {
-                shape = Some(CursorShape {
-                    shape_id: id,
-                    hotspot_x: payload.hotspot_x,
-                    hotspot_y: payload.hotspot_y,
-                    width: payload.width,
-                    height: payload.height,
-                    composition_mode: payload.composition_mode,
-                    shape_rgba: payload.shape_rgba,
-                });
-            }
-        }
+        let (shape_id, shape) = self.resolve_shape(probe.shape);
 
         Ok(CursorFrameSample {
             position_x: probe.position_x,
@@ -148,10 +160,38 @@ impl CursorSampler {
             shape,
         })
     }
+
+    /// Resolves a raw shape payload into a deduplicated `(shape_id, shape)` pair.
+    fn resolve_shape(
+        &mut self,
+        payload: Option<ShapePayload>,
+    ) -> (Option<u64>, Option<CursorShape>) {
+        let Some(payload) = payload else {
+            return (self.last_shape_id, None);
+        };
+
+        let id = hash_shape_payload(&payload);
+        self.last_shape_id = Some(id);
+
+        let shape = if self.emitted_shape_ids.insert(id) {
+            Some(CursorShape::from_payload(id, payload))
+        } else {
+            None
+        };
+
+        (Some(id), shape)
+    }
 }
 
+/// Computes an FNV-1a 64-bit hash over all fields of a [`ShapePayload`].
+///
+/// This is used as a content-addressable shape identifier so that identical
+/// cursor shapes map to the same `shape_id` without requiring pixel-by-pixel
+/// comparison on every frame.
 fn hash_shape_payload(shape: &ShapePayload) -> u64 {
+    /// FNV-1a 64-bit offset basis.
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    /// FNV-1a 64-bit prime.
     const FNV_PRIME: u64 = 0x100000001b3;
 
     fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {

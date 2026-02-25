@@ -37,46 +37,31 @@ impl AudioPacketAlignment {
 }
 
 /// Build a [`TimestampAnchor`] from the first audio packet.
-/// Build a [`TimestampAnchor`] from the first audio packet.
 ///
 /// Derives the stream origin from `packet.metadata.stream_timestamp`,
 /// adjusting from packet-end to packet-start by subtracting the packet
-/// duration. Falls back to deprecated accessors when `stream_timestamp`
-/// is not populated (legacy path).
+/// duration.
 pub fn audio_anchor_from_first_packet(packet: &AudioPacket) -> TimestampAnchor {
-    if let Some(end_ts) = &packet.metadata.stream_timestamp {
-        // stream_timestamp represents the end of the packet.
-        // Derive the start (origin) by subtracting the packet duration.
-        let duration = packet.duration();
-        let origin_instant = end_ts
-            .instant
-            .checked_sub(duration)
-            .unwrap_or(end_ts.instant);
-        let origin_ticks = end_ts
-            .raw_os_ticks
-            .map(|t| t.saturating_sub(packet.duration_100ns()));
-        TimestampAnchor::new(StreamTimestamp {
-            instant: origin_instant,
-            raw_os_ticks: origin_ticks,
-            tick_format: end_ts.tick_format,
-        })
-    } else {
-        // Legacy fallback: use deprecated accessors.
-        #[allow(deprecated)]
-        let origin_qpc_100ns = packet
-            .start_qpc_position_100ns()
-            .or_else(|| packet.end_qpc_position_100ns());
-        #[allow(deprecated)]
-        let origin_instant = packet
-            .start_capture_time()
-            .or_else(|| packet.end_capture_time())
-            .unwrap_or_else(Instant::now);
-        TimestampAnchor::new(StreamTimestamp {
-            instant: origin_instant,
-            raw_os_ticks: origin_qpc_100ns,
-            tick_format: TickFormat::Hns100,
-        })
-    }
+    let end_ts = packet
+        .metadata
+        .stream_timestamp
+        .as_ref()
+        .expect("stream_timestamp must be set on every AudioPacket");
+
+    let duration = packet.duration();
+    let origin_instant = end_ts
+        .instant
+        .checked_sub(duration)
+        .unwrap_or(end_ts.instant);
+    let origin_ticks = end_ts
+        .raw_os_ticks
+        .map(|t| t.saturating_sub(packet.duration_100ns()));
+
+    TimestampAnchor::new(StreamTimestamp {
+        instant: origin_instant,
+        raw_os_ticks: origin_ticks,
+        tick_format: end_ts.tick_format,
+    })
 }
 
 
@@ -117,25 +102,13 @@ impl AudioTimestampAnchorExt for TimestampAnchor {
     fn audio_stream_relative(&self, packet: &AudioPacket) -> AudioPacketTimestamp {
         let packet_duration = packet.duration();
 
-        let end = if let Some(end_ts) = &packet.metadata.stream_timestamp {
-            // Primary path: use TimestampAnchor::stream_relative on the
-            // packet's stream_timestamp (which represents packet-end time).
-            self.stream_relative(end_ts)
-        } else {
-            // Legacy fallback: use deprecated accessors when stream_timestamp
-            // is not populated. This path will be removed once deprecated
-            // fields are cleaned up.
-            #[allow(deprecated)]
-            if let (Some(origin), Some(packet_end)) =
-                (self.origin().raw_os_ticks, packet.end_qpc_position_100ns())
-            {
-                hns_delta_to_duration(packet_end.saturating_sub(origin).max(0))
-            } else {
-                packet_end_instant(packet)
-                    .unwrap_or_else(Instant::now)
-                    .saturating_duration_since(self.origin().instant)
-            }
-        };
+        let end_ts = packet
+            .metadata
+            .stream_timestamp
+            .as_ref()
+            .expect("stream_timestamp must be set on every AudioPacket");
+
+        let end = self.stream_relative(end_ts);
 
         AudioPacketTimestamp {
             start: end.saturating_sub(packet_duration),
@@ -200,22 +173,6 @@ pub fn align_i16_interleaved_to_duration(
         samples.truncate(target_samples);
     }
     samples
-}
-
-fn packet_end_instant(packet: &AudioPacket) -> Option<Instant> {
-    packet.end_capture_time().or_else(|| {
-        packet
-            .start_capture_time()
-            .and_then(|start| start.checked_add(packet.duration()))
-    })
-}
-
-fn hns_delta_to_duration(delta_100ns: i64) -> Duration {
-    if delta_100ns <= 0 {
-        return Duration::ZERO;
-    }
-    let nanos = (delta_100ns as u128).saturating_mul(100u128);
-    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
 }
 
 #[cfg(test)]

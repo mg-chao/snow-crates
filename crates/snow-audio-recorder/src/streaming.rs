@@ -402,23 +402,22 @@ fn push_event_with_drop_notice(
         let _ = queue.push(pressure_event);
     }
 
-    if let Some(dropped) = outcome.dropped {
-        if let Some((source, dropped_frames)) = dropped_packet_info(&dropped) {
-            record_dropped_packet(stats, dropped_frames);
-            let notice_outcome = queue.push(AudioEvent::PacketDropped {
-                source,
-                dropped_frames,
-            });
-            stats
-                .buffer_fill
-                .store(notice_outcome.len as u64, Ordering::Release);
-            if let Some(dropped_notice_target) = notice_outcome.dropped {
-                if let Some((_, secondary_dropped_frames)) =
-                    dropped_packet_info(&dropped_notice_target)
-                {
-                    record_dropped_packet(stats, secondary_dropped_frames);
-                }
-            }
+    if let Some(dropped) = outcome.dropped
+        && let Some((source, dropped_frames)) = dropped_packet_info(&dropped)
+    {
+        record_dropped_packet(stats, dropped_frames);
+        let notice_outcome = queue.push(AudioEvent::PacketDropped {
+            source,
+            dropped_frames,
+        });
+        stats
+            .buffer_fill
+            .store(notice_outcome.len as u64, Ordering::Release);
+        if let Some(dropped_notice_target) = notice_outcome.dropped
+            && let Some((_, secondary_dropped_frames)) =
+                dropped_packet_info(&dropped_notice_target)
+        {
+            record_dropped_packet(stats, secondary_dropped_frames);
         }
     }
 }
@@ -440,7 +439,6 @@ fn record_dropped_packet(stats: &AudioStreamStats, dropped_frames: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     use crate::backend::EngineEvent;
     use crate::error::{AudioError, AudioResult};
@@ -448,14 +446,14 @@ mod tests {
     use crate::packet::{AudioPacket, AudioPacketMetadata, AudioSourceKind};
 
     struct ScriptedEngine {
-        cursor: AtomicUsize,
+        cursor: usize,
         events: Vec<EngineEvent>,
     }
 
     impl ScriptedEngine {
         fn new(events: Vec<EngineEvent>) -> Self {
             Self {
-                cursor: AtomicUsize::new(0),
+                cursor: 0,
                 events,
             }
         }
@@ -463,13 +461,13 @@ mod tests {
 
     impl AudioRecorderEngine for ScriptedEngine {
         fn poll(&mut self, _timeout: Duration) -> AudioResult<EngineEvent> {
-            let idx = self.cursor.fetch_add(1, Ordering::Relaxed);
+            let idx = self.cursor;
+            self.cursor += 1;
             if let Some(ev) = self.events.get(idx) {
                 match ev {
                     EngineEvent::Idle => Ok(EngineEvent::Idle),
                     EngineEvent::Events(events) => {
-                        let cloned = events.iter().map(|e| e.clone()).collect();
-                        Ok(EngineEvent::Events(cloned))
+                        Ok(EngineEvent::Events(events.clone()))
                     }
                 }
             } else {

@@ -141,12 +141,18 @@ mod tests {
         let format = AudioFormat::new(48_000, 2, AudioSampleFormat::I16);
         let byte_count = (frames as usize) * 2 * 2; // 2 channels * 2 bytes per sample
         let bytes = vec![0u8; byte_count];
+        let mut metadata = AudioPacketMetadata::default();
+        metadata.stream_timestamp = Some(snow_core::timestamp::StreamTimestamp {
+            instant: Instant::now(),
+            raw_os_ticks: None,
+            tick_format: snow_core::timestamp::TickFormat::Hns100,
+        });
         let packet = AudioPacket {
             source,
             format,
             frames,
             data: bytes.clone(),
-            metadata: AudioPacketMetadata::default(),
+            metadata,
         };
         (packet, bytes)
     }

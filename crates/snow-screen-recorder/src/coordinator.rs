@@ -22,11 +22,12 @@ use crate::recording::{WorkerOutcome, audio_packet_to_i16_le_bytes};
 use crate::timeline::PauseTimeline;
 
 /// Coordinates the recording pipeline.
+/// Coordinates the recording pipeline.
 ///
 /// Owns the pause timeline, receives unified events, and dispatches
-/// to the appropriate processor. Tracks stream-ended states for all
-/// three data streams (video, audio, cursor) and evaluates termination
-/// conditions in precedence order.
+/// to the appropriate processor. Tracks stream-ended states via
+/// `ended_sources` and evaluates termination conditions in precedence
+/// order.
 pub(crate) struct RecordingCoordinator {
     timeline: PauseTimeline,
     video: VideoProcessor,
@@ -34,9 +35,6 @@ pub(crate) struct RecordingCoordinator {
     cursor: CursorProcessor,
     last_observed_ts_ms: Option<u64>,
     frame_interval_ms: u32,
-    capture_ended: bool,
-    audio_ended: bool,
-    cursor_ended: bool,
     /// Set when a fatal error has been received from any stream.
     fatal_error: bool,
     /// Set when an `InvalidConfig` error has been received.
@@ -45,9 +43,10 @@ pub(crate) struct RecordingCoordinator {
     control_stop: bool,
     /// The set of source IDs that were registered at startup.
     active_sources: HashSet<SourceId>,
-    /// The set of source IDs whose streams have ended.
+    /// The single source of truth for which streams have ended.
     ended_sources: HashSet<SourceId>,
 }
+
 
 impl RecordingCoordinator {
     /// Create a new `RecordingCoordinator`.
@@ -68,9 +67,6 @@ impl RecordingCoordinator {
             cursor,
             last_observed_ts_ms: None,
             frame_interval_ms,
-            capture_ended: false,
-            audio_ended: false,
-            cursor_ended: false,
             fatal_error: false,
             invalid_config_error: false,
             control_stop: false,
@@ -78,7 +74,6 @@ impl RecordingCoordinator {
             ended_sources: HashSet::new(),
         }
     }
-
 
     /// Dispatch a unified recording event to the correct processor.
     ///
@@ -95,43 +90,27 @@ impl RecordingCoordinator {
     }
 
     /// Handle a control-plane command, separate from data-plane routing.
+    ///
+    /// Pause/Resume are acknowledged but do not mutate the timeline —
+    /// authoritative timestamps come from the backend via capture events.
     pub(crate) fn handle_control(&mut self, cmd: ControlCommand) -> Result<EventAction> {
-        match cmd {
-            ControlCommand::Pause => {
-                // In the new architecture the actual pause timestamp comes
-                // from the backend via CaptureEvent::Paused. The
-                // control command is acknowledged but does not mutate the
-                // timeline directly.
-            }
-            ControlCommand::Resume => {
-                // Same as Pause — the backend provides the authoritative
-                // resume timestamp via CaptureEvent::Resumed.
-            }
-            ControlCommand::Stop => {
-                self.control_stop = true;
-            }
+        if let ControlCommand::Stop = cmd {
+            self.control_stop = true;
         }
         Ok(self.evaluate_termination())
     }
 
-    /// Returns `true` when all three data streams have ended.
+    /// Returns `true` when all registered active sources have ended.
     pub(crate) fn all_streams_ended(&self) -> bool {
-        self.capture_ended && self.audio_ended && self.cursor_ended
+        self.active_sources
+            .iter()
+            .all(|s| self.ended_sources.contains(s))
     }
 
     /// Mark a source as ended (used by the multiplexer-based event loop
     /// when receiving `MuxStatus` events).
     pub(crate) fn mark_source_ended(&mut self, source: SourceId) {
         self.ended_sources.insert(source);
-        // Keep the legacy boolean flags in sync for backward compatibility
-        // with `all_streams_ended()` and test helpers.
-        if source == VIDEO_SOURCE {
-            self.capture_ended = true;
-        } else if source == AUDIO_SOURCE {
-            self.audio_ended = true;
-        } else if source == CURSOR_SOURCE {
-            self.cursor_ended = true;
-        }
     }
 
     /// Override the active source set. Called during multiplexer setup
@@ -140,16 +119,12 @@ impl RecordingCoordinator {
         self.active_sources = sources.into_iter().collect();
     }
 
-    /// Evaluate termination conditions in precedence order and return
-    /// `EventAction::Stop` for the highest-priority satisfied condition.
+    /// Evaluate termination conditions in precedence order.
     ///
     /// Precedence (highest first):
-    /// 1. `FatalError` (any stream reported a fatal or invalid-config error)
-    /// 2. `ControlStop`
-    /// 3. `AllStreamsEnded`
-    ///
-    /// `AllChannelsDisconnected` is not evaluated here — it is detected
-    /// by the event loop when all crossbeam receivers disconnect.
+    /// 1. Fatal or invalid-config error
+    /// 2. Control stop
+    /// 3. All registered sources ended
     pub(crate) fn evaluate_termination(&self) -> EventAction {
         if self.fatal_error || self.invalid_config_error {
             return EventAction::Stop;
@@ -203,19 +178,19 @@ impl RecordingCoordinator {
     #[cfg(test)]
     /// Whether the capture (video) stream has ended.
     pub(crate) fn capture_ended(&self) -> bool {
-        self.capture_ended
+        self.ended_sources.contains(&VIDEO_SOURCE)
     }
 
     #[cfg(test)]
     /// Whether the audio stream has ended.
     pub(crate) fn audio_ended(&self) -> bool {
-        self.audio_ended
+        self.ended_sources.contains(&AUDIO_SOURCE)
     }
 
     #[cfg(test)]
     /// Whether the cursor stream has ended.
     pub(crate) fn cursor_ended(&self) -> bool {
-        self.cursor_ended
+        self.ended_sources.contains(&CURSOR_SOURCE)
     }
 
     /// Finalize the recording, producing a `WorkerOutcome`.
@@ -230,7 +205,7 @@ impl RecordingCoordinator {
         let final_ts_ms = self.timeline.active_elapsed_ms(at);
         self.observe_video_time(final_ts_ms);
 
-        if let Some(encoder) = self.video.take_preview_encoder() {
+        if let Some(encoder) = self.video.take_encoder() {
             let tail_rgba = self.video.last_encoded_rgba();
             encoder.finalize(final_ts_ms, tail_rgba)?;
         }
@@ -256,7 +231,6 @@ impl RecordingCoordinator {
 
         Ok((outcome, mouse_store))
     }
-
 
     fn handle_video(&mut self, event: CaptureEvent) -> Result<()> {
         match event {
@@ -301,18 +275,10 @@ impl RecordingCoordinator {
             }
 
             CaptureEvent::Error(err) => {
-                let error_class = Classify::class(&err);
-
-                match error_class {
-                    ErrorClass::Fatal => {
-                        self.fatal_error = true;
-                    }
-                    ErrorClass::Transient => {
-                        self.capture_ended = true;
-                    }
-                    ErrorClass::InvalidConfig => {
-                        self.invalid_config_error = true;
-                    }
+                match Classify::class(&err) {
+                    ErrorClass::Fatal => self.fatal_error = true,
+                    ErrorClass::Transient => self.mark_source_ended(VIDEO_SOURCE),
+                    ErrorClass::InvalidConfig => self.invalid_config_error = true,
                 }
                 Ok(())
             }
@@ -362,18 +328,10 @@ impl RecordingCoordinator {
             }
 
             AudioEvent::Error(err) => {
-                let error_class = Classify::class(&err);
-
-                match error_class {
-                    ErrorClass::Fatal => {
-                        self.fatal_error = true;
-                    }
-                    ErrorClass::Transient => {
-                        self.audio_ended = true;
-                    }
-                    ErrorClass::InvalidConfig => {
-                        self.invalid_config_error = true;
-                    }
+                match Classify::class(&err) {
+                    ErrorClass::Fatal => self.fatal_error = true,
+                    ErrorClass::Transient => self.mark_source_ended(AUDIO_SOURCE),
+                    ErrorClass::InvalidConfig => self.invalid_config_error = true,
                 }
                 Ok(())
             }
@@ -403,7 +361,6 @@ impl RecordingCoordinator {
 
             CursorEvent::Error(_err) => {
                 // Cursor errors are always non-fatal — mark ended and continue.
-                self.cursor_ended = true;
                 self.mark_source_ended(CURSOR_SOURCE);
                 Ok(())
             }
@@ -464,13 +421,13 @@ mod tests {
         let mut coord = test_coordinator();
         assert!(!coord.all_streams_ended());
 
-        coord.capture_ended = true;
+        coord.mark_source_ended(VIDEO_SOURCE);
         assert!(!coord.all_streams_ended());
 
-        coord.audio_ended = true;
+        coord.mark_source_ended(AUDIO_SOURCE);
         assert!(!coord.all_streams_ended());
 
-        coord.cursor_ended = true;
+        coord.mark_source_ended(CURSOR_SOURCE);
         assert!(coord.all_streams_ended());
     }
 
@@ -490,9 +447,9 @@ mod tests {
             EventAction::Continue
         ));
 
-        coord.capture_ended = true;
-        coord.audio_ended = true;
-        coord.cursor_ended = true;
+        coord.mark_source_ended(VIDEO_SOURCE);
+        coord.mark_source_ended(AUDIO_SOURCE);
+        coord.mark_source_ended(CURSOR_SOURCE);
         assert!(matches!(coord.evaluate_termination(), EventAction::Stop));
 
         coord.control_stop = true;
@@ -1218,8 +1175,6 @@ mod tests {
         ) {
             use snow_cursor_capture::CursorFrameSample;
             use snow_core::timestamp::{StreamTimestamp as CoreStreamTimestamp, TickFormat};
-            use snow_core::event::TaggedEvent;
-            use smallvec::SmallVec;
 
             let frame_ts = CoreStreamTimestamp {
                 instant: Instant::now(),
@@ -1240,14 +1195,7 @@ mod tests {
             frame.metadata.stream_timestamp = Some(frame_ts.clone());
             frame.metadata.cursor = Some(cursor_data.clone());
 
-            // Run through the video mapper.
-            let tagged = TaggedEvent {
-                source: VIDEO_SOURCE,
-                event: CaptureEvent::Frame(frame),
-            };
-
-            // Call the video_mapper indirectly by simulating what it does:
-            // Extract cursor event from the frame.
+            // Extract cursor event from the frame (simulating video_mapper).
             let cursor_event = CursorEvent::Sample {
                 sample: cursor_data,
                 stream_timestamp: frame_ts.clone(),
