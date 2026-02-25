@@ -34,9 +34,8 @@ pub enum CaptureTarget {
 
 pub use backend::CaptureMode;
 pub use capture_session::{CaptureSession, CaptureSessionBuilder, CaptureSessionConfig};
-#[allow(deprecated)]
 pub use frame::{
-    CaptureEvent, ColorSpace, DirtyRect, FrameMetadata, FrameTimestampAnchor,
+    CaptureEvent, ColorSpace, DirtyRect, FrameMetadata,
 };
 #[cfg(feature = "cursor")]
 pub use frame::{CursorCompositionMode, CursorData, CursorFrameSample, CursorShape};

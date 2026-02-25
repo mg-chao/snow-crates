@@ -16,6 +16,8 @@ rayon = "1.11.0"
 rustc-hash = "2.1.1"
 tokio = { version = "1.49.0", default-features = false }
 windows = "0.62.2"
+crossbeam-channel = "0.5"
+smallvec = "1"
 windows-core = "0.62.2"
 
 [profile.release]

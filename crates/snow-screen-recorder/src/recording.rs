@@ -392,13 +392,12 @@ fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
     }
 }
 
-#[allow(deprecated)]
 pub(crate) struct PcmTrackWriter {
     writer: BufWriter<File>,
     sample_rate_hz: u32,
     channels: u16,
     written_frames: u64,
-    anchor: snow_audio_recorder::AudioTimestampAnchor,
+    anchor: snow_core::timestamp::TimestampAnchor,
 }
 
 impl PcmTrackWriter {
@@ -866,91 +865,37 @@ fn new_recording_worker(
     let cursor = CursorProcessor::new(capture_origin_x, capture_origin_y);
     let timeline = PauseTimeline::new(started_at);
 
-    let coordinator = RecordingCoordinator::new(
+    let mut coordinator = RecordingCoordinator::new(
         timeline, video, audio, cursor, frame_interval_ms,
     );
 
-    let (senders, receivers) = crate::adapter::create_adapter_channels();
-
-    // Determine whether cursor data is embedded in video frames.
-    // When the `cursor` feature is enabled, the video mapper extracts
-    // embedded cursor data from frames and sends it on `cursor_tx`.
-    #[cfg(feature = "cursor")]
-    let cursor_tx_for_video = Some(senders.cursor_tx.clone());
+    // --- Build multiplexer ---
+    // Resolve standalone cursor handle (only when cursor feature is disabled).
     #[cfg(not(feature = "cursor"))]
-    let cursor_tx_for_video: Option<crossbeam_channel::Sender<crate::event::RecordingEvent>> = None;
+    let cursor_handle: Option<snow_cursor_capture::CursorStreamHandle> = {
+        match snow_cursor_capture::CursorStreamHandle::start(
+            snow_cursor_capture::CursorStreamConfig {
+                poll_interval: Duration::from_secs(1) / config.fps.max(1),
+                ..Default::default()
+            },
+        ) {
+            Ok(handle) => Some(handle),
+            Err(_) => None,
+        }
+    };
 
-    let send_timeout = Duration::from_millis(10);
-
-    let video_mapper = crate::adapter::video::create_video_mapper(cursor_tx_for_video);
-    let video_adapter = crate::adapter::stream_bridge::StreamBridge::start(
+    let (multiplexer, active_sources) = crate::adapter::multiplexer_setup::build_multiplexer(
         capture_stream,
-        video_mapper,
-        senders.video_tx,
-        send_timeout,
-        "snow-video-bridge",
-    )?;
+        audio_stream,
+        #[cfg(not(feature = "cursor"))]
+        cursor_handle,
+    );
 
-    let audio_adapter = match audio_stream {
-        Some(handle) => {
-            let audio_mapper = crate::adapter::audio::create_audio_mapper();
-            Some(crate::adapter::stream_bridge::StreamBridge::start(
-                handle,
-                audio_mapper,
-                senders.audio_tx,
-                send_timeout,
-                "snow-audio-bridge",
-            )?)
-        }
-        None => {
-            // Drop the audio sender so the channel disconnects immediately.
-            drop(senders.audio_tx);
-            None
-        }
-    };
+    coordinator.set_active_sources(active_sources);
 
-    // Start cursor adapter (only when cursor feature is disabled, since
-    // with cursor feature enabled, cursor data is embedded in video frames
-    // and extracted by the video adapter).
-    #[cfg(feature = "cursor")]
-    let cursor_adapter: Option<Box<dyn crate::adapter::StreamAdapter>> = None;
-    #[cfg(not(feature = "cursor"))]
-    let cursor_adapter: Option<Box<dyn crate::adapter::StreamAdapter>> = {
-        match snow_cursor_capture::CursorSampler::new() {
-            Ok(sampler) => Some(Box::new(
-                crate::adapter::cursor::CursorStreamAdapter::start(
-                    sampler,
-                    senders.cursor_tx,
-                    config.fps.max(1),
-                )?,
-            )),
-            Err(_) => {
-                drop(senders.cursor_tx);
-                None
-            }
-        }
-    };
+    let mut coordinator = event_loop::run_mux_event_loop(coordinator, &multiplexer, &control_rx)?;
 
-    // If cursor feature is enabled and no standalone cursor adapter,
-    // the cursor_tx sender was already cloned for the video adapter.
-    // Drop the original so the channel can disconnect when the video
-    // adapter finishes.
-    #[cfg(feature = "cursor")]
-    drop(senders.cursor_tx);
-
-    let mut adapters = crate::adapter::RecordingAdapters {
-        video_rx: receivers.video_rx,
-        audio_rx: receivers.audio_rx,
-        cursor_rx: receivers.cursor_rx,
-        control_rx,
-        video_adapter: Box::new(video_adapter),
-        audio_adapter: audio_adapter.map(|a| Box::new(a) as Box<dyn crate::adapter::StreamAdapter>),
-        cursor_adapter,
-    };
-
-    let mut coordinator = event_loop::run_event_loop(coordinator, &adapters)?;
-
-    event_loop::graceful_shutdown(&mut coordinator, &mut adapters)?;
+    event_loop::mux_graceful_shutdown(&mut coordinator, &multiplexer)?;
 
     let finalize_at = Instant::now();
     let (outcome, mouse_store) = coordinator.finalize(finalize_at)?;

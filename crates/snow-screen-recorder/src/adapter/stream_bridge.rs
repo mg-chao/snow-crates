@@ -261,9 +261,18 @@ mod tests {
     use std::time::Duration;
 
     use crate::adapter::StreamAdapter;
-    use crate::event::{RecordingEvent, VideoCaptureEvent};
+    use crate::event::RecordingEvent;
+    use snow_capture::CaptureEvent;
+    use snow_core::event::{SourceId, TaggedEvent};
 
     use super::StreamBridge;
+
+    fn tagged_video(event: CaptureEvent) -> RecordingEvent {
+        RecordingEvent::Video(TaggedEvent {
+            source: SourceId(0),
+            event,
+        })
+    }
 
     struct MockStreamHandle<E: Clone + Send> {
         events: Vec<E>,
@@ -433,7 +442,7 @@ mod tests {
 
         let mut bridge = StreamBridge::start(
             handle,
-            |_v: u8| RecordingEvent::Video(VideoCaptureEvent::FrameDropped { sequence: 1 }),
+            |_v: u8| tagged_video(CaptureEvent::FrameDropped { sequence: 1 }),
             event_tx,
             Duration::from_millis(10),
             "test-hot-stream-bridge",
@@ -479,7 +488,7 @@ mod tests {
 
             let mut bridge = StreamBridge::start(
                 handle,
-                |v: u32| RecordingEvent::Video(VideoCaptureEvent::FrameDropped { sequence: v as u64 }),
+                |v: u32| tagged_video(CaptureEvent::FrameDropped { sequence: v as u64 }),
                 event_tx,
                 Duration::from_millis(100),
                 "test-bridge",
@@ -491,8 +500,12 @@ mod tests {
             let mut received = Vec::new();
             while let Ok(evt) = event_rx.try_recv() {
                 match evt {
-                    RecordingEvent::Video(VideoCaptureEvent::FrameDropped { sequence }) => {
-                        received.push(sequence);
+                    RecordingEvent::Video(tagged) => {
+                        if let CaptureEvent::FrameDropped { sequence } = tagged.event {
+                            received.push(sequence);
+                        } else {
+                            panic!("unexpected CaptureEvent variant");
+                        }
                     }
                     _ => panic!("unexpected event variant"),
                 }

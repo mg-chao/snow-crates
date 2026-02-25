@@ -2262,9 +2262,8 @@ impl WindowsGraphicsCaptureCapturer {
         self.region.blit = None;
 
         let mut out = reuse.unwrap_or_else(Frame::empty);
-        #[allow(deprecated)]
         let destination_has_history =
-            out.metadata.capture_time.is_some() && !out.as_rgba_bytes().is_empty();
+            out.metadata.stream_timestamp.is_some() && !out.as_rgba_bytes().is_empty();
         let single_shot_screenshot =
             self.capture_mode == CaptureMode::Screenshot && !destination_has_history;
         out.reset_metadata();

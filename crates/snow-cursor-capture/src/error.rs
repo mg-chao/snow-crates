@@ -22,3 +22,15 @@ impl fmt::Display for CursorCaptureError {
 }
 
 impl std::error::Error for CursorCaptureError {}
+
+impl snow_core::error::Classify for CursorCaptureError {
+    fn class(&self) -> snow_core::error::ErrorClass {
+        match self {
+            Self::UnsupportedPlatform => snow_core::error::ErrorClass::InvalidConfig,
+            // Cannot reliably distinguish transient vs fatal from a string message;
+            // default to Transient for parity with current recorder behavior.
+            Self::Platform(_) => snow_core::error::ErrorClass::Transient,
+        }
+    }
+}
+

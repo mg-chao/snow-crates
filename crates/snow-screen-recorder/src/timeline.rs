@@ -6,11 +6,11 @@ use crate::artifact::PauseInterval;
 ///
 /// `PauseTimeline` is mutated exclusively by video-capture backend timestamps:
 /// - [`mark_pause`](Self::mark_pause) — called with the `at` field from
-///   `VideoCaptureEvent::Paused { at }` (or `CaptureEvent::Paused { at }`)
+///   `CaptureEvent::Paused { at }`
 /// - [`mark_resume`](Self::mark_resume) — called with the `at` field from
-///   `VideoCaptureEvent::Resumed { at, .. }` (or `CaptureEvent::Resumed { at, .. }`)
+///   `CaptureEvent::Resumed { at, .. }`
 ///
-/// Audio lifecycle events (`AudioCaptureEvent::Paused`, `AudioCaptureEvent::Resumed`,
+/// Audio lifecycle events (`AudioEvent::Paused`, `AudioEvent::Resumed`,
 /// etc.) must **not** directly modify timeline state. Audio processors may *read*
 /// the timeline for timestamp alignment, but never write to it.
 #[derive(Debug)]
@@ -34,7 +34,7 @@ impl PauseTimeline {
     /// Record the start of a pause interval.
     ///
     /// Must be called with a backend-provided `Instant` from
-    /// `VideoCaptureEvent::Paused { at }`, **not** `Instant::now()`.
+    /// `CaptureEvent::Paused { at }`, **not** `Instant::now()`.
     /// Using the backend timestamp ensures the pause point reflects the
     /// actual capture-pipeline pause, not the coordinator's processing
     /// latency.
@@ -47,7 +47,7 @@ impl PauseTimeline {
     /// Record the end of a pause interval and accumulate paused duration.
     ///
     /// Must be called with a backend-provided `Instant` from
-    /// `VideoCaptureEvent::Resumed { at, .. }`, **not** `Instant::now()`.
+    /// `CaptureEvent::Resumed { at, .. }`, **not** `Instant::now()`.
     /// The interval `[pause_start, at)` is appended to the timeline and
     /// its duration is added to `total_paused`.
     pub fn mark_resume(&mut self, at: Instant) {

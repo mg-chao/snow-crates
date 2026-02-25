@@ -21,6 +21,7 @@ zstd = "0.13.3"
 ffmpeg-next = "8.0.0"
 uuid = { version = "1.18.1", features = ["v4"] }
 crossbeam-channel = "0.5.15"
+smallvec.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

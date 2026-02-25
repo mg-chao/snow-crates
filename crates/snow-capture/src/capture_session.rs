@@ -700,10 +700,9 @@ impl CaptureSession {
                 };
 
                 copy_region_rgba(&monitor_frame, entry.blit, &mut out_frame)?;
-                #[allow(deprecated)]
                 let sample = CaptureSampleMetadata {
-                    capture_time: monitor_frame.metadata.capture_time,
-                    present_time_qpc: monitor_frame.metadata.present_time_qpc,
+                    capture_time: monitor_frame.metadata.stream_timestamp.as_ref().map(|st| st.instant),
+                    present_time_qpc: monitor_frame.metadata.stream_timestamp.as_ref().and_then(|st| st.raw_os_ticks),
                     is_duplicate: monitor_frame.metadata.is_duplicate,
                 };
                 self.region_fallback_frames
@@ -815,10 +814,9 @@ mod tests {
 
     impl MonitorCapturer for MetadataDrivenCapturer {
         fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
-            #[allow(deprecated)]
             let inferred_history = reuse
                 .as_ref()
-                .is_some_and(|frame| frame.metadata.capture_time.is_some())
+                .is_some_and(|frame| frame.metadata.stream_timestamp.is_some())
                 && reuse
                     .as_ref()
                     .is_some_and(|frame| !frame.as_rgba_bytes().is_empty());

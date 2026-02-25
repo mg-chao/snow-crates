@@ -101,3 +101,32 @@ impl From<std::sync::mpsc::RecvTimeoutError> for RecvTimeoutError {
         }
     }
 }
+
+// From impls: crossbeam-channel errors -> snow_core error types
+// These live in snow-core (where the target types are defined) to satisfy
+// Rust's orphan rules. Leaf crates that use crossbeam-channel
+// (e.g. snow-cursor-capture) get these conversions for free.
+
+impl From<crossbeam_channel::RecvError> for RecvError {
+    fn from(_: crossbeam_channel::RecvError) -> Self {
+        RecvError::Disconnected
+    }
+}
+
+impl From<crossbeam_channel::TryRecvError> for TryRecvError {
+    fn from(e: crossbeam_channel::TryRecvError) -> Self {
+        match e {
+            crossbeam_channel::TryRecvError::Empty => TryRecvError::Empty,
+            crossbeam_channel::TryRecvError::Disconnected => TryRecvError::Disconnected,
+        }
+    }
+}
+
+impl From<crossbeam_channel::RecvTimeoutError> for RecvTimeoutError {
+    fn from(e: crossbeam_channel::RecvTimeoutError) -> Self {
+        match e {
+            crossbeam_channel::RecvTimeoutError::Timeout => RecvTimeoutError::Timeout,
+            crossbeam_channel::RecvTimeoutError::Disconnected => RecvTimeoutError::Disconnected,
+        }
+    }
+}

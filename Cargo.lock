@@ -796,6 +796,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
+name = "smallvec"
+version = "1.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
 name = "snow-audio-recorder"
 version = "0.1.0"
 dependencies = [
@@ -827,7 +833,9 @@ name = "snow-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "proptest",
+ "smallvec",
  "windows",
 ]
 
@@ -835,6 +843,9 @@ dependencies = [
 name = "snow-cursor-capture"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
+ "proptest",
+ "snow-core",
  "windows",
 ]
 
@@ -848,6 +859,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "smallvec",
  "snow-audio-recorder",
  "snow-capture",
  "snow-core",

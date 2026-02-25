@@ -36,28 +36,49 @@ impl AudioPacketAlignment {
     }
 }
 
-/// Deprecated alias for [`snow_core::timestamp::TimestampAnchor`].
-///
-/// Use `snow_core::timestamp::TimestampAnchor` (or `snow_core::TimestampAnchor`
-/// if re-exported) directly for new code.
-#[deprecated(note = "Use `snow_core::TimestampAnchor` instead")]
-pub type AudioTimestampAnchor = snow_core::timestamp::TimestampAnchor;
-
 /// Build a [`TimestampAnchor`] from the first audio packet.
+/// Build a [`TimestampAnchor`] from the first audio packet.
+///
+/// Derives the stream origin from `packet.metadata.stream_timestamp`,
+/// adjusting from packet-end to packet-start by subtracting the packet
+/// duration. Falls back to deprecated accessors when `stream_timestamp`
+/// is not populated (legacy path).
 pub fn audio_anchor_from_first_packet(packet: &AudioPacket) -> TimestampAnchor {
-    let origin_qpc_100ns = packet
-        .start_qpc_position_100ns()
-        .or_else(|| packet.end_qpc_position_100ns());
-    let origin_instant = packet
-        .start_capture_time()
-        .or_else(|| packet.end_capture_time())
-        .unwrap_or_else(Instant::now);
-    TimestampAnchor::new(StreamTimestamp {
-        instant: origin_instant,
-        raw_os_ticks: origin_qpc_100ns,
-        tick_format: TickFormat::Hns100,
-    })
+    if let Some(end_ts) = &packet.metadata.stream_timestamp {
+        // stream_timestamp represents the end of the packet.
+        // Derive the start (origin) by subtracting the packet duration.
+        let duration = packet.duration();
+        let origin_instant = end_ts
+            .instant
+            .checked_sub(duration)
+            .unwrap_or(end_ts.instant);
+        let origin_ticks = end_ts
+            .raw_os_ticks
+            .map(|t| t.saturating_sub(packet.duration_100ns()));
+        TimestampAnchor::new(StreamTimestamp {
+            instant: origin_instant,
+            raw_os_ticks: origin_ticks,
+            tick_format: end_ts.tick_format,
+        })
+    } else {
+        // Legacy fallback: use deprecated accessors.
+        #[allow(deprecated)]
+        let origin_qpc_100ns = packet
+            .start_qpc_position_100ns()
+            .or_else(|| packet.end_qpc_position_100ns());
+        #[allow(deprecated)]
+        let origin_instant = packet
+            .start_capture_time()
+            .or_else(|| packet.end_capture_time())
+            .unwrap_or_else(Instant::now);
+        TimestampAnchor::new(StreamTimestamp {
+            instant: origin_instant,
+            raw_os_ticks: origin_qpc_100ns,
+            tick_format: TickFormat::Hns100,
+        })
+    }
 }
+
 
 /// Build a [`TimestampAnchor`] from a known stream origin instant.
 ///
@@ -95,14 +116,25 @@ pub trait AudioTimestampAnchorExt {
 impl AudioTimestampAnchorExt for TimestampAnchor {
     fn audio_stream_relative(&self, packet: &AudioPacket) -> AudioPacketTimestamp {
         let packet_duration = packet.duration();
-        let end = if let (Some(origin), Some(packet_end)) =
-            (self.origin().raw_os_ticks, packet.end_qpc_position_100ns())
-        {
-            hns_delta_to_duration(packet_end.saturating_sub(origin).max(0))
+
+        let end = if let Some(end_ts) = &packet.metadata.stream_timestamp {
+            // Primary path: use TimestampAnchor::stream_relative on the
+            // packet's stream_timestamp (which represents packet-end time).
+            self.stream_relative(end_ts)
         } else {
-            packet_end_instant(packet)
-                .unwrap_or_else(Instant::now)
-                .saturating_duration_since(self.origin().instant)
+            // Legacy fallback: use deprecated accessors when stream_timestamp
+            // is not populated. This path will be removed once deprecated
+            // fields are cleaned up.
+            #[allow(deprecated)]
+            if let (Some(origin), Some(packet_end)) =
+                (self.origin().raw_os_ticks, packet.end_qpc_position_100ns())
+            {
+                hns_delta_to_duration(packet_end.saturating_sub(origin).max(0))
+            } else {
+                packet_end_instant(packet)
+                    .unwrap_or_else(Instant::now)
+                    .saturating_duration_since(self.origin().instant)
+            }
         };
 
         AudioPacketTimestamp {
@@ -207,12 +239,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn stream_relative_prefers_qpc_when_available() {
         let anchor = audio_anchor_from_origin(Instant::now(), Some(1_000_000));
 
         let mut pkt = packet(480); // 10ms at 48kHz.
-        pkt.metadata.qpc_position_100ns = Some(1_500_000);
+        pkt.metadata.set_timing(None, Some(1_500_000));
 
         let ts = anchor.audio_stream_relative(&pkt);
         assert_eq!(ts.end, Duration::from_millis(50));
@@ -221,13 +252,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn stream_relative_falls_back_to_instant_when_qpc_absent() {
         let origin = Instant::now();
         let anchor = audio_anchor_from_origin_instant(origin);
 
         let mut pkt = packet(480); // 10ms.
-        pkt.metadata.capture_time = origin.checked_add(Duration::from_millis(30));
+        pkt.metadata.set_timing(origin.checked_add(Duration::from_millis(30)), None);
 
         let ts = anchor.audio_stream_relative(&pkt);
         assert_eq!(ts.end, Duration::from_millis(30));

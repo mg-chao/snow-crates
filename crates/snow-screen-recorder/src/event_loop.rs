@@ -220,18 +220,164 @@ fn drain_all_channels(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Multiplexer-based event loop (new architecture)
+// ---------------------------------------------------------------------------
+
+use snow_core::multiplexer::{MuxCommand, MuxStatus, StreamMultiplexer};
+
+use crate::event::{ControlCommand, RecordingEvent};
+
+/// Run the recording event loop using a `StreamMultiplexer`.
+///
+/// The multiplexer handles audio-priority drain, per-source channels,
+/// and select-based multiplexing internally. This loop simply receives
+/// from the multiplexer's output channel and dispatches events to the
+/// coordinator.
+///
+/// Control commands are received on `control_rx` and forwarded to the
+/// multiplexer as `MuxCommand`s. `MuxStatus` events are polled to
+/// track source lifecycle.
+///
+/// Returns the coordinator so the caller can call `finalize()`.
+pub(crate) fn run_mux_event_loop(
+    mut coordinator: RecordingCoordinator,
+    multiplexer: &StreamMultiplexer<RecordingEvent>,
+    control_rx: &crossbeam_channel::Receiver<ControlCommand>,
+) -> Result<RecordingCoordinator> {
+    loop {
+        // Poll control commands (non-blocking) and forward to multiplexer.
+        while let Ok(cmd) = control_rx.try_recv() {
+            let mux_cmd = match &cmd {
+                ControlCommand::Pause => MuxCommand::Pause,
+                ControlCommand::Resume => MuxCommand::Resume,
+                ControlCommand::Stop => MuxCommand::Stop,
+            };
+            let _ = multiplexer.send_command(mux_cmd);
+
+            if coordinator.handle_control(cmd)?.is_stop() {
+                return Ok(coordinator);
+            }
+        }
+
+        // Poll multiplexer status (non-blocking) for source lifecycle.
+        while let Ok(status) = multiplexer.try_recv_status() {
+            match status {
+                MuxStatus::SourceEnded(sid) => {
+                    coordinator.mark_source_ended(sid);
+                }
+                MuxStatus::SourceDisconnected(sid) => {
+                    coordinator.mark_source_ended(sid);
+                }
+                MuxStatus::SourceForwarderPanicked(sid) => {
+                    coordinator.mark_source_ended(sid);
+                }
+                MuxStatus::Completed => {
+                    // All sources done — drain remaining output and exit.
+                    drain_mux_output(&mut coordinator, multiplexer)?;
+                    return Ok(coordinator);
+                }
+            }
+        }
+
+        if coordinator.evaluate_termination().is_stop() {
+            return Ok(coordinator);
+        }
+
+        // Receive next event from multiplexer output (with timeout).
+        match multiplexer.recv_timeout(Duration::from_millis(25)) {
+            Ok(event) => {
+                if coordinator.handle_event(event)?.is_stop() {
+                    return Ok(coordinator);
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // No events available — loop back to check control/status.
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                // Output channel closed — multiplexer shut down.
+                return Ok(coordinator);
+            }
+        }
+
+        if coordinator.evaluate_termination().is_stop() {
+            return Ok(coordinator);
+        }
+    }
+}
+
+/// Perform graceful shutdown using the multiplexer.
+///
+/// Sends a Stop command to the multiplexer, then drains all remaining
+/// output events through the coordinator.
+pub(crate) fn mux_graceful_shutdown(
+    coordinator: &mut RecordingCoordinator,
+    multiplexer: &StreamMultiplexer<RecordingEvent>,
+) -> Result<()> {
+    // Send stop to all sources via multiplexer.
+    let _ = multiplexer.send_command(MuxCommand::Stop);
+
+    // Drain remaining output events.
+    drain_mux_output(coordinator, multiplexer)?;
+
+    // Drain any remaining status events.
+    while let Ok(status) = multiplexer.try_recv_status() {
+        match status {
+            MuxStatus::SourceEnded(sid)
+            | MuxStatus::SourceDisconnected(sid)
+            | MuxStatus::SourceForwarderPanicked(sid) => {
+                coordinator.mark_source_ended(sid);
+            }
+            MuxStatus::Completed => break,
+        }
+    }
+
+    Ok(())
+}
+
+/// Drain all remaining events from the multiplexer output channel.
+fn drain_mux_output(
+    coordinator: &mut RecordingCoordinator,
+    multiplexer: &StreamMultiplexer<RecordingEvent>,
+) -> Result<()> {
+    loop {
+        match multiplexer.try_recv() {
+            Ok(event) => {
+                let _ = coordinator.handle_event(event)?;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{RecordingVideoFormat, VideoEncodeConfig};
-    use crate::coordinator::RecordingCoordinator;
-    use crate::event::{
-        AudioCaptureEvent, ControlCommand, CursorCaptureEvent, RecordingEvent, VideoCaptureEvent,
-    };
+    use crate::coordinator::{RecordingCoordinator, VIDEO_SOURCE, AUDIO_SOURCE, CURSOR_SOURCE};
+    use crate::event::{ControlCommand, RecordingEvent};
     use crate::processor::{AudioProcessor, CursorProcessor, VideoProcessor};
     use crate::timeline::PauseTimeline;
+    use snow_audio_recorder::AudioEvent;
+    use snow_capture::CaptureEvent;
+    use snow_core::event::{SourceId, TaggedEvent};
+    use snow_cursor_capture::CursorEvent;
     use std::path::PathBuf;
     use std::time::Instant;
+
+    /// Wrap a CaptureEvent in RecordingEvent::Video.
+    fn vid(event: CaptureEvent) -> RecordingEvent {
+        RecordingEvent::Video(TaggedEvent { source: VIDEO_SOURCE, event })
+    }
+    /// Wrap an AudioEvent in RecordingEvent::Audio.
+    fn aud(event: AudioEvent) -> RecordingEvent {
+        RecordingEvent::Audio(TaggedEvent { source: AUDIO_SOURCE, event })
+    }
+    /// Wrap a CursorEvent in RecordingEvent::Cursor.
+    fn cur(event: CursorEvent) -> RecordingEvent {
+        RecordingEvent::Cursor(TaggedEvent { source: CURSOR_SOURCE, event })
+    }
 
     /// Build a minimal `RecordingCoordinator` for testing.
     fn test_coordinator() -> RecordingCoordinator {
@@ -332,13 +478,13 @@ mod tests {
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
         video_tx
-            .send(RecordingEvent::Video(VideoCaptureEvent::StreamEnded))
+            .send(vid(CaptureEvent::StreamEnded))
             .unwrap();
         audio_tx
-            .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
+            .send(aud(AudioEvent::StreamEnded))
             .unwrap();
         cursor_tx
-            .send(RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded))
+            .send(cur(CursorEvent::StreamEnded))
             .unwrap();
 
         let coordinator = test_coordinator();
@@ -358,8 +504,8 @@ mod tests {
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
         video_tx
-            .send(RecordingEvent::Video(VideoCaptureEvent::Error(
-                "fatal error".into(),
+            .send(vid(CaptureEvent::Error(
+                snow_capture::error::CaptureError::BufferOverflow,
             )))
             .unwrap();
 
@@ -378,8 +524,8 @@ mod tests {
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
         audio_tx
-            .send(RecordingEvent::Audio(AudioCaptureEvent::Error(
-                "audio device lost".into(),
+            .send(aud(AudioEvent::Error(
+                snow_audio_recorder::error::AudioError::DeviceLost,
             )))
             .unwrap();
 
@@ -402,7 +548,7 @@ mod tests {
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
         audio_tx
-            .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
+            .send(aud(AudioEvent::StreamEnded))
             .unwrap();
 
         control_tx.send(ControlCommand::Stop).unwrap();
@@ -424,12 +570,12 @@ mod tests {
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
         for _ in 0..8 {
-            let _ = video_tx.try_send(RecordingEvent::Video(VideoCaptureEvent::FrameDropped {
+            let _ = video_tx.try_send(vid(CaptureEvent::FrameDropped {
                 sequence: 1,
             }));
         }
         for _ in 0..8 {
-            let _ = audio_tx.try_send(RecordingEvent::Audio(AudioCaptureEvent::BufferPressure {
+            let _ = audio_tx.try_send(aud(AudioEvent::BufferPressure {
                 fill_ratio: 0.9,
                 buffer_depth: 8,
             }));
@@ -489,13 +635,13 @@ mod tests {
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
         video_tx
-            .send(RecordingEvent::Video(VideoCaptureEvent::StreamEnded))
+            .send(vid(CaptureEvent::StreamEnded))
             .unwrap();
         audio_tx
-            .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
+            .send(aud(AudioEvent::StreamEnded))
             .unwrap();
         cursor_tx
-            .send(RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded))
+            .send(cur(CursorEvent::StreamEnded))
             .unwrap();
 
         let mut coordinator = test_coordinator();
@@ -534,7 +680,7 @@ mod tests {
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
         audio_tx
-            .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
+            .send(aud(AudioEvent::StreamEnded))
             .unwrap();
 
         let mut coordinator = test_coordinator();
@@ -567,10 +713,10 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
 
         audio_tx
-            .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
+            .send(aud(AudioEvent::StreamEnded))
             .unwrap();
         video_tx
-            .send(RecordingEvent::Video(VideoCaptureEvent::StreamEnded))
+            .send(vid(CaptureEvent::StreamEnded))
             .unwrap();
 
         let mut coordinator = test_coordinator();
@@ -613,29 +759,29 @@ mod tests {
 
             for _ in 0..n_audio_extra {
                 audio_tx
-                    .send(RecordingEvent::Audio(AudioCaptureEvent::BufferPressure {
+                    .send(aud(AudioEvent::BufferPressure {
                         fill_ratio: 0.7,
                         buffer_depth: 4,
                     }))
                     .unwrap();
             }
             audio_tx
-                .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
+                .send(aud(AudioEvent::StreamEnded))
                 .unwrap();
 
             for i in 0..n_video_extra {
                 video_tx
-                    .send(RecordingEvent::Video(VideoCaptureEvent::FrameDropped {
+                    .send(vid(CaptureEvent::FrameDropped {
                         sequence: i as u64,
                     }))
                     .unwrap();
             }
             video_tx
-                .send(RecordingEvent::Video(VideoCaptureEvent::StreamEnded))
+                .send(vid(CaptureEvent::StreamEnded))
                 .unwrap();
 
             cursor_tx
-                .send(RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded))
+                .send(cur(CursorEvent::StreamEnded))
                 .unwrap();
 
             drop(video_tx);
@@ -692,19 +838,19 @@ mod tests {
 
             for _ in 0..(n_audio - 1) {
                 audio_tx
-                    .send(RecordingEvent::Audio(AudioCaptureEvent::BufferPressure {
+                    .send(aud(AudioEvent::BufferPressure {
                         fill_ratio: 0.8,
                         buffer_depth: 4,
                     }))
                     .unwrap();
             }
             audio_tx
-                .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
+                .send(aud(AudioEvent::StreamEnded))
                 .unwrap();
 
             for i in 0..n_video {
                 video_tx
-                    .send(RecordingEvent::Video(VideoCaptureEvent::FrameDropped {
+                    .send(vid(CaptureEvent::FrameDropped {
                         sequence: i as u64,
                     }))
                     .unwrap();
@@ -725,6 +871,125 @@ mod tests {
                  processed all {} audio events (including StreamEnded) \
                  before the select! wait handled the Stop command",
                 n_audio,
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Property 12: Stop latency under backpressure.
+        #[test]
+        fn prop_stop_latency_under_backpressure(
+            n_video in 1usize..=8,
+            n_audio in 1usize..=8,
+            n_cursor in 0usize..=4,
+        ) {
+            let (video_tx, video_rx) = crossbeam_channel::bounded(16);
+            let (audio_tx, audio_rx) = crossbeam_channel::bounded(16);
+            let (cursor_tx, cursor_rx) = crossbeam_channel::bounded(16);
+            let (control_tx, control_rx) = crossbeam_channel::unbounded();
+
+            for _ in 0..n_video {
+                let _ = video_tx.try_send(vid(CaptureEvent::FrameDropped { sequence: 1 }));
+            }
+            for _ in 0..n_audio {
+                let _ = audio_tx.try_send(aud(AudioEvent::BufferPressure {
+                    fill_ratio: 0.9,
+                    buffer_depth: 8,
+                }));
+            }
+            for _ in 0..n_cursor {
+                let _ = cursor_tx.try_send(cur(CursorEvent::StreamEnded));
+            }
+
+            control_tx.send(ControlCommand::Stop).unwrap();
+
+            let coordinator = test_coordinator();
+            let adapters = test_adapters(video_rx, audio_rx, cursor_rx, control_rx);
+
+            let start = Instant::now();
+            let result = run_event_loop(coordinator, &adapters);
+            let elapsed = start.elapsed();
+
+            prop_assert!(result.is_ok(), "event loop should exit cleanly");
+            prop_assert!(
+                elapsed < Duration::from_millis(100),
+                "Stop should be honored within 100ms under backpressure, took {:?} \
+                 (video={}, audio={}, cursor={})",
+                elapsed, n_video, n_audio, n_cursor,
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Property 13: Shutdown drain ordering.
+        #[test]
+        fn prop_shutdown_drain_ordering(
+            n_audio_extra in 0usize..=4,
+            n_video_extra in 0usize..=4,
+        ) {
+            let (video_tx, video_rx) = crossbeam_channel::bounded(16);
+            let (audio_tx, audio_rx) = crossbeam_channel::bounded(16);
+            let (cursor_tx, cursor_rx) = crossbeam_channel::bounded(16);
+            let (_control_tx, control_rx) = crossbeam_channel::unbounded();
+
+            // Fill audio channel with extra events + StreamEnded.
+            for _ in 0..n_audio_extra {
+                audio_tx
+                    .send(aud(AudioEvent::BufferPressure {
+                        fill_ratio: 0.8,
+                        buffer_depth: 4,
+                    }))
+                    .unwrap();
+            }
+            audio_tx.send(aud(AudioEvent::StreamEnded)).unwrap();
+
+            // Fill video channel with extra events + StreamEnded.
+            for i in 0..n_video_extra {
+                video_tx
+                    .send(vid(CaptureEvent::FrameDropped { sequence: i as u64 }))
+                    .unwrap();
+            }
+            video_tx.send(vid(CaptureEvent::StreamEnded)).unwrap();
+
+            cursor_tx.send(cur(CursorEvent::StreamEnded)).unwrap();
+
+            drop(video_tx);
+            drop(audio_tx);
+            drop(cursor_tx);
+
+            let mut coordinator = test_coordinator();
+            let mut adapters = RecordingAdapters {
+                video_rx,
+                audio_rx,
+                cursor_rx,
+                control_rx,
+                video_adapter: Box::new(NoopAdapter),
+                audio_adapter: None,
+                cursor_adapter: None,
+            };
+
+            let result = graceful_shutdown(&mut coordinator, &mut adapters);
+            prop_assert!(result.is_ok(), "graceful_shutdown should succeed");
+
+            // Audio must be drained (StreamEnded processed).
+            prop_assert!(
+                coordinator.audio_ended(),
+                "audio StreamEnded must be processed during drain \
+                 ({} extra audio events were in channel)",
+                n_audio_extra,
+            );
+            // Video and cursor must also be drained.
+            prop_assert!(
+                coordinator.capture_ended(),
+                "video StreamEnded must be processed during drain",
+            );
+            prop_assert!(
+                coordinator.cursor_ended(),
+                "cursor StreamEnded must be processed during drain",
             );
         }
     }

@@ -5,5 +5,7 @@
 //! `snow-cursor-capture`) and the compositor crate (`snow-screen-recorder`).
 
 pub mod error;
+pub mod event;
+pub mod multiplexer;
 pub mod streaming;
 pub mod timestamp;

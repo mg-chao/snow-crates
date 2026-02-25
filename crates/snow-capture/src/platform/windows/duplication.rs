@@ -2181,9 +2181,8 @@ impl OutputCapturer {
         let mut frame = reuse
             .or_else(|| self.spare_frame.take())
             .unwrap_or_else(Frame::empty);
-        #[allow(deprecated)]
         let has_frame_history =
-            frame.metadata.capture_time.is_some() && !frame.as_rgba_bytes().is_empty();
+            frame.metadata.stream_timestamp.is_some() && !frame.as_rgba_bytes().is_empty();
         let single_shot_screenshot =
             self.capture_mode == CaptureMode::Screenshot && !has_frame_history;
         frame.reset_metadata();
