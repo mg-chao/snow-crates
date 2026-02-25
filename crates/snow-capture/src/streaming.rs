@@ -461,63 +461,44 @@ fn stream_loop(
 
                 stats.frames_captured.fetch_add(1, Ordering::Relaxed);
 
-                match tx.try_send(CaptureEvent::Frame(frame)) {
+                let was_dropped = match tx.try_send(CaptureEvent::Frame(frame)) {
                     Ok(()) => {
                         stats.buffer_fill.fetch_add(1, Ordering::Release);
-
-                        window_total += 1;
-                        if config.adaptive_fps && window_total >= ADAPTIVE_WINDOW {
-                            let drop_ratio = window_drops as f64 / window_total as f64;
-                            if let (Some(cur), Some(base), Some(max)) =
-                                (current_interval, base_interval, min_interval)
-                            {
-                                let cur_ns = cur.as_nanos() as f64;
-                                let target_ns = if drop_ratio > DROP_RATIO_THRESHOLD {
-                                    (cur_ns * 1.5).min(max.as_nanos() as f64)
-                                } else {
-                                    (cur_ns * 0.8).max(base.as_nanos() as f64)
-                                };
-                                let smoothed =
-                                    ADAPTIVE_ALPHA * target_ns + (1.0 - ADAPTIVE_ALPHA) * cur_ns;
-                                current_interval = Some(Duration::from_nanos(smoothed as u64));
-                            }
-                            window_drops = 0;
-                            window_total = 0;
-                        }
+                        false
                     }
                     Err(mpsc::TrySendError::Full(CaptureEvent::Frame(dropped))) => {
                         stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
-                        // Frame never entered the channel, so buffer_fill
-                        // is unchanged.
-                        // Notify receiver about the drop.
                         let _ = tx.try_send(CaptureEvent::FrameDropped { sequence: seq });
                         reuse_frame = Some(dropped);
-
-                        window_drops += 1;
-                        window_total += 1;
-                        if config.adaptive_fps && window_total >= ADAPTIVE_WINDOW {
-                            let drop_ratio = window_drops as f64 / window_total as f64;
-                            if let (Some(cur), Some(base), Some(max)) =
-                                (current_interval, base_interval, min_interval)
-                            {
-                                let cur_ns = cur.as_nanos() as f64;
-                                let target_ns = if drop_ratio > DROP_RATIO_THRESHOLD {
-                                    (cur_ns * 1.5).min(max.as_nanos() as f64)
-                                } else {
-                                    (cur_ns * 0.8).max(base.as_nanos() as f64)
-                                };
-                                let smoothed =
-                                    ADAPTIVE_ALPHA * target_ns + (1.0 - ADAPTIVE_ALPHA) * cur_ns;
-                                current_interval = Some(Duration::from_nanos(smoothed as u64));
-                            }
-                            window_drops = 0;
-                            window_total = 0;
-                        }
+                        true
                     }
-                    Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Full(_)) => false,
                     Err(mpsc::TrySendError::Disconnected(_)) => {
                         break;
                     }
+                };
+
+                if was_dropped {
+                    window_drops += 1;
+                }
+                window_total += 1;
+                if config.adaptive_fps && window_total >= ADAPTIVE_WINDOW {
+                    let drop_ratio = window_drops as f64 / window_total as f64;
+                    if let (Some(cur), Some(base), Some(max)) =
+                        (current_interval, base_interval, min_interval)
+                    {
+                        let cur_ns = cur.as_nanos() as f64;
+                        let target_ns = if drop_ratio > DROP_RATIO_THRESHOLD {
+                            (cur_ns * 1.5).min(max.as_nanos() as f64)
+                        } else {
+                            (cur_ns * 0.8).max(base.as_nanos() as f64)
+                        };
+                        let smoothed =
+                            ADAPTIVE_ALPHA * target_ns + (1.0 - ADAPTIVE_ALPHA) * cur_ns;
+                        current_interval = Some(Duration::from_nanos(smoothed as u64));
+                    }
+                    window_drops = 0;
+                    window_total = 0;
                 }
             }
             Err(ref e) if e.is_retryable() => {

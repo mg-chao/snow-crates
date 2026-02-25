@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use ffmpeg_next as ffmpeg;
@@ -11,6 +10,7 @@ use crate::artifact::{RecordingArtifact, SessionManifest};
 use crate::config::{EditConfig, ExportFormat, MouseEditConfig, VideoEncodeConfig};
 use crate::error::{Result, ScreenRecorderError};
 use crate::export::ExportResult;
+use crate::ffmpeg_util::{copy_rgba_into_frame, ensure_ffmpeg_initialized, is_eagain};
 use crate::model::StoredFrame;
 use crate::mouse::{CursorShapeCompositionMode, CursorShapeRecord, MouseStore, read_mouse_records};
 use crate::video_quality::{quality_to_h264_crf, smart_quality_bitrate_bps};
@@ -1226,19 +1226,7 @@ fn retime_audio_i16_interleaved(samples: &[i16], channels: u16, playback_speed: 
     out
 }
 
-fn ensure_ffmpeg_initialized() -> Result<()> {
-    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    INIT.get_or_init(|| ffmpeg::init().map_err(|err| err.to_string()))
-        .clone()
-        .map_err(|err| ScreenRecorderError::Export(format!("failed to initialize ffmpeg: {err}")))
-}
 
-fn is_eagain(err: &ffmpeg::Error) -> bool {
-    matches!(
-        err,
-        ffmpeg::Error::Other { errno } if *errno == ffmpeg::error::EAGAIN
-    )
-}
 
 fn choose_video_codec_id(format: ExportFormat) -> ffmpeg::codec::Id {
     match format {
@@ -1641,21 +1629,6 @@ fn validate_export_frames(frames: &[StoredFrame], require_even: bool) -> Result<
     }
 
     Ok((width, height))
-}
-
-fn copy_rgba_into_frame(frame: &mut ffmpeg::frame::Video, width: u32, rgba: &[u8]) {
-    let stride = frame.stride(0);
-    let row_bytes = width as usize * 4;
-    let height = frame.height() as usize;
-    let dst = frame.data_mut(0);
-
-    for y in 0..height {
-        let src_start = y * row_bytes;
-        let src_end = src_start + row_bytes;
-        let dst_start = y * stride;
-        let dst_end = dst_start + row_bytes;
-        dst[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
-    }
 }
 
 fn drain_video_packets(

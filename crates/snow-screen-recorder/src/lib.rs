@@ -11,6 +11,7 @@ pub(crate) mod adapter;
 pub(crate) mod coordinator;
 pub(crate) mod event;
 pub(crate) mod event_loop;
+pub(crate) mod ffmpeg_util;
 pub(crate) mod model;
 pub(crate) mod processor;
 pub(crate) mod timeline;

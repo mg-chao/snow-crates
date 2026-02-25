@@ -177,17 +177,8 @@ impl RecordingCoordinator {
 
     /// Update `last_observed_ts_ms` monotonically (non-decreasing).
     pub(crate) fn observe_video_time(&mut self, ts_ms: u64) {
-        match self.last_observed_ts_ms {
-            Some(prev) if ts_ms > prev => {
-                self.last_observed_ts_ms = Some(ts_ms);
-            }
-            None => {
-                self.last_observed_ts_ms = Some(ts_ms);
-            }
-            _ => {
-                // ts_ms <= prev — keep the existing value to maintain
-                // monotonically non-decreasing invariant.
-            }
+        if self.last_observed_ts_ms.is_none_or(|prev| ts_ms > prev) {
+            self.last_observed_ts_ms = Some(ts_ms);
         }
     }
 
@@ -311,14 +302,12 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            CaptureEvent::Resumed { at, gap } => {
-                let _ = gap;
+            CaptureEvent::Resumed { at, .. } => {
                 self.timeline.mark_resume(at);
                 Ok(())
             }
 
             CaptureEvent::StreamEnded => {
-                self.capture_ended = true;
                 self.mark_source_ended(VIDEO_SOURCE);
                 Ok(())
             }
@@ -340,8 +329,7 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            CaptureEvent::FrameDropped { sequence } => {
-                let _ = sequence;
+            CaptureEvent::FrameDropped { .. } => {
                 if let Some(last) = self.last_observed_ts_ms {
                     let next_ts = last.saturating_add(u64::from(self.frame_interval_ms));
                     self.observe_video_time(next_ts);
@@ -351,12 +339,10 @@ impl RecordingCoordinator {
             }
 
             CaptureEvent::ResolutionChanged {
-                old_width,
-                old_height,
                 new_width,
                 new_height,
+                ..
             } => {
-                let _ = (old_width, old_height);
                 self.video.handle_resolution_change(new_width, new_height)
             }
         }
@@ -383,7 +369,6 @@ impl RecordingCoordinator {
             }
 
             AudioEvent::StreamEnded => {
-                self.audio_ended = true;
                 self.mark_source_ended(AUDIO_SOURCE);
                 Ok(())
             }
@@ -406,30 +391,10 @@ impl RecordingCoordinator {
             }
 
             // Diagnostics-only events – no state mutation.
-            AudioEvent::Paused { at } => {
-                let _ = at;
-                Ok(())
-            }
-            AudioEvent::Resumed { at, gap } => {
-                let _ = (at, gap);
-                Ok(())
-            }
-            AudioEvent::SourceRestarted {
-                source,
-                old_device_id,
-                new_device_id,
-                downtime,
-            } => {
-                let _ = (source, old_device_id, new_device_id, downtime);
-                Ok(())
-            }
-            AudioEvent::BufferPressure {
-                fill_ratio,
-                buffer_depth,
-            } => {
-                let _ = (fill_ratio, buffer_depth);
-                Ok(())
-            }
+            AudioEvent::Paused { .. }
+            | AudioEvent::Resumed { .. }
+            | AudioEvent::SourceRestarted { .. }
+            | AudioEvent::BufferPressure { .. } => Ok(()),
         }
     }
 
@@ -441,18 +406,9 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            CursorEvent::Paused { at } => {
-                let _ = at;
-                Ok(())
-            }
-
-            CursorEvent::Resumed { at, gap } => {
-                let _ = (at, gap);
-                Ok(())
-            }
+            CursorEvent::Paused { .. } | CursorEvent::Resumed { .. } => Ok(()),
 
             CursorEvent::StreamEnded => {
-                self.cursor_ended = true;
                 self.mark_source_ended(CURSOR_SOURCE);
                 Ok(())
             }

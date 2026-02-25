@@ -86,7 +86,7 @@ impl TimestampAnchor {
                     let delta = (current - origin).max(0);
                     let secs = delta / self.qpc_frequency;
                     let remainder = delta % self.qpc_frequency;
-                    let nanos = (remainder * 1_000_000_000 / self.qpc_frequency) as u32;
+                    let nanos = (remainder as i128 * 1_000_000_000 / self.qpc_frequency as i128) as u32;
                     Duration::new(secs as u64, nanos)
                 }
                 TickFormat::Hns100 => {
@@ -235,7 +235,7 @@ mod tests {
 
                 let expected_secs = delta_ticks / frequency;
                 let expected_remainder = delta_ticks % frequency;
-                let expected_nanos = (expected_remainder * 1_000_000_000 / frequency) as u32;
+                let expected_nanos = (expected_remainder as i128 * 1_000_000_000 / frequency as i128) as u32;
                 let expected = Duration::new(expected_secs as u64, expected_nanos);
 
                 let diff = if result > expected { result - expected } else { expected - result };

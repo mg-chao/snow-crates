@@ -181,40 +181,20 @@ fn drain_all_channels(
     coordinator: &mut RecordingCoordinator,
     adapters: &RecordingAdapters,
 ) -> Result<()> {
-    loop {
-        match adapters.audio_rx.try_recv() {
-            Ok(event) => {
-                let _ = coordinator.handle_event(event)?;
-            }
-            Err(_) => break,
-        }
+    while let Ok(event) = adapters.audio_rx.try_recv() {
+        let _ = coordinator.handle_event(event)?;
     }
 
-    loop {
-        match adapters.video_rx.try_recv() {
-            Ok(event) => {
-                let _ = coordinator.handle_event(event)?;
-            }
-            Err(_) => break,
-        }
+    while let Ok(event) = adapters.video_rx.try_recv() {
+        let _ = coordinator.handle_event(event)?;
     }
 
-    loop {
-        match adapters.cursor_rx.try_recv() {
-            Ok(event) => {
-                let _ = coordinator.handle_event(event)?;
-            }
-            Err(_) => break,
-        }
+    while let Ok(event) = adapters.cursor_rx.try_recv() {
+        let _ = coordinator.handle_event(event)?;
     }
 
-    loop {
-        match adapters.control_rx.try_recv() {
-            Ok(cmd) => {
-                let _ = coordinator.handle_control(cmd)?;
-            }
-            Err(_) => break,
-        }
+    while let Ok(cmd) = adapters.control_rx.try_recv() {
+        let _ = coordinator.handle_control(cmd)?;
     }
 
     Ok(())
@@ -340,13 +320,8 @@ fn drain_mux_output(
     coordinator: &mut RecordingCoordinator,
     multiplexer: &StreamMultiplexer<RecordingEvent>,
 ) -> Result<()> {
-    loop {
-        match multiplexer.try_recv() {
-            Ok(event) => {
-                let _ = coordinator.handle_event(event)?;
-            }
-            Err(_) => break,
-        }
+    while let Ok(event) = multiplexer.try_recv() {
+        let _ = coordinator.handle_event(event)?;
     }
     Ok(())
 }

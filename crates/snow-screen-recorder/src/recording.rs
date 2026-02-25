@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use snow_capture::{CaptureMode, CaptureSession, StreamConfig};
 use uuid::Uuid;
 
 use crate::artifact::{RecordingArtifact, SessionManifest};
+use crate::ffmpeg_util::{copy_rgba_into_frame, ensure_ffmpeg_initialized, is_eagain};
 use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat, VideoEncodeConfig};
 use crate::error::{Result, ScreenRecorderError};
 use crate::adapter::video::resolve_capture_target;
@@ -768,21 +769,7 @@ impl LiveVideoEncoder {
     }
 }
 
-fn ensure_ffmpeg_initialized() -> Result<()> {
-    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    INIT.get_or_init(|| ffmpeg::init().map_err(|err| err.to_string()))
-        .clone()
-        .map_err(|err| {
-            ScreenRecorderError::Encode(format!("failed to initialize ffmpeg for recording: {err}"))
-        })
-}
 
-fn is_eagain(err: &ffmpeg::Error) -> bool {
-    matches!(
-        err,
-        ffmpeg::Error::Other { errno } if *errno == ffmpeg::error::EAGAIN
-    )
-}
 
 fn choose_video_pixel_format(codec: ffmpeg::codec::Video) -> ffmpeg::format::Pixel {
     let preferred = [
@@ -802,21 +789,6 @@ fn choose_video_pixel_format(codec: ffmpeg::codec::Video) -> ffmpeg::format::Pix
         }
     }
     ffmpeg::format::Pixel::YUV420P
-}
-
-fn copy_rgba_into_frame(frame: &mut ffmpeg::frame::Video, width: u32, rgba: &[u8]) {
-    let stride = frame.stride(0);
-    let row_bytes = width as usize * 4;
-    let height = frame.height() as usize;
-    let dst = frame.data_mut(0);
-
-    for y in 0..height {
-        let src_start = y * row_bytes;
-        let src_end = src_start + row_bytes;
-        let dst_start = y * stride;
-        let dst_end = dst_start + row_bytes;
-        dst[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
-    }
 }
 
 fn new_recording_worker(

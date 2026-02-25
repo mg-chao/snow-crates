@@ -408,7 +408,6 @@ fn main_loop<O: Send + 'static>(
                 &status_tx,
                 &drop_counter,
                 &mut terminated_count,
-                total_sources,
             );
             // Check for panicked forwarders among remaining joins.
             check_panicked_forwarders(&mut joins, &status_tx, &mut terminated_count);
@@ -441,20 +440,14 @@ fn main_loop<O: Send + 'static>(
                         Ok(SourceMsg::StreamEnded) => {
                             let _ = status_tx.send(MuxStatus::SourceEnded(prio_id));
                             terminated_count += 1;
-                            alive.remove(prio_idx);
-                            if let Some(cmd_idx) = alive_cmd_txs.iter().position(|(id, _)| *id == prio_id) {
-                                alive_cmd_txs.remove(cmd_idx);
-                            }
+                            remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
                             break;
                         }
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => {
                             check_forwarder_panic(&mut joins, prio_id, &status_tx);
                             terminated_count += 1;
-                            alive.remove(prio_idx);
-                            if let Some(cmd_idx) = alive_cmd_txs.iter().position(|(id, _)| *id == prio_id) {
-                                alive_cmd_txs.remove(cmd_idx);
-                            }
+                            remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
                             break;
                         }
                     }
@@ -463,24 +456,16 @@ fn main_loop<O: Send + 'static>(
         }
 
         // Check completion after priority drain.
-        if terminated_count >= total_sources {
-            let _ = status_tx.send(MuxStatus::Completed);
-            break;
-        }
-        if alive.is_empty() {
+        if terminated_count >= total_sources || alive.is_empty() {
             let _ = status_tx.send(MuxStatus::Completed);
             break;
         }
 
         // Blocking select: poll all alive sources with timeout.
-        let per_source_timeout = if alive.is_empty() {
-            config.select_timeout
-        } else {
-            let t = config.select_timeout / (alive.len() as u32);
-            t.max(Duration::from_millis(1))
-        };
+        let per_source_timeout = (config.select_timeout / (alive.len() as u32))
+            .max(Duration::from_millis(1));
 
-        let mut to_remove: Vec<usize> = Vec::new();
+        let mut to_remove: SmallVec<[usize; 4]> = SmallVec::new();
 
         for (idx, (sid, rx)) in alive.iter().enumerate() {
             match rx.recv_timeout(per_source_timeout) {
@@ -511,17 +496,11 @@ fn main_loop<O: Send + 'static>(
         // Remove terminated sources (reverse order to preserve indices).
         for &idx in to_remove.iter().rev() {
             let (sid, _) = alive.remove(idx);
-            if let Some(cmd_idx) = alive_cmd_txs.iter().position(|(id, _)| *id == sid) {
-                alive_cmd_txs.remove(cmd_idx);
-            }
+            remove_source_cmd_tx(&mut alive_cmd_txs, sid);
         }
 
         // Check completion.
-        if terminated_count >= total_sources {
-            let _ = status_tx.send(MuxStatus::Completed);
-            break;
-        }
-        if alive.is_empty() {
+        if terminated_count >= total_sources || alive.is_empty() {
             let _ = status_tx.send(MuxStatus::Completed);
             break;
         }
@@ -532,6 +511,28 @@ fn main_loop<O: Send + 'static>(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Remove a source from both the alive receivers and command sender lists.
+fn remove_source<O>(
+    alive: &mut Vec<(SourceId, Receiver<SourceMsg<O>>)>,
+    alive_cmd_txs: &mut Vec<(SourceId, Sender<MuxCommand>)>,
+    sid: SourceId,
+) {
+    if let Some(idx) = alive.iter().position(|(id, _)| *id == sid) {
+        alive.remove(idx);
+    }
+    remove_source_cmd_tx(alive_cmd_txs, sid);
+}
+
+/// Remove a source's command sender from the list.
+fn remove_source_cmd_tx(
+    alive_cmd_txs: &mut Vec<(SourceId, Sender<MuxCommand>)>,
+    sid: SourceId,
+) {
+    if let Some(idx) = alive_cmd_txs.iter().position(|(id, _)| *id == sid) {
+        alive_cmd_txs.remove(idx);
+    }
+}
+
 /// Drain remaining events during shutdown, prioritizing the audio source.
 fn shutdown_drain<O: Send + 'static>(
     config: &MultiplexerConfig,
@@ -540,7 +541,6 @@ fn shutdown_drain<O: Send + 'static>(
     status_tx: &Sender<MuxStatus>,
     drop_counter: &Arc<AtomicU64>,
     terminated_count: &mut usize,
-    _total_sources: usize,
 ) {
     // Phase 1: Drain priority source first.
     if let Some(prio_id) = config.priority_source {
