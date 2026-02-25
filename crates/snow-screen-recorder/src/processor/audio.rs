@@ -159,7 +159,6 @@ mod tests {
         ]
     }
 
-    // **Validates: Requirements 4.2, 4.3, 4.4**
     //
     // Property 4: Audio track isolation and recording flags
     //
@@ -200,7 +199,6 @@ mod tests {
             }
         }
 
-        /// **Validates: Requirements 4.2, 4.5**
         ///
         /// When the corresponding writer is `None`, `write_packet`
         /// returns `Ok(0)` and no recording flag is set.
@@ -223,7 +221,6 @@ mod tests {
                 "recorded_mic should remain false when writer is None");
         }
 
-        /// **Validates: Requirements 4.2, 4.3, 4.4**
         ///
         /// When only one writer is present, writing to the other source
         /// returns `Ok(0)` and does not affect the present writer's flag.
@@ -260,7 +257,6 @@ mod tests {
         }
     }
 
-    // ── Unit tests with synthetic data ──────────────────────────
 
     #[test]
     fn system_write_sets_recorded_system_flag() {

@@ -212,8 +212,6 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        // Feature: unified-crate-architecture, Property 1: TimestampAnchor RawQpc conversion
-        // **Validates: Requirements 2.4, 2.5**
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
             #[test]
@@ -253,8 +251,6 @@ mod tests {
             }
         }
 
-        // Feature: unified-crate-architecture, Property 2: TimestampAnchor Hns100 conversion
-        // **Validates: Requirements 2.4, 2.5**
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
             #[test]
@@ -282,8 +278,6 @@ mod tests {
             }
         }
 
-        // Feature: unified-crate-architecture, Property 3: TimestampAnchor Instant fallback
-        // **Validates: Requirements 2.5, 2.8**
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
             #[test]

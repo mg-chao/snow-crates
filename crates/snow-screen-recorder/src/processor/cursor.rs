@@ -130,7 +130,6 @@ mod tests {
         prop::collection::vec((1u64..=8, prop::bool::ANY), 1..=30)
     }
 
-    // **Validates: Requirements 4.7, 4.8**
     //
     // Property 6: Cursor frame recording with coordinate translation
     //
@@ -183,7 +182,6 @@ mod tests {
         }
     }
 
-    // **Validates: Requirement 4.6**
     //
     // Property 5: Cursor shape deduplication invariant
     //
@@ -252,7 +250,6 @@ mod tests {
         }
     }
 
-    // ── Unit tests with synthetic data ──────────────────────────
 
     #[test]
     fn record_frame_appends_exactly_one_frame() {

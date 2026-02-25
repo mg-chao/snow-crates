@@ -100,9 +100,7 @@ impl std::error::Error for AudioError {
 
 pub type AudioResult<T> = Result<T, AudioError>;
 
-// ---------------------------------------------------------------------------
 // snow_core::Classify impl — maps AudioErrorClass → ErrorClass
-// ---------------------------------------------------------------------------
 
 impl snow_core::error::Classify for AudioError {
     fn class(&self) -> snow_core::error::ErrorClass {
@@ -167,9 +165,7 @@ impl fmt::Display for RecvTimeoutError {
 
 impl std::error::Error for RecvTimeoutError {}
 
-// ---------------------------------------------------------------------------
 // From impls: audio-specific recv errors → snow_core error types
-// ---------------------------------------------------------------------------
 
 impl From<RecvError> for snow_core::error::RecvError {
     fn from(_: RecvError) -> Self {

@@ -1,4 +1,4 @@
-﻿//! Multi-monitor region capture support.
+//! Multi-monitor region capture support.
 //!
 //! [`MonitorLayout`] snapshots the virtual desktop geometry at startup.
 //! [`CaptureRegion`] describes an arbitrary rectangle in virtual desktop
@@ -69,7 +69,6 @@ impl MonitorLayout {
     /// Snapshot the current monitor layout from the OS.
     ///
     /// This queries monitor positions once and caches them. Call this
-    /// at session startup 鈥?the layout is not refreshed automatically.
     pub fn snapshot() -> CaptureResult<Self> {
         let monitors = crate::monitor::enumerate_monitors()?;
         Self::snapshot_from_monitors(monitors)

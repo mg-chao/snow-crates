@@ -2611,11 +2611,9 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
     }
 }
 
-// ---------------------------------------------------------------------------
 // DXGI-based window capture: captures only the window's visible monitor
 // sub-rectangle via CopySubresourceRegion, avoiding full-monitor readback
 // and CPU-side cropping.
-// ---------------------------------------------------------------------------
 
 use crate::window::WindowId;
 use windows::Win32::Foundation::HWND;

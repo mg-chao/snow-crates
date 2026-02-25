@@ -1891,10 +1891,8 @@ impl GdiResources {
     /// Capture the monitor region and return an RGBA frame.
     ///
     /// The strategy is to BitBlt into the DIB section, then perform an
-    /// in-place BGRA鈫扲GBA swizzle directly in that buffer, and finally
     /// bulk-copy the result into the `Frame`.  When `src == dst` the
     /// SIMD kernels read and write the same cache lines, cutting memory
-    /// bandwidth roughly in half compared to a separate src鈫抎st copy.
     fn read_surface_to_rgba(
         &mut self,
         width: i32,
@@ -1972,7 +1970,6 @@ impl GdiResources {
             }
         }
 
-        // Single-pass: read from DIB section, swizzle BGRA鈫扲GBA, and
         // write directly into the Frame to avoid an extra memcpy.
         unsafe {
             match mode {
@@ -2480,7 +2477,6 @@ impl WindowsMonitorCapturer {
         let current_gen = self.resolver.display_generation();
 
         // When backed by the event-driven DisplayInfoCache, skip the
-        // refresh entirely if the generation hasn't changed 鈥?no
         // WM_DISPLAYCHANGE has fired since our last check.
         if let (Some(current), Some(last)) = (current_gen, self.last_display_generation)
             && current == last
@@ -2490,7 +2486,6 @@ impl WindowsMonitorCapturer {
 
         self.last_display_generation = current_gen;
 
-        // Display config changed 鈥?refresh the screen DC so we don't
         // capture from a stale device context after resolution /
         // composition changes.
         self.resources.refresh_screen_dc()?;

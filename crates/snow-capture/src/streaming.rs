@@ -1,4 +1,4 @@
-﻿//! Continuous capture streaming with frame pacing, backpressure, and
+//! Continuous capture streaming with frame pacing, backpressure, and
 //! adaptive rate control.
 //!
 //! The streaming module runs a capture loop on a dedicated thread,
@@ -183,7 +183,6 @@ impl StreamHandle {
     /// Get the raw receiver end of the capture event channel.
     ///
     /// **Note:** Prefer `recv()`, `try_recv()`, or `recv_timeout()` on
-    /// `StreamHandle` directly 鈥?those methods keep `buffer_fill` accurate.
     /// Reading from the raw receiver bypasses fill tracking.
     pub fn receiver(&self) -> &mpsc::Receiver<CaptureEvent> {
         &self.receiver
@@ -233,7 +232,6 @@ impl StreamHandle {
         Ok(event)
     }
 
-    /// Signal the stream thread to stop. Non-blocking 鈥?the thread will
     /// exit on its next loop iteration.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Release);
@@ -306,9 +304,7 @@ impl Drop for StreamHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
 // snow_core::StreamHandle<CaptureEvent> implementation
-// ---------------------------------------------------------------------------
 
 impl snow_core::streaming::StreamHandle<CaptureEvent> for StreamHandle {
     type RecvError = std::sync::mpsc::RecvError;
@@ -348,9 +344,7 @@ impl snow_core::streaming::StreamHandle<CaptureEvent> for StreamHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
 // snow_core::StreamStats implementation
-// ---------------------------------------------------------------------------
 
 impl snow_core::streaming::StreamStats for StreamHandle {
     fn snapshot(&self) -> snow_core::streaming::StreamStatsSnapshot {
@@ -405,7 +399,6 @@ fn stream_loop(
     let mut latency_avg_ns: f64 = 0.0;
     const LATENCY_ALPHA: f64 = 0.1;
 
-    // Buffer fill tracking 鈥?stats.buffer_fill is the shared atomic
     // counter. The producer (this loop) increments on successful send,
     // and the consumer decrements via StreamHandle::recv* methods.
 
@@ -425,7 +418,6 @@ fn stream_loop(
         // Pause handling with lifecycle events.
         if pause.load(Ordering::Acquire) {
             if !was_paused {
-                // Entering pause 鈥?send Paused event.
                 let now = Instant::now();
                 pause_started = Some(now);
                 let _ = tx.try_send(CaptureEvent::Paused { at: now });
@@ -437,7 +429,6 @@ fn stream_loop(
             fps_epoch = Instant::now();
             continue;
         } else if was_paused {
-            // Exiting pause 鈥?send Resumed event.
             let now = Instant::now();
             let gap = pause_started
                 .map(|s| now.saturating_duration_since(s))
@@ -567,7 +558,6 @@ fn stream_loop(
                 continue;
             }
             Err(e) => {
-                // Fatal error 鈥?notify receiver and exit.
                 let _ = tx.try_send(CaptureEvent::Error(e.clone()));
                 break;
             }
@@ -612,9 +602,7 @@ fn spin_sleep(duration: Duration) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Async (tokio) stream wrapper
-// ---------------------------------------------------------------------------
 
 /// Async wrapper around `StreamHandle` for tokio-based recording pipelines.
 ///

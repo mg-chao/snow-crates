@@ -195,8 +195,6 @@ mod tests {
         );
     }
 
-    // Feature: unified-crate-architecture, Property 5: AudioPacketMetadata carries Hns100 StreamTimestamp
-    // **Validates: Requirements 2.7**
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
         #[test]

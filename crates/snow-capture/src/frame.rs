@@ -418,8 +418,6 @@ mod tests {
     use proptest::prelude::*;
     use snow_core::timestamp::TickFormat;
 
-    // Feature: unified-crate-architecture, Property 4: FrameMetadata carries RawQpc StreamTimestamp
-    // **Validates: Requirements 2.6**
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
         #[test]

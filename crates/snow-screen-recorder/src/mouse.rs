@@ -161,7 +161,6 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    // ── Strategies ──────────────────────────────────────────────────
 
     fn arb_composition_mode() -> impl Strategy<Value = snow_cursor_capture::CursorCompositionMode> {
         prop_oneof![
@@ -207,8 +206,6 @@ mod tests {
             })
     }
 
-    // ── Property 12: Cursor type conversion fidelity ────────────────
-    // **Validates: Requirements 7.1, 7.2, 7.3**
 
     proptest! {
         /// From conversion on CursorCompositionMode preserves semantic

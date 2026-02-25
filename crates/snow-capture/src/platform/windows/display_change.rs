@@ -1,4 +1,4 @@
-﻿use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -211,9 +211,7 @@ impl Drop for DisplayInfoCache {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Listener thread
-// ---------------------------------------------------------------------------
 
 /// Class name for our message-only window.
 const CLASS_NAME: &str = "SnowCaptureDisplayChangeListener";

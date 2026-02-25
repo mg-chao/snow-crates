@@ -1,4 +1,4 @@
-﻿use super::HdrToSdrParams;
+use super::HdrToSdrParams;
 use half::f16;
 use std::sync::OnceLock;
 
@@ -148,7 +148,6 @@ fn f16_to_srgb_lut() -> &'static [u8; 65_536] {
     })
 }
 
-/// Force-initialize the F16鈫抯RGB LUT so the first HDR capture doesn't
 /// pay the ~1-2 ms build cost.
 pub(crate) fn warmup_lut() {
     let _ = f16_to_srgb_lut();
@@ -165,7 +164,6 @@ unsafe fn pack_f16_rgba_to_srgb(src_words: *const u16, lut: &[u8; 65_536]) -> u3
     let b_bits = ((packed >> 32) & 0xFFFF) as usize;
     let a_bits = ((packed >> 48) & 0xFFFF) as usize;
 
-    // Alpha is linear 0..1 鈫?0..255, clamped.
     let a = f16::from_bits(a_bits as u16).to_f32().clamp(0.0, 1.0);
     let a_byte = (a * 255.0 + 0.5) as u32;
 
@@ -188,7 +186,6 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_scalar_unchecked(
     let mut dst_px = dst as *mut u32;
     let mut remaining = pixel_count;
 
-    // Software prefetch helper 鈥?prefetch the LUT entries for the next
     // batch of pixels so they're in L1/L2 by the time we need them.
     // Uses NTA hint since the LUT is 64 KB and we don't want to evict
     // other hot data from the cache hierarchy.

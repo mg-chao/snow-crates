@@ -1,4 +1,4 @@
-﻿use anyhow::Context;
+use anyhow::Context;
 use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC,
@@ -29,11 +29,9 @@ const PRECOMPILED_CSO: &[u8] = include_bytes!(env!("TONEMAP_CSO_PATH"));
 #[cfg(has_precompiled_shader_1d)]
 const PRECOMPILED_1D_CSO: &[u8] = include_bytes!(env!("TONEMAP_1D_CSO_PATH"));
 
-/// Pre-compiled F16鈫抯RGB shader bytecode.
 #[cfg(has_precompiled_shader_f16)]
 const PRECOMPILED_F16_CSO: &[u8] = include_bytes!(env!("F16_CONVERT_CSO_PATH"));
 
-/// Pre-compiled F16鈫抯RGB 1D shader bytecode.
 #[cfg(has_precompiled_shader_f16_1d)]
 const PRECOMPILED_F16_1D_CSO: &[u8] = include_bytes!(env!("F16_CONVERT_1D_CSO_PATH"));
 
@@ -74,7 +72,6 @@ fn cached_bytecode_1d() -> &'static CaptureResult<Vec<u8>> {
     })
 }
 
-/// Returns cached F16鈫抯RGB shader bytecode.
 fn cached_bytecode_f16() -> &'static CaptureResult<Vec<u8>> {
     static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
     BYTECODE.get_or_init(|| {
@@ -89,7 +86,6 @@ fn cached_bytecode_f16() -> &'static CaptureResult<Vec<u8>> {
     })
 }
 
-/// Returns cached F16鈫抯RGB 1D shader bytecode.
 fn cached_bytecode_f16_1d() -> &'static CaptureResult<Vec<u8>> {
     static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
     BYTECODE.get_or_init(|| {
@@ -178,7 +174,6 @@ const SMALL_TEXTURE_THRESHOLD: u32 = 512;
 /// Shared GPU compute-shader pass infrastructure.
 ///
 /// Encapsulates the D3D11 resources and caching logic common to both
-/// HDR tonemapping and F16鈫抯RGB conversion: shader objects, output
 /// texture/UAV management, SRV caching, and the dispatch call.
 struct GpuComputePass {
     cs: ID3D11ComputeShader,
@@ -389,7 +384,6 @@ impl GpuComputePass {
 pub(crate) struct GpuTonemapper {
     pass: GpuComputePass,
     /// Combined cache of tonemap params and dimensions written to the
-    /// constant buffer 鈥?skip the update when neither has changed.
     cached_cbuf_state: Option<(HdrToSdrParams, u32, u32)>,
 }
 
@@ -447,7 +441,6 @@ impl GpuTonemapper {
     }
 }
 
-/// GPU-accelerated F16 linear 鈫?sRGB conversion (no HDR tonemapping).
 ///
 /// Used when the source is RGBA16Float but no HDR-to-SDR tonemap is needed.
 /// Converts linear light values directly to sRGB gamma on the GPU, so the
@@ -480,7 +473,6 @@ impl GpuF16Converter {
         let height = source_desc.Height;
         self.pass.ensure_output(device, width, height)?;
 
-        // F16 converter only needs dimensions 鈥?HDR fields are zeroed.
         let gpu_params = GpuParams {
             hdr_paper_white_nits: 0.0,
             hdr_maximum_nits: 0.0,

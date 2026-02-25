@@ -20,9 +20,7 @@ fn nt_prefix_pixels(dst: *mut u8, pixel_count: usize, alignment: usize) -> usize
     (bytes_to_align / 4).min(pixel_count)
 }
 
-// ---------------------------------------------------------------------------
 // AVX-512
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn convert_bgra_to_rgba_avx512_unchecked(
@@ -163,9 +161,7 @@ unsafe fn avx512_bgra_core(
     }
 }
 
-// ---------------------------------------------------------------------------
 // AVX2
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn convert_bgra_to_rgba_avx2_unchecked(
@@ -286,9 +282,7 @@ unsafe fn avx2_bgra_core(
     }
 }
 
-// ---------------------------------------------------------------------------
 // SSSE3
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "ssse3")]
 pub(crate) unsafe fn convert_bgra_to_rgba_ssse3_unchecked(
@@ -396,9 +390,7 @@ unsafe fn ssse3_bgra_core(
     }
 }
 
-// ---------------------------------------------------------------------------
 // F16->sRGB via AVX2 + F16C
-// ---------------------------------------------------------------------------
 //
 // Uses `vcvtph2ps` (F16C) to bulk-convert half-floats to f32, then applies
 // a polynomial sRGB gamma approximation entirely in SIMD, packs to u8, and
@@ -604,9 +596,7 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
     } // unsafe
 }
 
-// ---------------------------------------------------------------------------
 // F16 HDR->sRGB via AVX2 + F16C (with PQ tonemap)
-// ---------------------------------------------------------------------------
 //
 // SIMD version of the HDR→SDR tonemap pipeline.  F16C converts half-floats
 // to f32, then we apply the same three-step algorithm as the scalar path:
@@ -846,9 +836,7 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
     } // unsafe
 }
 
-// ---------------------------------------------------------------------------
 // F16->sRGB via AVX-512 + F16C (16 pixels per iteration)
-// ---------------------------------------------------------------------------
 //
 // Processes 16 RGBA f16 pixels at a time by splitting into two 8-wide
 // batches (F16C's `vcvtph2ps` operates on 128→256 bit), applying the
@@ -1030,9 +1018,7 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
     } // unsafe
 }
 
-// ---------------------------------------------------------------------------
 // F16 HDR->sRGB via AVX-512 + F16C (16 pixels per iteration, with PQ tonemap)
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx512f,avx512bw,f16c")]
 pub(crate) unsafe fn convert_f16_rgba_to_srgb_hdr_avx512_unchecked(

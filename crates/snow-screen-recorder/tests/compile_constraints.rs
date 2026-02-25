@@ -3,11 +3,6 @@
 //! These tests verify crate independence, feature flag hygiene, and
 //! backward-compatible deprecated type aliases.
 //!
-//! **Validates: Requirements 4.2, 7.1, 7.2, 8.4, 8.5, 9.2, 9.3**
-
-// ---------------------------------------------------------------------------
-// Req 9.3 — Deprecated type aliases resolve to `snow_core::TimestampAnchor`
-// ---------------------------------------------------------------------------
 
 /// Verify that `snow_capture::FrameTimestampAnchor` is the same type as
 /// `snow_core::timestamp::TimestampAnchor`. If this test compiles and the
@@ -36,9 +31,6 @@ fn deprecated_audio_timestamp_anchor_resolves_to_core() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Req 9.2 — Existing concrete types still exist and implement the new trait
-// ---------------------------------------------------------------------------
 
 /// Verify that `snow_capture::StreamHandle` (the concrete type) is still
 /// publicly accessible. This is a compile-time-only check — we just need

@@ -64,7 +64,6 @@ impl RecordingCoordinator {
         }
     }
 
-    // ── public dispatch entry points ────────────────────────────────
 
     /// Dispatch a unified recording event to the correct processor.
     ///
@@ -231,7 +230,6 @@ impl RecordingCoordinator {
         Ok((outcome, mouse_store))
     }
 
-    // ── private per-stream handlers ─────────────────────────────────
 
     fn handle_video(&mut self, event: VideoCaptureEvent) -> Result<()> {
         match event {
@@ -802,7 +800,6 @@ mod tests {
         assert_eq!(packet.metadata.qpc_position_100ns, qpc_100ns);
     }
 
-    // ── Property-based tests ────────────────────────────────────
 
     use proptest::prelude::*;
     use snow_cursor_capture::CursorFrameSample;
@@ -861,7 +858,6 @@ mod tests {
         })
     }
 
-    // **Validates: Requirement 5.1**
     //
     // Property 7: Event dispatch correctness
     //
@@ -936,7 +932,6 @@ mod tests {
         }
     }
 
-    // **Validates: Requirements 5.5, 5.6**
     //
     // Property 9: Stream termination completeness
     //
@@ -973,7 +968,6 @@ mod tests {
         }
     }
 
-    // **Validates: Requirement 5.8**
     //
     // Property 10: Timestamp monotonicity
     //
@@ -1002,7 +996,6 @@ mod tests {
         }
     }
 
-    // **Validates: Requirement 11.4**
     //
     // Property 15: Audio error is non-fatal
     //
@@ -1080,9 +1073,7 @@ mod tests {
         }
     }
 
-    // Feature: unified-crate-architecture, Property 9: ErrorClass drives coordinator termination decision
     //
-    // **Validates: Requirements 6.4**
     //
     // For any error from a leaf crate, if `Classify::class()` returns `Fatal`,
     // the coordinator shall stop recording. If `Classify::class()` returns

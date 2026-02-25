@@ -123,7 +123,6 @@ mod tests {
         })
     }
 
-    // **Validates: Requirements 5.3, 5.4**
     //
     // Property 8: Pause timeline uses backend timestamps
     //

@@ -281,11 +281,9 @@ mod tests {
 
     use super::StreamBridge;
 
-    // -----------------------------------------------------------------------
     // Mock StreamHandle that yields events from a pre-loaded Vec.
     // Returns Disconnected after all events are consumed.
     // is_running() returns false after all events are consumed.
-    // -----------------------------------------------------------------------
 
     struct MockStreamHandle<E: Clone + Send> {
         events: Vec<E>,
@@ -357,8 +355,6 @@ mod tests {
         }
     }
 
-    // Feature: unified-crate-architecture, Property 6: StreamBridge forwards all events in order
-    // **Validates: Requirements 3.4**
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
         #[test]

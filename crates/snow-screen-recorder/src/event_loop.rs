@@ -37,7 +37,6 @@ pub(crate) fn run_event_loop(
     let mut cursor_disconnected = false;
 
     loop {
-        // ── 1. Audio-first drain ────────────────────────────────
         // Drain up to AUDIO_DRAIN_BATCH audio events before entering
         // the select! wait. This ensures audio gets priority to reduce
         // underrun risk.
@@ -58,12 +57,10 @@ pub(crate) fn run_event_loop(
             }
         }
 
-        // ── 2. Check termination after audio drain ──────────────
         if coordinator.evaluate_termination().is_stop() {
             return Ok(coordinator);
         }
 
-        // ── 3. crossbeam Select across non-disconnected channels ─
         // Build a dynamic Select that only includes live channels.
         let mut sel = Select::new();
 
@@ -151,7 +148,6 @@ pub(crate) fn run_event_loop(
             }
         }
 
-        // ── 4. Check termination after select ───────────────────
         if coordinator.evaluate_termination().is_stop() {
             return Ok(coordinator);
         }
@@ -489,7 +485,6 @@ mod tests {
         );
     }
 
-    // ── Graceful shutdown tests ─────────────────────────────────
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -644,11 +639,9 @@ mod tests {
         );
     }
 
-    // ── Property-based tests ────────────────────────────────────
 
     use proptest::prelude::*;
 
-    // **Validates: Requirements 6.2, 6.5**
     //
     // Property 11: Event completeness across shutdown
     //
@@ -752,7 +745,6 @@ mod tests {
         }
     }
 
-    // **Validates: Requirement 3.3**
     //
     // Property 3: Audio-first drain priority
     //

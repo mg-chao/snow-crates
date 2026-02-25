@@ -186,9 +186,7 @@ mod tests {
     use snow_cursor_capture::CursorFrameSample;
     use std::time::{Duration, Instant};
 
-    // ---------------------------------------------------------------
     // Strategies for generating arbitrary leaf-crate-level event data
-    // ---------------------------------------------------------------
 
     fn arb_stream_timestamp() -> impl Strategy<Value = (Instant, Option<i64>)> {
         (Just(Instant::now()), proptest::option::of(0i64..i64::MAX))
@@ -252,15 +250,12 @@ mod tests {
             })
     }
 
-    // ---------------------------------------------------------------
     // Property 1: Event translation fidelity
     //
-    // **Validates: Requirements 1.2, 1.3, 1.4, 2.6**
     //
     // For any leaf-crate event data, translating it into the
     // corresponding RecordingEvent variant and destructuring back
     // must yield identical payload fields.
-    // ---------------------------------------------------------------
 
     proptest! {
         /// Video Frame translation preserves all payload fields.
@@ -429,16 +424,13 @@ mod tests {
             }
         }
 
-        // ---------------------------------------------------------------
         // Property 2: Embedded cursor extraction
         //
-        // **Validates: Requirements 2.7, 9.5**
         //
         // When a video frame carries embedded cursor data (non-None
         // FrameMetadata::cursor), the adapter must produce both a
         // RecordingEvent::Video and a RecordingEvent::Cursor whose
         // CursorFrameSample matches the frame's embedded cursor data.
-        // ---------------------------------------------------------------
 
         /// Embedded cursor extraction preserves all cursor fields.
         #[test]
@@ -483,15 +475,12 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // Property 13: MonitorSelector resolution
     //
-    // **Validates: Requirements 8.2, 8.5**
     //
     // Matching stable_id resolves to the correct MonitorId.
     // Non-matching stable_id returns InvalidConfig error containing
     // the unresolved stable_id.
-    // ---------------------------------------------------------------
 
     proptest! {
         #[test]
@@ -544,10 +533,8 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // Property 14: Cursor data path exclusivity
     //
-    // **Validates: Requirements 9.5, 9.7**
     //
     // Cursor data arrives through exactly one path, determined at
     // compile time by the `cursor` feature flag:
@@ -562,7 +549,6 @@ mod tests {
     // These tests verify the current configuration's path and assert
     // that no duplicate cursor records can arise from both paths
     // simultaneously.
-    // ---------------------------------------------------------------
 
     /// When cursor feature is enabled, FrameMetadata has a `cursor` field.
     /// This is a compile-time assertion: if the field doesn't exist, this
@@ -694,10 +680,8 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
     // Property 7: resolve_capture_target preserves semantics
     //
-    // **Validates: Requirements 5.2**
     //
     // For any valid RecordingTarget (non-zero dimensions, valid handles),
     // resolve_capture_target returns a CaptureTarget that preserves the
@@ -708,10 +692,8 @@ mod tests {
     // Note: Monitor(selector) requires a real MonitorLayout::snapshot()
     // and Window(selector) requires a real window handle (IsWindow check
     // on Windows), so those variants are not tested here.
-    // ---------------------------------------------------------------
 
     proptest! {
-        // Feature: unified-crate-architecture, Property 7: resolve_capture_target preserves semantics
 
         /// PrimaryMonitor always resolves to CaptureTarget::PrimaryMonitor.
         #[test]
@@ -756,15 +738,11 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------
-    // Feature: unified-crate-architecture, Property 8: Invalid RecordingRegion dimensions produce errors
     //
-    // **Validates: Requirements 5.5**
     //
     // For any RecordingRegion where width == 0 or height == 0,
     // resolve_capture_target shall return an Err indicating invalid
     // dimensions.
-    // ---------------------------------------------------------------
 
     proptest! {
         #[test]

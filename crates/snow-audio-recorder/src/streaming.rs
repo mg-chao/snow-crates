@@ -188,9 +188,7 @@ impl Drop for AudioStreamHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
 // snow_core::StreamHandle<AudioEvent> implementation
-// ---------------------------------------------------------------------------
 
 impl snow_core::streaming::StreamHandle<AudioEvent> for AudioStreamHandle {
     type RecvError = crate::error::RecvError;
@@ -230,9 +228,7 @@ impl snow_core::streaming::StreamHandle<AudioEvent> for AudioStreamHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
 // snow_core::StreamStats implementation
-// ---------------------------------------------------------------------------
 
 impl snow_core::streaming::StreamStats for AudioStreamHandle {
     fn snapshot(&self) -> snow_core::streaming::StreamStatsSnapshot {
