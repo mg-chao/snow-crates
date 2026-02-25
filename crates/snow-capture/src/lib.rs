@@ -34,6 +34,7 @@ pub enum CaptureTarget {
 
 pub use backend::CaptureMode;
 pub use capture_session::{CaptureSession, CaptureSessionBuilder, CaptureSessionConfig};
+#[allow(deprecated)]
 pub use frame::{
     CaptureEvent, ColorSpace, DirtyRect, FrameMetadata, FrameTimestampAnchor,
 };

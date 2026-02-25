@@ -670,8 +670,7 @@ impl CaptureSession {
                         self.region_desktop_direct_support
                             .insert(first_entry.monitor_key, true);
                         out_frame.metadata.sequence = seq;
-                        out_frame.metadata.capture_time = sample.capture_time;
-                        out_frame.metadata.present_time_qpc = sample.present_time_qpc;
+                        out_frame.metadata.set_timing(sample.capture_time, sample.present_time_qpc);
                         out_frame.metadata.is_duplicate =
                             destination_has_history && sample.is_duplicate;
                         self.region_output_history_valid = true;
@@ -707,6 +706,7 @@ impl CaptureSession {
                 };
 
                 copy_region_rgba(&monitor_frame, entry.blit, &mut out_frame)?;
+                #[allow(deprecated)]
                 let sample = CaptureSampleMetadata {
                     capture_time: monitor_frame.metadata.capture_time,
                     present_time_qpc: monitor_frame.metadata.present_time_qpc,
@@ -730,8 +730,7 @@ impl CaptureSession {
         }
 
         out_frame.metadata.sequence = seq;
-        out_frame.metadata.capture_time = latest_capture_time;
-        out_frame.metadata.present_time_qpc = latest_present_qpc;
+        out_frame.metadata.set_timing(latest_capture_time, latest_present_qpc);
         out_frame.metadata.is_duplicate = all_duplicate;
         self.region_output_history_valid = true;
         Ok(out_frame)
@@ -824,6 +823,7 @@ mod tests {
         fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
             // Simulate backends that do not override `capture_with_history_hint`
             // and infer destination history directly from frame metadata.
+            #[allow(deprecated)]
             let inferred_history = reuse
                 .as_ref()
                 .is_some_and(|frame| frame.metadata.capture_time.is_some())
@@ -835,7 +835,7 @@ mod tests {
             let mut frame = reuse.unwrap_or_else(Frame::empty);
             frame.ensure_rgba_capacity(4, 4)?;
             frame.reset_metadata();
-            frame.metadata.capture_time = Some(Instant::now());
+            frame.metadata.set_timing(Some(Instant::now()), None);
             Ok(frame)
         }
     }

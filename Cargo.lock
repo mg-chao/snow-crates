@@ -800,6 +800,8 @@ name = "snow-audio-recorder"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "proptest",
+ "snow-core",
  "windows",
  "windows-core",
 ]
@@ -811,10 +813,21 @@ dependencies = [
  "anyhow",
  "half",
  "image",
+ "proptest",
  "rayon",
  "rustc-hash",
+ "snow-core",
  "snow-cursor-capture",
  "tokio",
+ "windows",
+]
+
+[[package]]
+name = "snow-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "proptest",
  "windows",
 ]
 
@@ -837,6 +850,7 @@ dependencies = [
  "serde_json",
  "snow-audio-recorder",
  "snow-capture",
+ "snow-core",
  "snow-cursor-capture",
  "tempfile",
  "thiserror",

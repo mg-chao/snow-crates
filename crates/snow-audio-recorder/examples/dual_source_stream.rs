@@ -2,7 +2,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use snow_audio_recorder::{
-    AudioEvent, AudioSession, AudioStreamConfig, AudioTimestampAnchor, RecvTimeoutError,
+    AudioEvent, AudioSession, AudioStreamConfig, AudioTimestampAnchorExt,
+    RecvTimeoutError, audio_anchor_from_origin_instant,
 };
 
 fn main() -> Result<()> {
@@ -11,7 +12,7 @@ fn main() -> Result<()> {
     let stream = session.start_streaming(AudioStreamConfig::default())?;
     let stats = stream.stats().clone();
     let stream_origin = Instant::now();
-    let stream_anchor = AudioTimestampAnchor::from_origin_instant(stream_origin);
+    let stream_anchor = audio_anchor_from_origin_instant(stream_origin);
 
     let start = Instant::now();
     println!("capturing system and microphone audio for 5 seconds...");
@@ -19,7 +20,7 @@ fn main() -> Result<()> {
     while start.elapsed() < Duration::from_secs(5) {
         match stream.recv_timeout(Duration::from_millis(500)) {
             Ok(AudioEvent::Packet(packet)) => {
-                let ts = stream_anchor.stream_relative(&packet);
+                let ts = stream_anchor.audio_stream_relative(&packet);
                 if packet.metadata.sequence % 50 == 0 {
                     println!(
                         "source={:?} seq={} frames={} silent={} stream=[{:?}..{:?}]",

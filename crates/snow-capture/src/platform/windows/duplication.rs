@@ -2186,6 +2186,7 @@ impl OutputCapturer {
         let mut frame = reuse
             .or_else(|| self.spare_frame.take())
             .unwrap_or_else(Frame::empty);
+        #[allow(deprecated)]
         let has_frame_history =
             frame.metadata.capture_time.is_some() && !frame.as_rgba_bytes().is_empty();
         let single_shot_screenshot =
@@ -2207,12 +2208,10 @@ impl OutputCapturer {
             };
 
         // Populate frame metadata from DXGI frame info.
-        frame.metadata.capture_time = Some(capture_time);
-        frame.metadata.present_time_qpc = if frame_info.LastPresentTime != 0 {
-            Some(frame_info.LastPresentTime)
-        } else {
-            None
-        };
+        frame.metadata.set_timing(
+            Some(capture_time),
+            if frame_info.LastPresentTime != 0 { Some(frame_info.LastPresentTime) } else { None },
+        );
         frame.metadata.is_duplicate =
             frame_info.LastPresentTime != 0 && frame_info.LastPresentTime == self.last_present_time;
         if frame_info.LastPresentTime != 0 {
@@ -2880,8 +2879,7 @@ impl WindowsDxgiWindowCapturer {
                 Err(e) => return Err(e),
             };
 
-        frame.metadata.capture_time = sample.capture_time;
-        frame.metadata.present_time_qpc = sample.present_time_qpc;
+        frame.metadata.set_timing(sample.capture_time, sample.present_time_qpc);
         frame.metadata.is_duplicate = sample.is_duplicate;
         Ok(frame)
     }

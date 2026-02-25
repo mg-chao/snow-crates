@@ -1764,12 +1764,10 @@ impl WindowsGraphicsCaptureCapturer {
             slot.dirty_rects.clear();
         }
 
-        out.metadata.capture_time = Some(capture_time);
-        out.metadata.present_time_qpc = if present_time_ticks != 0 {
-            Some(present_time_ticks)
-        } else {
-            None
-        };
+        out.metadata.set_timing(
+            Some(capture_time),
+            if present_time_ticks != 0 { Some(present_time_ticks) } else { None },
+        );
         out.metadata.is_duplicate = true;
         out.metadata.dirty_rects.clear();
 
@@ -1804,12 +1802,10 @@ impl WindowsGraphicsCaptureCapturer {
             present_time_ticks != 0 && present_time_ticks == self.last_emitted_present_time;
         let is_duplicate = source_duplicate || emitted_duplicate;
 
-        out.metadata.capture_time = Some(capture_time);
-        out.metadata.present_time_qpc = if present_time_ticks != 0 {
-            Some(present_time_ticks)
-        } else {
-            None
-        };
+        out.metadata.set_timing(
+            Some(capture_time),
+            if present_time_ticks != 0 { Some(present_time_ticks) } else { None },
+        );
         out.metadata.is_duplicate = is_duplicate;
 
         let out_matches_source =
@@ -2269,6 +2265,7 @@ impl WindowsGraphicsCaptureCapturer {
         self.region.blit = None;
 
         let mut out = reuse.unwrap_or_else(Frame::empty);
+        #[allow(deprecated)]
         let destination_has_history =
             out.metadata.capture_time.is_some() && !out.as_rgba_bytes().is_empty();
         let single_shot_screenshot =
@@ -2288,17 +2285,17 @@ impl WindowsGraphicsCaptureCapturer {
                 .read_slot_into_output(slot_idx, &mut out, destination_has_history)
                 .is_ok()
             {
-                out.metadata.capture_time = Some(capture_time);
+                out.metadata.set_timing(Some(capture_time), None);
                 out.metadata.is_duplicate = true;
                 self.has_frame_history = true;
                 return Ok(out);
             }
             self.reset_staging_pipeline();
-            out.metadata.capture_time = Some(capture_time);
+            out.metadata.set_timing(Some(capture_time), None);
             out.metadata.is_duplicate = true;
             return Ok(out);
         } else {
-            out.metadata.capture_time = Some(capture_time);
+            out.metadata.set_timing(Some(capture_time), None);
             out.metadata.is_duplicate = true;
             return Ok(out);
         };
@@ -2421,12 +2418,10 @@ impl WindowsGraphicsCaptureCapturer {
                         "failed to map WGC staging texture",
                     )?;
                 }
-                out.metadata.capture_time = Some(capture_time);
-                out.metadata.present_time_qpc = if time_ticks != 0 {
-                    Some(time_ticks)
-                } else {
-                    None
-                };
+                out.metadata.set_timing(
+                    Some(capture_time),
+                    if time_ticks != 0 { Some(time_ticks) } else { None },
+                );
                 out.metadata.is_duplicate = source_is_duplicate;
                 out.metadata.dirty_rects.clear();
                 if time_ticks != 0 {
@@ -2465,12 +2460,10 @@ impl WindowsGraphicsCaptureCapturer {
                 && out.width() == effective_desc.Width
                 && out.height() == effective_desc.Height
             {
-                out.metadata.capture_time = Some(capture_time);
-                out.metadata.present_time_qpc = if time_ticks != 0 {
-                    Some(time_ticks)
-                } else {
-                    None
-                };
+                out.metadata.set_timing(
+                    Some(capture_time),
+                    if time_ticks != 0 { Some(time_ticks) } else { None },
+                );
                 out.metadata.is_duplicate = source_is_duplicate || emitted_duplicate;
                 out.metadata.dirty_rects.clear();
                 if time_ticks != 0 {

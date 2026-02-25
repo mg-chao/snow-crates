@@ -9,6 +9,7 @@ default = ["cursor"]
 cursor = ["snow-capture/cursor"]
 
 [dependencies]
+snow-core = { path = "../snow-core" }
 snow-capture = { path = "../snow-capture" }
 snow-audio-recorder = { path = "../snow-audio-recorder" }
 snow-cursor-capture = { path = "../snow-cursor-capture" }

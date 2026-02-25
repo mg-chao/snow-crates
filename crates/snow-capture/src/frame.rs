@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 pub use snow_cursor_capture::{CursorCompositionMode, CursorFrameSample, CursorShape};
 
 use crate::error::{CaptureError, CaptureResult};
+use snow_core::timestamp::{StreamTimestamp, TickFormat};
 
 /// Color space / transfer function describing the frame's pixel data.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,11 +46,13 @@ pub type CursorData = CursorFrameSample;
 pub struct FrameMetadata {
     /// Monotonic timestamp taken immediately after the frame was acquired
     /// from the OS capture API. Use for frame pacing and drop detection.
+    #[deprecated(note = "Use `stream_timestamp.instant` instead")]
     pub capture_time: Option<Instant>,
     /// OS presentation timestamp in QPC ticks (100ns units on Windows).
     /// Sourced from `DXGI_OUTDUPL_FRAME_INFO.LastPresentTime` or
     /// `Direct3D11CaptureFrame.SystemRelativeTime`. More accurate than
     /// `capture_time` for A/V sync.
+    #[deprecated(note = "Use `stream_timestamp` instead")]
     pub present_time_qpc: Option<i64>,
     /// Wall-clock time spent inside the capture call (GPU readback,
     /// staging copy, pixel conversion). Lets recorders detect when the
@@ -74,88 +77,34 @@ pub struct FrameMetadata {
     /// `Srgb` for standard dynamic range captures. HDR pipelines can
     /// check this to decide whether tonemapping or passthrough is needed.
     pub color_space: ColorSpace,
+    /// Unified timestamp. `tick_format` is `RawQpc`.
+    pub stream_timestamp: Option<StreamTimestamp>,
 }
 
-/// Anchor for converting raw QPC ticks into stream-relative durations.
-///
-/// Created from the first frame's `present_time_qpc` (or `capture_time`
-/// when QPC is unavailable). All subsequent frames can be mapped to a
-/// consistent `Duration` offset from stream start via
-/// [`stream_relative`](Self::stream_relative).
-#[derive(Clone, Debug)]
-pub struct FrameTimestampAnchor {
-    /// QPC ticks of the first frame (if available).
-    origin_qpc: Option<i64>,
-    /// `Instant` of the first frame (fallback when QPC is absent).
-    origin_instant: Instant,
-    /// QPC frequency (ticks per second), cached at construction.
-    qpc_frequency: i64,
-}
-
-impl FrameTimestampAnchor {
-    /// Build an anchor from the first captured frame's metadata.
-    pub fn from_first_frame(meta: &FrameMetadata) -> Self {
-        let qpc_frequency = qpc_frequency_cached();
-        Self {
-            origin_qpc: meta.present_time_qpc,
-            origin_instant: meta.capture_time.unwrap_or_else(Instant::now),
-            qpc_frequency,
-        }
-    }
-
-    /// Raw QPC ticks of the stream origin frame. Useful for correlating
-    /// with WASAPI audio timestamps which also use QPC.
-    pub fn origin_qpc_ticks(&self) -> Option<i64> {
-        self.origin_qpc
-    }
-
-    /// QPC tick frequency (ticks per second). Returns 0 on non-Windows.
-    pub fn qpc_frequency(&self) -> i64 {
-        self.qpc_frequency
-    }
-
-    /// The `Instant` of the stream origin frame.
-    pub fn origin_instant(&self) -> Instant {
-        self.origin_instant
-    }
-
-    /// Convert a frame's timestamp to a stream-relative `Duration`.
+impl FrameMetadata {
+    /// Set timing fields from a capture operation.
     ///
-    /// Uses QPC when both the anchor and the frame have QPC timestamps,
-    /// otherwise falls back to `capture_time` difference.
-    pub fn stream_relative(&self, meta: &FrameMetadata) -> Duration {
-        if let (Some(origin), Some(current)) = (self.origin_qpc, meta.present_time_qpc) {
-            let delta_ticks = current.saturating_sub(origin).max(0);
-            if self.qpc_frequency > 0 {
-                let secs = delta_ticks / self.qpc_frequency;
-                let remainder = delta_ticks % self.qpc_frequency;
-                let nanos = (remainder as u128 * 1_000_000_000) / self.qpc_frequency as u128;
-                return Duration::new(secs as u64, nanos as u32);
-            }
-        }
-        // Fallback: Instant-based delta.
-        meta.capture_time
-            .unwrap_or_else(Instant::now)
-            .saturating_duration_since(self.origin_instant)
+    /// Populates both the deprecated `capture_time` / `present_time_qpc`
+    /// fields and the new `stream_timestamp` field so that old and new
+    /// consumers both see correct values.
+    #[allow(deprecated)]
+    pub(crate) fn set_timing(&mut self, capture_time: Option<Instant>, present_time_qpc: Option<i64>) {
+        self.capture_time = capture_time;
+        self.present_time_qpc = present_time_qpc;
+        self.stream_timestamp = Some(StreamTimestamp {
+            instant: capture_time.unwrap_or_else(Instant::now),
+            raw_os_ticks: present_time_qpc,
+            tick_format: TickFormat::RawQpc,
+        });
     }
 }
 
-/// Cached QPC frequency. Returns 0 if unavailable.
-fn qpc_frequency_cached() -> i64 {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::System::Performance::QueryPerformanceFrequency;
-        let mut freq = 0i64;
-        unsafe {
-            let _ = QueryPerformanceFrequency(&mut freq);
-        }
-        freq
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        0
-    }
-}
+/// Deprecated alias for [`snow_core::timestamp::TimestampAnchor`].
+///
+/// Use `snow_core::timestamp::TimestampAnchor` (or `snow_core::TimestampAnchor`
+/// if re-exported) directly for new code.
+#[deprecated(note = "Use `snow_core::TimestampAnchor` instead")]
+pub type FrameTimestampAnchor = snow_core::timestamp::TimestampAnchor;
 
 /// Query the current QPC counter value. Returns `None` on non-Windows
 /// or if the call fails.
@@ -429,9 +378,11 @@ impl Frame {
     /// Reset metadata fields to defaults, preserving the pixel buffer.
     /// Called at the start of each capture to avoid stale metadata from
     /// a reused frame leaking into the new result.
+    #[allow(deprecated)]
     pub(crate) fn reset_metadata(&mut self) {
         self.metadata.capture_time = None;
         self.metadata.present_time_qpc = None;
+        self.metadata.stream_timestamp = None;
         self.metadata.capture_duration = None;
         self.metadata.is_duplicate = false;
         self.metadata.dirty_rects.clear();
@@ -458,5 +409,27 @@ impl std::fmt::Debug for Frame {
             .field("data_len", &self.data.len())
             .field("metadata", &self.metadata)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use snow_core::timestamp::TickFormat;
+
+    // Feature: unified-crate-architecture, Property 4: FrameMetadata carries RawQpc StreamTimestamp
+    // **Validates: Requirements 2.6**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn prop_frame_metadata_rawqpc_timestamp(qpc_value in proptest::num::i64::ANY) {
+            let mut meta = FrameMetadata::default();
+            meta.set_timing(Some(Instant::now()), Some(qpc_value));
+
+            let ts = meta.stream_timestamp.as_ref().unwrap();
+            prop_assert_eq!(ts.tick_format, TickFormat::RawQpc);
+            prop_assert_eq!(ts.raw_os_ticks, Some(qpc_value));
+        }
     }
 }

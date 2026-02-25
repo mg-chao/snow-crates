@@ -9,7 +9,8 @@ use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_next as ffmpeg;
 use snow_audio_recorder::{
     AudioFormat, AudioPacket, AudioSampleFormat, AudioSession,
-    AudioStreamConfig, AudioTimestampAnchor, DeviceSelector, SourceConfig, align_packet_frames,
+    AudioStreamConfig, AudioTimestampAnchorExt, DeviceSelector, SourceConfig,
+    align_packet_frames, audio_anchor_from_origin_instant,
 };
 use snow_capture::{CaptureMode, CaptureSession, StreamConfig};
 use uuid::Uuid;
@@ -391,12 +392,13 @@ fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
     }
 }
 
+#[allow(deprecated)]
 pub(crate) struct PcmTrackWriter {
     writer: BufWriter<File>,
     sample_rate_hz: u32,
     channels: u16,
     written_frames: u64,
-    anchor: AudioTimestampAnchor,
+    anchor: snow_audio_recorder::AudioTimestampAnchor,
 }
 
 impl PcmTrackWriter {
@@ -412,7 +414,7 @@ impl PcmTrackWriter {
             sample_rate_hz: sample_rate_hz.max(1),
             channels: channels.max(1),
             written_frames: 0,
-            anchor: AudioTimestampAnchor::from_origin_instant(started_at),
+            anchor: audio_anchor_from_origin_instant(started_at),
         })
     }
 
@@ -473,7 +475,7 @@ impl PcmTrackWriter {
             return Ok(0);
         }
 
-        let packet_ts = self.anchor.stream_relative(packet);
+        let packet_ts = self.anchor.audio_stream_relative(packet);
         let active_start = timeline.active_elapsed_from_stream_offset(packet_ts.start);
         let aligned = align_packet_frames(
             self.written_frames,
@@ -872,24 +874,38 @@ fn new_recording_worker(
     let (senders, receivers) = crate::adapter::create_adapter_channels();
 
     // Determine whether cursor data is embedded in video frames.
+    // When the `cursor` feature is enabled, the video mapper extracts
+    // embedded cursor data from frames and sends it on `cursor_tx`.
     #[cfg(feature = "cursor")]
     let cursor_tx_for_video = Some(senders.cursor_tx.clone());
     #[cfg(not(feature = "cursor"))]
     let cursor_tx_for_video: Option<crossbeam_channel::Sender<crate::event::RecordingEvent>> = None;
 
-    // Start video adapter.
-    let video_adapter = crate::adapter::video::VideoStreamAdapter::start(
+    // Default send timeout for backpressure handling (10ms).
+    let send_timeout = Duration::from_millis(10);
+
+    // Start video adapter via StreamBridge.
+    let video_mapper = crate::adapter::video::create_video_mapper(cursor_tx_for_video);
+    let video_adapter = crate::adapter::stream_bridge::StreamBridge::start(
         capture_stream,
+        video_mapper,
         senders.video_tx,
-        cursor_tx_for_video,
+        send_timeout,
+        "snow-video-bridge",
     )?;
 
-    // Start audio adapter (if audio is enabled).
+    // Start audio adapter via StreamBridge (if audio is enabled).
     let audio_adapter = match audio_stream {
-        Some(handle) => Some(crate::adapter::audio::AudioStreamAdapter::start(
-            handle,
-            senders.audio_tx,
-        )?),
+        Some(handle) => {
+            let audio_mapper = crate::adapter::audio::create_audio_mapper();
+            Some(crate::adapter::stream_bridge::StreamBridge::start(
+                handle,
+                audio_mapper,
+                senders.audio_tx,
+                send_timeout,
+                "snow-audio-bridge",
+            )?)
+        }
         None => {
             // Drop the audio sender so the channel disconnects immediately.
             drop(senders.audio_tx);

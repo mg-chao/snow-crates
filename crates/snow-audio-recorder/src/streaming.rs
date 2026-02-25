@@ -188,6 +188,62 @@ impl Drop for AudioStreamHandle {
     }
 }
 
+// ---------------------------------------------------------------------------
+// snow_core::StreamHandle<AudioEvent> implementation
+// ---------------------------------------------------------------------------
+
+impl snow_core::streaming::StreamHandle<AudioEvent> for AudioStreamHandle {
+    type RecvError = crate::error::RecvError;
+    type TryRecvError = crate::error::TryRecvError;
+    type RecvTimeoutError = crate::error::RecvTimeoutError;
+
+    fn recv(&self) -> Result<AudioEvent, Self::RecvError> {
+        self.recv()
+    }
+
+    fn try_recv(&self) -> Result<AudioEvent, Self::TryRecvError> {
+        self.try_recv()
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<AudioEvent, Self::RecvTimeoutError> {
+        self.recv_timeout(timeout)
+    }
+
+    fn stop(&self) {
+        self.stop()
+    }
+
+    fn pause(&self) {
+        self.pause()
+    }
+
+    fn resume(&self) {
+        self.resume()
+    }
+
+    fn is_paused(&self) -> bool {
+        self.is_paused()
+    }
+
+    fn is_running(&self) -> bool {
+        self.is_running()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// snow_core::StreamStats implementation
+// ---------------------------------------------------------------------------
+
+impl snow_core::streaming::StreamStats for AudioStreamHandle {
+    fn snapshot(&self) -> snow_core::streaming::StreamStatsSnapshot {
+        snow_core::streaming::StreamStatsSnapshot {
+            total_events: self.stats.packets_captured.load(Ordering::Relaxed),
+            dropped_events: self.stats.packets_dropped.load(Ordering::Relaxed),
+            buffer_fill_ratio: self.buffer_fill_percent(),
+        }
+    }
+}
+
 fn stream_loop(
     engine: &mut Box<dyn AudioRecorderEngine>,
     config: &AudioStreamConfig,

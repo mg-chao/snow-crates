@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use snow_core::timestamp::{StreamTimestamp, TickFormat, TimestampAnchor};
+
 use crate::packet::AudioPacket;
 
 /// Stream-relative packet time range.
@@ -34,71 +36,73 @@ impl AudioPacketAlignment {
     }
 }
 
-/// Anchor for converting packet timestamps into stream-relative time.
+/// Deprecated alias for [`snow_core::timestamp::TimestampAnchor`].
 ///
-/// Mirrors the same design as `snow-capture`'s frame timestamp anchor,
-/// so audio/video pipelines can use a shared "relative timeline" model.
-#[derive(Clone, Debug)]
-pub struct AudioTimestampAnchor {
-    origin_qpc_100ns: Option<i64>,
-    origin_instant: Instant,
+/// Use `snow_core::timestamp::TimestampAnchor` (or `snow_core::TimestampAnchor`
+/// if re-exported) directly for new code.
+#[deprecated(note = "Use `snow_core::TimestampAnchor` instead")]
+pub type AudioTimestampAnchor = snow_core::timestamp::TimestampAnchor;
+
+/// Build a [`TimestampAnchor`] from the first audio packet.
+pub fn audio_anchor_from_first_packet(packet: &AudioPacket) -> TimestampAnchor {
+    let origin_qpc_100ns = packet
+        .start_qpc_position_100ns()
+        .or_else(|| packet.end_qpc_position_100ns());
+    let origin_instant = packet
+        .start_capture_time()
+        .or_else(|| packet.end_capture_time())
+        .unwrap_or_else(Instant::now);
+    TimestampAnchor::new(StreamTimestamp {
+        instant: origin_instant,
+        raw_os_ticks: origin_qpc_100ns,
+        tick_format: TickFormat::Hns100,
+    })
 }
 
-impl AudioTimestampAnchor {
-    /// Build an anchor from the first audio packet.
-    pub fn from_first_packet(packet: &AudioPacket) -> Self {
-        Self {
-            origin_qpc_100ns: packet
-                .start_qpc_position_100ns()
-                .or_else(|| packet.end_qpc_position_100ns()),
-            origin_instant: packet
-                .start_capture_time()
-                .or_else(|| packet.end_capture_time())
-                .unwrap_or_else(Instant::now),
-        }
-    }
+/// Build a [`TimestampAnchor`] from a known stream origin instant.
+///
+/// This is the easiest way to align with `snow-capture`: pass the
+/// first video frame's capture instant as the shared origin.
+pub fn audio_anchor_from_origin_instant(origin_instant: Instant) -> TimestampAnchor {
+    TimestampAnchor::new(StreamTimestamp {
+        instant: origin_instant,
+        raw_os_ticks: None,
+        tick_format: TickFormat::Hns100,
+    })
+}
 
-    /// Build an anchor from a known stream origin instant.
-    ///
-    /// This is the easiest way to align with `snow-capture`: pass the
-    /// first video frame's capture instant as the shared origin.
-    pub fn from_origin_instant(origin_instant: Instant) -> Self {
-        Self {
-            origin_qpc_100ns: None,
-            origin_instant,
-        }
-    }
+/// Build a [`TimestampAnchor`] from a known origin instant and optional QPC value (100ns units).
+pub fn audio_anchor_from_origin(
+    origin_instant: Instant,
+    origin_qpc_100ns: Option<i64>,
+) -> TimestampAnchor {
+    TimestampAnchor::new(StreamTimestamp {
+        instant: origin_instant,
+        raw_os_ticks: origin_qpc_100ns,
+        tick_format: TickFormat::Hns100,
+    })
+}
 
-    /// Build an anchor from a known origin instant and optional QPC value.
-    pub fn from_origin(origin_instant: Instant, origin_qpc_100ns: Option<i64>) -> Self {
-        Self {
-            origin_qpc_100ns,
-            origin_instant,
-        }
-    }
-
-    pub fn origin_qpc_100ns(&self) -> Option<i64> {
-        self.origin_qpc_100ns
-    }
-
-    pub fn origin_instant(&self) -> Instant {
-        self.origin_instant
-    }
-
+/// Extension trait providing audio-specific convenience methods on [`TimestampAnchor`].
+pub trait AudioTimestampAnchorExt {
     /// Convert a packet into stream-relative `[start, end]` time.
     ///
     /// Uses QPC(100ns) when both anchor and packet carry QPC metadata,
     /// otherwise falls back to `Instant` deltas.
-    pub fn stream_relative(&self, packet: &AudioPacket) -> AudioPacketTimestamp {
+    fn audio_stream_relative(&self, packet: &AudioPacket) -> AudioPacketTimestamp;
+}
+
+impl AudioTimestampAnchorExt for TimestampAnchor {
+    fn audio_stream_relative(&self, packet: &AudioPacket) -> AudioPacketTimestamp {
         let packet_duration = packet.duration();
         let end = if let (Some(origin), Some(packet_end)) =
-            (self.origin_qpc_100ns, packet.end_qpc_position_100ns())
+            (self.origin().raw_os_ticks, packet.end_qpc_position_100ns())
         {
             hns_delta_to_duration(packet_end.saturating_sub(origin).max(0))
         } else {
             packet_end_instant(packet)
                 .unwrap_or_else(Instant::now)
-                .saturating_duration_since(self.origin_instant)
+                .saturating_duration_since(self.origin().instant)
         };
 
         AudioPacketTimestamp {
@@ -203,27 +207,29 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn stream_relative_prefers_qpc_when_available() {
-        let anchor = AudioTimestampAnchor::from_origin(Instant::now(), Some(1_000_000));
+        let anchor = audio_anchor_from_origin(Instant::now(), Some(1_000_000));
 
         let mut pkt = packet(480); // 10ms at 48kHz.
         pkt.metadata.qpc_position_100ns = Some(1_500_000);
 
-        let ts = anchor.stream_relative(&pkt);
+        let ts = anchor.audio_stream_relative(&pkt);
         assert_eq!(ts.end, Duration::from_millis(50));
         assert_eq!(ts.start, Duration::from_millis(40));
         assert_eq!(ts.duration(), Duration::from_millis(10));
     }
 
     #[test]
+    #[allow(deprecated)]
     fn stream_relative_falls_back_to_instant_when_qpc_absent() {
         let origin = Instant::now();
-        let anchor = AudioTimestampAnchor::from_origin_instant(origin);
+        let anchor = audio_anchor_from_origin_instant(origin);
 
         let mut pkt = packet(480); // 10ms.
         pkt.metadata.capture_time = origin.checked_add(Duration::from_millis(30));
 
-        let ts = anchor.stream_relative(&pkt);
+        let ts = anchor.audio_stream_relative(&pkt);
         assert_eq!(ts.end, Duration::from_millis(30));
         assert_eq!(ts.start, Duration::from_millis(20));
     }

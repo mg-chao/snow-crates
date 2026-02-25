@@ -118,3 +118,18 @@ impl std::error::Error for CaptureError {
 }
 
 pub type CaptureResult<T> = Result<T, CaptureError>;
+
+// ---------------------------------------------------------------------------
+// snow_core::Classify impl — maps CaptureErrorClass → ErrorClass
+// ---------------------------------------------------------------------------
+
+impl snow_core::error::Classify for CaptureError {
+    fn class(&self) -> snow_core::error::ErrorClass {
+        match CaptureError::class(self) {
+            CaptureErrorClass::InvalidInput => snow_core::error::ErrorClass::InvalidConfig,
+            CaptureErrorClass::Unsupported => snow_core::error::ErrorClass::InvalidConfig,
+            CaptureErrorClass::Transient => snow_core::error::ErrorClass::Transient,
+            CaptureErrorClass::Fatal => snow_core::error::ErrorClass::Fatal,
+        }
+    }
+}

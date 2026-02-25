@@ -20,7 +20,10 @@ pub use session::{
     AudioSession, AudioSessionBuilder, AudioStreamConfig, RestartPolicy, SourceConfig,
 };
 pub use streaming::{AudioStreamHandle, AudioStreamStats, AudioStreamStatsSnapshot};
+#[allow(deprecated)]
 pub use timeline::{
     AudioPacketAlignment, AudioPacketTimestamp, AudioTimestampAnchor,
-    align_i16_interleaved_to_duration, align_packet_frames, duration_to_frames_round,
+    AudioTimestampAnchorExt, align_i16_interleaved_to_duration, align_packet_frames,
+    audio_anchor_from_first_packet, audio_anchor_from_origin,
+    audio_anchor_from_origin_instant, duration_to_frames_round,
 };

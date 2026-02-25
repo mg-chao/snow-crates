@@ -2526,11 +2526,7 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
             self.capture_mode,
             destination_has_history,
         )?;
-        frame.metadata.capture_time = Some(capture_time);
-        // GDI doesn't provide native presentation timestamps, so we
-        // synthesize a QPC value at capture time for consistent timing
-        // across backends.
-        frame.metadata.present_time_qpc = crate::frame::query_qpc_now();
+        frame.metadata.set_timing(Some(capture_time), crate::frame::query_qpc_now());
         Ok(frame)
     }
 
@@ -2763,8 +2759,7 @@ impl MonitorCapturer for WindowsWindowCapturer {
             CaptureMode::ScreenRecording => Some(used_path),
             CaptureMode::Screenshot => None,
         };
-        frame.metadata.capture_time = Some(capture_time);
-        frame.metadata.present_time_qpc = crate::frame::query_qpc_now();
+        frame.metadata.set_timing(Some(capture_time), crate::frame::query_qpc_now());
         Ok(frame)
     }
 

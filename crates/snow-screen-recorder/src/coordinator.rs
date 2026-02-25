@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use snow_core::error::{Classify, ErrorClass};
+
 use crate::error::{Result, ScreenRecorderError};
 use crate::event::{
     AudioCaptureEvent, ControlCommand, CursorCaptureEvent, EventAction, RecordingEvent,
@@ -26,8 +28,10 @@ pub(crate) struct RecordingCoordinator {
     capture_ended: bool,
     audio_ended: bool,
     cursor_ended: bool,
-    /// Set when a fatal video error has been received.
-    fatal_video_error: bool,
+    /// Set when a fatal error has been received from any stream.
+    fatal_error: bool,
+    /// Set when an `InvalidConfig` error has been received.
+    invalid_config_error: bool,
     /// Set when a control stop has been requested.
     control_stop: bool,
 }
@@ -54,7 +58,8 @@ impl RecordingCoordinator {
             capture_ended: false,
             audio_ended: false,
             cursor_ended: false,
-            fatal_video_error: false,
+            fatal_error: false,
+            invalid_config_error: false,
             control_stop: false,
         }
     }
@@ -104,14 +109,14 @@ impl RecordingCoordinator {
     /// `EventAction::Stop` for the highest-priority satisfied condition.
     ///
     /// Precedence (highest first):
-    /// 1. `FatalVideoError`
+    /// 1. `FatalError` (any stream reported a fatal or invalid-config error)
     /// 2. `ControlStop`
     /// 3. `AllStreamsEnded`
     ///
     /// `AllChannelsDisconnected` is not evaluated here — it is detected
     /// by the event loop when all crossbeam receivers disconnect.
     pub(crate) fn evaluate_termination(&self) -> EventAction {
-        if self.fatal_video_error {
+        if self.fatal_error || self.invalid_config_error {
             return EventAction::Stop;
         }
         if self.control_stop {
@@ -268,10 +273,26 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            VideoCaptureEvent::Error(_err) => {
-                // Video errors are fatal — the recording cannot continue
-                // without the video stream.
-                self.fatal_video_error = true;
+            VideoCaptureEvent::Error(err) => {
+                // Classify the error using ErrorClass if the concrete type
+                // is available (downcast to CaptureError). Fall back to
+                // Fatal for unrecognized error types.
+                let error_class = err
+                    .downcast_ref::<snow_capture::error::CaptureError>()
+                    .map(|ce| Classify::class(ce))
+                    .unwrap_or(ErrorClass::Fatal);
+
+                match error_class {
+                    ErrorClass::Fatal => {
+                        self.fatal_error = true;
+                    }
+                    ErrorClass::Transient => {
+                        self.capture_ended = true;
+                    }
+                    ErrorClass::InvalidConfig => {
+                        self.invalid_config_error = true;
+                    }
+                }
                 Ok(())
             }
 
@@ -329,10 +350,26 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            AudioCaptureEvent::Error(_err) => {
-                // Audio errors are non-fatal — mark the stream as ended
-                // and continue recording video and cursor data.
-                self.audio_ended = true;
+            AudioCaptureEvent::Error(err) => {
+                // Classify the error using ErrorClass if the concrete type
+                // is available (downcast to AudioError). Fall back to
+                // Transient for unrecognized error types (audio is non-critical).
+                let error_class = err
+                    .downcast_ref::<snow_audio_recorder::error::AudioError>()
+                    .map(|ae| Classify::class(ae))
+                    .unwrap_or(ErrorClass::Transient);
+
+                match error_class {
+                    ErrorClass::Fatal => {
+                        self.fatal_error = true;
+                    }
+                    ErrorClass::Transient => {
+                        self.audio_ended = true;
+                    }
+                    ErrorClass::InvalidConfig => {
+                        self.invalid_config_error = true;
+                    }
+                }
                 Ok(())
             }
 
@@ -378,7 +415,9 @@ impl RecordingCoordinator {
             }
 
             CursorCaptureEvent::Error(_err) => {
-                // Cursor errors are non-fatal — mark ended and continue.
+                // Cursor errors are always non-fatal — mark ended and continue.
+                // CursorCaptureError does not implement Classify, so we
+                // treat all cursor errors as transient.
                 self.cursor_ended = true;
                 Ok(())
             }
@@ -465,8 +504,8 @@ mod tests {
         coord.control_stop = true;
         assert!(matches!(coord.evaluate_termination(), EventAction::Stop));
 
-        // FatalVideoError takes highest precedence
-        coord.fatal_video_error = true;
+        // FatalError takes highest precedence
+        coord.fatal_error = true;
         assert!(matches!(coord.evaluate_termination(), EventAction::Stop));
     }
 
@@ -969,7 +1008,7 @@ mod tests {
     //
     // For any sequence of audio lifecycle events followed by an
     // AudioCaptureEvent::Error, the coordinator marks audio_ended = true,
-    // does NOT set fatal_video_error, and continues to process subsequent
+    // does NOT set fatal_error, and continues to process subsequent
     // video and cursor events normally.
     proptest! {
         #[test]
@@ -1001,19 +1040,19 @@ mod tests {
             // audio_ended should still be false before the error
             prop_assert!(!coord.audio_ended(),
                 "audio_ended must be false before error");
-            prop_assert!(!coord.fatal_video_error,
-                "fatal_video_error must be false before audio error");
+            prop_assert!(!coord.fatal_error,
+                "fatal_error must be false before audio error");
 
-            // 2. Inject the audio error
+            // 2. Inject the audio error (plain string error → falls back to Transient)
             let action = coord.handle_event(
                 RecordingEvent::Audio(AudioCaptureEvent::Error("device lost".into()))
             ).unwrap();
 
-            // 3. Assert audio_ended is set and fatal_video_error is NOT set
+            // 3. Assert audio_ended is set and fatal_error is NOT set
             prop_assert!(coord.audio_ended(),
                 "audio_ended must be true after AudioCaptureEvent::Error");
-            prop_assert!(!coord.fatal_video_error,
-                "fatal_video_error must NOT be set by an audio error");
+            prop_assert!(!coord.fatal_error,
+                "fatal_error must NOT be set by a transient audio error");
             // handle_event returned Ok (we called .unwrap() above) and should be Continue
             // because not all streams have ended yet
             prop_assert!(matches!(action, EventAction::Continue),
@@ -1040,4 +1079,172 @@ mod tests {
                 "should Stop when all three streams have ended");
         }
     }
+
+    // Feature: unified-crate-architecture, Property 9: ErrorClass drives coordinator termination decision
+    //
+    // **Validates: Requirements 6.4**
+    //
+    // For any error from a leaf crate, if `Classify::class()` returns `Fatal`,
+    // the coordinator shall stop recording. If `Classify::class()` returns
+    // `Transient`, the coordinator shall mark the stream as ended and continue
+    // processing other streams. If `Classify::class()` returns `InvalidConfig`,
+    // the coordinator shall stop recording.
+
+    /// Strategy that generates a `CaptureError` whose `Classify::class()` is `Fatal`.
+    fn arb_fatal_capture_error() -> impl Strategy<Value = snow_capture::error::CaptureError> {
+        prop_oneof![
+            Just(snow_capture::error::CaptureError::BufferOverflow),
+            Just(snow_capture::error::CaptureError::platform(
+            std::io::Error::new(std::io::ErrorKind::Other, "platform error"),
+        )),
+        ]
+    }
+
+    /// Strategy that generates a `CaptureError` whose `Classify::class()` is `Transient`.
+    fn arb_transient_capture_error() -> impl Strategy<Value = snow_capture::error::CaptureError> {
+        prop_oneof![
+            Just(snow_capture::error::CaptureError::AccessLost),
+            Just(snow_capture::error::CaptureError::Timeout),
+            Just(snow_capture::error::CaptureError::WorkerDead),
+            Just(snow_capture::error::CaptureError::MonitorLost),
+            Just(snow_capture::error::CaptureError::Canceled),
+            (1u32..4096, 1u32..4096)
+                .prop_map(|(w, h)| snow_capture::error::CaptureError::ResolutionChanged(w, h)),
+        ]
+    }
+
+    /// Strategy that generates a `CaptureError` whose `Classify::class()` is `InvalidConfig`.
+    fn arb_invalid_config_capture_error(
+    ) -> impl Strategy<Value = snow_capture::error::CaptureError> {
+        prop_oneof![
+            ".*".prop_map(|s| snow_capture::error::CaptureError::InvalidTarget(s)),
+            Just(snow_capture::error::CaptureError::NoPrimaryMonitor),
+            ".*".prop_map(|s| snow_capture::error::CaptureError::InvalidConfig(s)),
+            ".*".prop_map(|s| snow_capture::error::CaptureError::UnsupportedFormat(s)),
+            ".*".prop_map(|s| snow_capture::error::CaptureError::BackendUnavailable(s)),
+        ]
+    }
+
+    /// Strategy that generates an `AudioError` whose `Classify::class()` is `Fatal`.
+    fn arb_fatal_audio_error() -> impl Strategy<Value = snow_audio_recorder::error::AudioError> {
+        prop_oneof![
+            Just(snow_audio_recorder::error::AudioError::AccessDenied),
+            Just(snow_audio_recorder::error::AudioError::BufferOverflow),
+            Just(snow_audio_recorder::error::AudioError::platform(
+            std::io::Error::new(std::io::ErrorKind::Other, "platform error"),
+        )),
+        ]
+    }
+
+    /// Strategy that generates an `AudioError` whose `Classify::class()` is `Transient`.
+    fn arb_transient_audio_error(
+    ) -> impl Strategy<Value = snow_audio_recorder::error::AudioError> {
+        prop_oneof![
+            Just(snow_audio_recorder::error::AudioError::DeviceLost),
+            Just(snow_audio_recorder::error::AudioError::Canceled),
+            Just(snow_audio_recorder::error::AudioError::WorkerDead),
+        ]
+    }
+
+    /// Strategy that generates an `AudioError` whose `Classify::class()` is `InvalidConfig`.
+    fn arb_invalid_config_audio_error(
+    ) -> impl Strategy<Value = snow_audio_recorder::error::AudioError> {
+        prop_oneof![
+            ".*".prop_map(|s| snow_audio_recorder::error::AudioError::InvalidConfig(s)),
+            ".*".prop_map(|s| snow_audio_recorder::error::AudioError::DeviceUnavailable(s)),
+            ".*".prop_map(|s| snow_audio_recorder::error::AudioError::UnsupportedFormat(s)),
+            ".*".prop_map(|s| snow_audio_recorder::error::AudioError::BackendUnavailable(s)),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn prop_error_class_fatal_capture_stops(
+            err in arb_fatal_capture_error(),
+        ) {
+            let mut coord = test_coordinator();
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+            let action = coord.handle_event(
+                RecordingEvent::Video(VideoCaptureEvent::Error(boxed))
+            ).unwrap();
+            prop_assert!(matches!(action, EventAction::Stop),
+                "Fatal CaptureError must cause coordinator to Stop");
+        }
+
+        #[test]
+        fn prop_error_class_transient_capture_continues(
+            err in arb_transient_capture_error(),
+        ) {
+            let mut coord = test_coordinator();
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+            let action = coord.handle_event(
+                RecordingEvent::Video(VideoCaptureEvent::Error(boxed))
+            ).unwrap();
+            // Transient → marks capture_ended, but other streams still active → Continue
+            prop_assert!(coord.capture_ended(),
+                "Transient CaptureError must set capture_ended");
+            prop_assert!(!coord.fatal_error,
+                "Transient CaptureError must NOT set fatal_error");
+            prop_assert!(matches!(action, EventAction::Continue),
+                "Transient CaptureError must return Continue (other streams active)");
+        }
+
+        #[test]
+        fn prop_error_class_invalid_config_capture_stops(
+            err in arb_invalid_config_capture_error(),
+        ) {
+            let mut coord = test_coordinator();
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+            let action = coord.handle_event(
+                RecordingEvent::Video(VideoCaptureEvent::Error(boxed))
+            ).unwrap();
+            prop_assert!(matches!(action, EventAction::Stop),
+                "InvalidConfig CaptureError must cause coordinator to Stop");
+        }
+
+        #[test]
+        fn prop_error_class_fatal_audio_stops(
+            err in arb_fatal_audio_error(),
+        ) {
+            let mut coord = test_coordinator();
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+            let action = coord.handle_event(
+                RecordingEvent::Audio(AudioCaptureEvent::Error(boxed))
+            ).unwrap();
+            prop_assert!(matches!(action, EventAction::Stop),
+                "Fatal AudioError must cause coordinator to Stop");
+        }
+
+        #[test]
+        fn prop_error_class_transient_audio_continues(
+            err in arb_transient_audio_error(),
+        ) {
+            let mut coord = test_coordinator();
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+            let action = coord.handle_event(
+                RecordingEvent::Audio(AudioCaptureEvent::Error(boxed))
+            ).unwrap();
+            // Transient → marks audio_ended, but other streams still active → Continue
+            prop_assert!(coord.audio_ended(),
+                "Transient AudioError must set audio_ended");
+            prop_assert!(!coord.fatal_error,
+                "Transient AudioError must NOT set fatal_error");
+            prop_assert!(matches!(action, EventAction::Continue),
+                "Transient AudioError must return Continue (other streams active)");
+        }
+
+        #[test]
+        fn prop_error_class_invalid_config_audio_stops(
+            err in arb_invalid_config_audio_error(),
+        ) {
+            let mut coord = test_coordinator();
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+            let action = coord.handle_event(
+                RecordingEvent::Audio(AudioCaptureEvent::Error(boxed))
+            ).unwrap();
+            prop_assert!(matches!(action, EventAction::Stop),
+                "InvalidConfig AudioError must cause coordinator to Stop");
+        }
+    }
 }
+

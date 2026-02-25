@@ -1,61 +1,114 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossbeam_channel::Sender;
-use snow_capture::{CaptureEvent, StreamHandle};
+use snow_capture::CaptureEvent;
 
-use crate::adapter::{AdapterCommand, StreamAdapter};
 use crate::config::RecordingTarget;
 use crate::error::{Result, ScreenRecorderError};
 #[cfg(feature = "cursor")]
 use crate::event::CursorCaptureEvent;
 use crate::event::{RecordingEvent, StreamTimestamp, VideoCaptureEvent};
 
-/// Default send timeout for backpressure handling (10ms).
+/// Default send timeout for cursor side-channel (10ms).
 const SEND_TIMEOUT: Duration = Duration::from_millis(10);
 
-/// Adapts `snow_capture::StreamHandle` → `RecordingEvent::Video`.
+/// Create a video event mapper closure for use with `StreamBridge`.
 ///
-/// The forwarding thread owns the `StreamHandle` and receives
-/// control commands (`Pause`, `Resume`, `Stop`) via `cmd_rx`.
-pub(crate) struct VideoStreamAdapter {
-    cmd_tx: crossbeam_channel::Sender<AdapterCommand>,
-    running: Arc<AtomicBool>,
-    forward_thread: Option<std::thread::JoinHandle<Result<()>>>,
-}
+/// Converts `CaptureEvent` variants into `RecordingEvent::Video(...)`.
+/// When the `cursor` feature is enabled and `cursor_tx` is `Some`,
+/// the mapper also extracts embedded cursor data from frames and
+/// sends it as a side-effect on the cursor channel.
+pub(crate) fn create_video_mapper(
+    cursor_tx: Option<crossbeam_channel::Sender<RecordingEvent>>,
+) -> impl Fn(CaptureEvent) -> RecordingEvent + Send + 'static {
+    move |event: CaptureEvent| -> RecordingEvent {
+        match event {
+            CaptureEvent::Frame(frame) => {
+                // Extract cursor data if present and cursor_tx is available.
+                #[cfg(feature = "cursor")]
+                if let Some(ref ctx) = cursor_tx {
+                    if let Some(cursor_data) = &frame.metadata.cursor {
+                        let cursor_event =
+                            RecordingEvent::Cursor(CursorCaptureEvent::Sample(cursor_data.clone()));
+                        // Best-effort send for cursor — don't block video pipeline.
+                        let _ = ctx.send_timeout(cursor_event, SEND_TIMEOUT);
+                    }
+                }
 
-impl VideoStreamAdapter {
-    /// Start the video forwarding thread.
-    ///
-    /// `stream_handle` is moved into the forwarding thread which owns it
-    /// for the lifetime of the adapter.
-    /// `video_tx` is the crossbeam sender for video events.
-    /// `cursor_tx` is an optional sender for cursor events extracted from
-    /// frames when the `cursor` feature is enabled.
-    pub(crate) fn start(
-        stream_handle: StreamHandle,
-        video_tx: Sender<RecordingEvent>,
-        cursor_tx: Option<Sender<RecordingEvent>>,
-    ) -> Result<Self> {
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AdapterCommand>();
-        let running = Arc::new(AtomicBool::new(true));
-        let running_flag = running.clone();
+                // Suppress unused-variable warning when cursor feature is off.
+                #[cfg(not(feature = "cursor"))]
+                let _ = &cursor_tx;
 
-        let forward_thread = std::thread::Builder::new()
-            .name("snow-video-adapter".into())
-            .spawn(move || {
-                let result = video_forward_loop(stream_handle, video_tx, cursor_tx, cmd_rx);
-                running_flag.store(false, Ordering::Release);
-                result
-            })
-            .map_err(ScreenRecorderError::Io)?;
+                let ts = StreamTimestamp {
+                    instant: frame
+                        .metadata
+                        .capture_time
+                        .unwrap_or_else(std::time::Instant::now),
+                    qpc_100ns: frame.metadata.present_time_qpc,
+                };
 
-        Ok(Self {
-            cmd_tx,
-            running,
-            forward_thread: Some(forward_thread),
-        })
+                RecordingEvent::Video(VideoCaptureEvent::Frame {
+                    rgba: frame.as_rgba_bytes().to_vec(),
+                    width: frame.width(),
+                    height: frame.height(),
+                    timestamp: ts,
+                    is_duplicate: frame.metadata.is_duplicate,
+                })
+            }
+
+            CaptureEvent::ResolutionChanged {
+                old_width,
+                old_height,
+                new_width,
+                new_height,
+            } => RecordingEvent::Video(VideoCaptureEvent::ResolutionChanged {
+                old_width,
+                old_height,
+                new_width,
+                new_height,
+            }),
+
+            CaptureEvent::FrameDropped { sequence } => {
+                RecordingEvent::Video(VideoCaptureEvent::FrameDropped { sequence })
+            }
+
+            CaptureEvent::Paused { at } => {
+                RecordingEvent::Video(VideoCaptureEvent::Paused { at })
+            }
+
+            CaptureEvent::Resumed { at, gap } => {
+                RecordingEvent::Video(VideoCaptureEvent::Resumed { at, gap })
+            }
+
+            CaptureEvent::StreamEnded => {
+                #[cfg(feature = "cursor")]
+                if let Some(ref ctx) = cursor_tx {
+                    let _ = ctx.send_timeout(
+                        RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded),
+                        SEND_TIMEOUT,
+                    );
+                }
+                #[cfg(not(feature = "cursor"))]
+                let _ = &cursor_tx;
+
+                RecordingEvent::Video(VideoCaptureEvent::StreamEnded)
+            }
+
+            CaptureEvent::Error(err) => {
+                #[cfg(feature = "cursor")]
+                if let Some(ref ctx) = cursor_tx {
+                    let _ = ctx.send_timeout(
+                        RecordingEvent::Cursor(CursorCaptureEvent::Error(Box::new(
+                            std::io::Error::other("video stream failed"),
+                        ))),
+                        SEND_TIMEOUT,
+                    );
+                }
+                #[cfg(not(feature = "cursor"))]
+                let _ = &cursor_tx;
+
+                RecordingEvent::Video(VideoCaptureEvent::Error(Box::new(err)))
+            }
+        }
     }
 }
 
@@ -119,258 +172,6 @@ pub(crate) fn resolve_capture_target(
             let capture_region =
                 snow_capture::CaptureRegion::new(region.x, region.y, region.width, region.height)?;
             Ok(snow_capture::CaptureTarget::Region(capture_region))
-        }
-    }
-}
-
-impl StreamAdapter for VideoStreamAdapter {
-    fn pause(&self) -> Result<()> {
-        self.cmd_tx
-            .send(AdapterCommand::Pause)
-            .map_err(|_| ScreenRecorderError::Encode("video adapter command channel closed".into()))
-    }
-
-    fn resume(&self) -> Result<()> {
-        self.cmd_tx
-            .send(AdapterCommand::Resume)
-            .map_err(|_| ScreenRecorderError::Encode("video adapter command channel closed".into()))
-    }
-
-    fn stop(&self) -> Result<()> {
-        self.cmd_tx
-            .send(AdapterCommand::Stop)
-            .map_err(|_| ScreenRecorderError::Encode("video adapter command channel closed".into()))
-    }
-
-    fn is_running(&self) -> bool {
-        self.running.load(Ordering::Acquire)
-    }
-
-    fn join(&mut self) -> Result<()> {
-        if let Some(handle) = self.forward_thread.take() {
-            handle
-                .join()
-                .map_err(|_| ScreenRecorderError::Encode("video adapter thread panicked".into()))?
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// The forwarding loop that bridges `std::sync::mpsc` → `crossbeam_channel`.
-///
-/// Owns the `StreamHandle` and polls it for capture events. Translates each
-/// `CaptureEvent` into a `RecordingEvent::Video` and sends it on `video_tx`.
-/// When cursor data is embedded in frames, extracts it and sends on `cursor_tx`.
-///
-/// Polls `cmd_rx` between events and after send timeouts to honor
-/// pause/resume/stop commands promptly.
-fn video_forward_loop(
-    stream_handle: StreamHandle,
-    video_tx: Sender<RecordingEvent>,
-    cursor_tx: Option<Sender<RecordingEvent>>,
-    cmd_rx: crossbeam_channel::Receiver<AdapterCommand>,
-) -> Result<()> {
-    // When cursor feature is disabled, cursor_tx is unused since cursor
-    // data is not embedded in frames.
-    #[cfg(not(feature = "cursor"))]
-    let _ = &cursor_tx;
-
-    loop {
-        // Check for commands first (non-blocking).
-        match drain_commands(&cmd_rx, &stream_handle) {
-            CommandResult::Continue => {}
-            CommandResult::Stop => break,
-        }
-
-        // Receive next capture event with timeout so we can check commands periodically.
-        let event = match stream_handle.recv_timeout(Duration::from_millis(25)) {
-            Ok(event) => event,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-
-        match event {
-            CaptureEvent::Frame(frame) => {
-                // Extract cursor data if present and cursor_tx is available.
-                #[cfg(feature = "cursor")]
-                if let Some(ref ctx) = cursor_tx {
-                    if let Some(cursor_data) = &frame.metadata.cursor {
-                        let cursor_event =
-                            RecordingEvent::Cursor(CursorCaptureEvent::Sample(cursor_data.clone()));
-                        // Best-effort send for cursor — don't block video pipeline.
-                        let _ = ctx.send_timeout(cursor_event, SEND_TIMEOUT);
-                    }
-                }
-
-                let ts = StreamTimestamp {
-                    instant: frame
-                        .metadata
-                        .capture_time
-                        .unwrap_or_else(std::time::Instant::now),
-                    qpc_100ns: frame.metadata.present_time_qpc,
-                };
-
-                let recording_event = RecordingEvent::Video(VideoCaptureEvent::Frame {
-                    rgba: frame.as_rgba_bytes().to_vec(),
-                    width: frame.width(),
-                    height: frame.height(),
-                    timestamp: ts,
-                    is_duplicate: frame.metadata.is_duplicate,
-                });
-
-                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
-                    .is_break()
-                {
-                    break;
-                }
-            }
-
-            CaptureEvent::ResolutionChanged {
-                old_width,
-                old_height,
-                new_width,
-                new_height,
-            } => {
-                let recording_event = RecordingEvent::Video(VideoCaptureEvent::ResolutionChanged {
-                    old_width,
-                    old_height,
-                    new_width,
-                    new_height,
-                });
-                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
-                    .is_break()
-                {
-                    break;
-                }
-            }
-
-            CaptureEvent::FrameDropped { sequence } => {
-                let recording_event =
-                    RecordingEvent::Video(VideoCaptureEvent::FrameDropped { sequence });
-                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
-                    .is_break()
-                {
-                    break;
-                }
-            }
-
-            CaptureEvent::Paused { at } => {
-                let recording_event = RecordingEvent::Video(VideoCaptureEvent::Paused { at });
-                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
-                    .is_break()
-                {
-                    break;
-                }
-            }
-
-            CaptureEvent::Resumed { at, gap } => {
-                let recording_event = RecordingEvent::Video(VideoCaptureEvent::Resumed { at, gap });
-                if send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle)
-                    .is_break()
-                {
-                    break;
-                }
-            }
-
-            CaptureEvent::StreamEnded => {
-                #[cfg(feature = "cursor")]
-                if let Some(ref ctx) = cursor_tx {
-                    let _ = ctx.send_timeout(
-                        RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded),
-                        SEND_TIMEOUT,
-                    );
-                }
-                let recording_event = RecordingEvent::Video(VideoCaptureEvent::StreamEnded);
-                let _ = send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle);
-                break;
-            }
-
-            CaptureEvent::Error(err) => {
-                #[cfg(feature = "cursor")]
-                if let Some(ref ctx) = cursor_tx {
-                    let _ = ctx.send_timeout(
-                        RecordingEvent::Cursor(CursorCaptureEvent::Error(Box::new(
-                            std::io::Error::other("video stream failed"),
-                        ))),
-                        SEND_TIMEOUT,
-                    );
-                }
-                let recording_event =
-                    RecordingEvent::Video(VideoCaptureEvent::Error(Box::new(err)));
-                let _ = send_with_backpressure(&video_tx, recording_event, &cmd_rx, &stream_handle);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Result of draining the command channel.
-enum CommandResult {
-    Continue,
-    Stop,
-}
-
-/// Drain all pending commands from the command channel, applying each
-/// to the stream handle. Returns `Stop` if a stop command was received.
-fn drain_commands(
-    cmd_rx: &crossbeam_channel::Receiver<AdapterCommand>,
-    stream_handle: &StreamHandle,
-) -> CommandResult {
-    while let Ok(cmd) = cmd_rx.try_recv() {
-        match cmd {
-            AdapterCommand::Pause => stream_handle.pause(),
-            AdapterCommand::Resume => stream_handle.resume(),
-            AdapterCommand::Stop => {
-                stream_handle.stop();
-                return CommandResult::Stop;
-            }
-        }
-    }
-    CommandResult::Continue
-}
-
-/// Outcome of a backpressure-aware send.
-enum SendOutcome {
-    Sent,
-    /// The receiver disconnected or a stop command was received.
-    Break,
-}
-
-impl SendOutcome {
-    fn is_break(&self) -> bool {
-        matches!(self, SendOutcome::Break)
-    }
-}
-
-/// Send an event with backpressure handling.
-///
-/// Uses `send_timeout` (10ms) and polls the command channel between
-/// retries. Returns `Break` if the channel disconnected or a stop
-/// command was received during backpressure.
-fn send_with_backpressure(
-    tx: &Sender<RecordingEvent>,
-    event: RecordingEvent,
-    cmd_rx: &crossbeam_channel::Receiver<AdapterCommand>,
-    stream_handle: &StreamHandle,
-) -> SendOutcome {
-    let mut event = event;
-    loop {
-        match tx.send_timeout(event, SEND_TIMEOUT) {
-            Ok(()) => return SendOutcome::Sent,
-            Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
-                event = returned;
-                // Poll command channel during backpressure.
-                match drain_commands(cmd_rx, stream_handle) {
-                    CommandResult::Continue => {}
-                    CommandResult::Stop => return SendOutcome::Break,
-                }
-            }
-            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                return SendOutcome::Break;
-            }
         }
     }
 }
@@ -890,6 +691,102 @@ mod tests {
                 prop_assert_eq!(cursor_events.len(), 0,
                     "video adapter must not produce cursor events when cursor feature is disabled");
             }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Property 7: resolve_capture_target preserves semantics
+    //
+    // **Validates: Requirements 5.2**
+    //
+    // For any valid RecordingTarget (non-zero dimensions, valid handles),
+    // resolve_capture_target returns a CaptureTarget that preserves the
+    // target semantics:
+    //   - PrimaryMonitor → PrimaryMonitor
+    //   - Region(r) → Region(cr) where coordinates match
+    //
+    // Note: Monitor(selector) requires a real MonitorLayout::snapshot()
+    // and Window(selector) requires a real window handle (IsWindow check
+    // on Windows), so those variants are not tested here.
+    // ---------------------------------------------------------------
+
+    proptest! {
+        // Feature: unified-crate-architecture, Property 7: resolve_capture_target preserves semantics
+
+        /// PrimaryMonitor always resolves to CaptureTarget::PrimaryMonitor.
+        #[test]
+        fn prop_resolve_capture_target_primary_monitor(_dummy in 0u8..1) {
+            use super::resolve_capture_target;
+            use crate::config::RecordingTarget;
+
+            let target = RecordingTarget::PrimaryMonitor;
+            let result = resolve_capture_target(&target);
+            prop_assert!(result.is_ok(), "PrimaryMonitor should always resolve");
+            match result.unwrap() {
+                snow_capture::CaptureTarget::PrimaryMonitor => { /* correct */ }
+                _ => prop_assert!(false, "expected CaptureTarget::PrimaryMonitor"),
+            }
+        }
+
+        /// Region with non-zero dimensions resolves to CaptureTarget::Region
+        /// with matching coordinates.
+        #[test]
+        fn prop_resolve_capture_target_region(
+            x in -10_000i32..10_000,
+            y in -10_000i32..10_000,
+            width in 1u32..10_000,
+            height in 1u32..10_000,
+        ) {
+            use super::resolve_capture_target;
+            use crate::config::{RecordingRegion, RecordingTarget};
+
+            let region = RecordingRegion::new(x, y, width, height);
+            let target = RecordingTarget::Region(region);
+            let result = resolve_capture_target(&target);
+            prop_assert!(result.is_ok(), "valid region should resolve, got: {:?}", result.err());
+            match result.unwrap() {
+                snow_capture::CaptureTarget::Region(cr) => {
+                    prop_assert_eq!(cr.x, x, "x coordinate must be preserved");
+                    prop_assert_eq!(cr.y, y, "y coordinate must be preserved");
+                    prop_assert_eq!(cr.width, width, "width must be preserved");
+                    prop_assert_eq!(cr.height, height, "height must be preserved");
+                }
+                _ => prop_assert!(false, "expected CaptureTarget::Region"),
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Feature: unified-crate-architecture, Property 8: Invalid RecordingRegion dimensions produce errors
+    //
+    // **Validates: Requirements 5.5**
+    //
+    // For any RecordingRegion where width == 0 or height == 0,
+    // resolve_capture_target shall return an Err indicating invalid
+    // dimensions.
+    // ---------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn prop_invalid_region_dimensions_produce_errors(
+            x in -10_000i32..10_000,
+            y in -10_000i32..10_000,
+            zero_width in proptest::bool::ANY,
+            non_zero_dim in 1u32..10_000,
+        ) {
+            use super::resolve_capture_target;
+            use crate::config::{RecordingRegion, RecordingTarget};
+
+            let (width, height) = if zero_width {
+                (0, non_zero_dim)
+            } else {
+                (non_zero_dim, 0)
+            };
+
+            let region = RecordingRegion { x, y, width, height };
+            let target = RecordingTarget::Region(region);
+            let result = resolve_capture_target(&target);
+            prop_assert!(result.is_err(), "zero-dimension region should produce an error");
         }
     }
 }

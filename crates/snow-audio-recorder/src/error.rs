@@ -100,6 +100,21 @@ impl std::error::Error for AudioError {
 
 pub type AudioResult<T> = Result<T, AudioError>;
 
+// ---------------------------------------------------------------------------
+// snow_core::Classify impl — maps AudioErrorClass → ErrorClass
+// ---------------------------------------------------------------------------
+
+impl snow_core::error::Classify for AudioError {
+    fn class(&self) -> snow_core::error::ErrorClass {
+        match AudioError::class(self) {
+            AudioErrorClass::InvalidInput => snow_core::error::ErrorClass::InvalidConfig,
+            AudioErrorClass::Unsupported => snow_core::error::ErrorClass::InvalidConfig,
+            AudioErrorClass::Transient => snow_core::error::ErrorClass::Transient,
+            AudioErrorClass::Fatal => snow_core::error::ErrorClass::Fatal,
+        }
+    }
+}
+
 /// Error returned by [`AudioStreamHandle::recv`] when the stream has closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecvError;
@@ -151,6 +166,34 @@ impl fmt::Display for RecvTimeoutError {
 }
 
 impl std::error::Error for RecvTimeoutError {}
+
+// ---------------------------------------------------------------------------
+// From impls: audio-specific recv errors → snow_core error types
+// ---------------------------------------------------------------------------
+
+impl From<RecvError> for snow_core::error::RecvError {
+    fn from(_: RecvError) -> Self {
+        snow_core::error::RecvError::Disconnected
+    }
+}
+
+impl From<TryRecvError> for snow_core::error::TryRecvError {
+    fn from(e: TryRecvError) -> Self {
+        match e {
+            TryRecvError::Empty => snow_core::error::TryRecvError::Empty,
+            TryRecvError::Closed => snow_core::error::TryRecvError::Disconnected,
+        }
+    }
+}
+
+impl From<RecvTimeoutError> for snow_core::error::RecvTimeoutError {
+    fn from(e: RecvTimeoutError) -> Self {
+        match e {
+            RecvTimeoutError::Timeout => snow_core::error::RecvTimeoutError::Timeout,
+            RecvTimeoutError::Closed => snow_core::error::RecvTimeoutError::Disconnected,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

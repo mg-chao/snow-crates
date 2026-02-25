@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+snow-core = { path = "../snow-core" }
 anyhow.workspace = true
 windows-core.workspace = true
 windows = { workspace = true, features = [
@@ -18,3 +19,6 @@ windows = { workspace = true, features = [
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
 ] }
+
+[dev-dependencies]
+proptest = "1"

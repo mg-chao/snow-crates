@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::AudioError;
 use crate::format::AudioFormat;
+use snow_core::timestamp::{StreamTimestamp, TickFormat};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioSourceKind {
@@ -14,14 +15,36 @@ pub struct AudioPacketMetadata {
     /// Approximate wall-clock `Instant` at the end of this packet.
     /// Derived from the most recent source chunk that contributes to
     /// the packet.
+    #[deprecated(note = "Use `stream_timestamp.instant` instead")]
     pub capture_time: Option<Instant>,
     /// WASAPI QPC position (100ns units) at packet end.
+    #[deprecated(note = "Use `stream_timestamp` instead")]
     pub qpc_position_100ns: Option<i64>,
     /// Device position in source frames at packet end.
     pub device_position_frames: Option<u64>,
     pub discontinuity: bool,
     pub is_silent: bool,
     pub sequence: u64,
+    /// Unified timestamp. `tick_format` is `Hns100`.
+    pub stream_timestamp: Option<StreamTimestamp>,
+}
+
+impl AudioPacketMetadata {
+    /// Set timing fields from a capture operation.
+    ///
+    /// Populates both the deprecated `capture_time` / `qpc_position_100ns`
+    /// fields and the new `stream_timestamp` field so that old and new
+    /// consumers both see correct values.
+    #[allow(deprecated)]
+    pub(crate) fn set_timing(&mut self, capture_time: Option<Instant>, qpc_position_100ns: Option<i64>) {
+        self.capture_time = capture_time;
+        self.qpc_position_100ns = qpc_position_100ns;
+        self.stream_timestamp = qpc_position_100ns.map(|qpc| StreamTimestamp {
+            instant: capture_time.unwrap_or_else(Instant::now),
+            raw_os_ticks: Some(qpc),
+            tick_format: TickFormat::Hns100,
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +68,7 @@ impl AudioPacket {
     }
 
     /// Wall-clock `Instant` at packet end.
+    #[allow(deprecated)]
     pub fn end_capture_time(&self) -> Option<Instant> {
         self.metadata.capture_time
     }
@@ -56,6 +80,7 @@ impl AudioPacket {
     }
 
     /// QPC position (100ns units) at packet end.
+    #[allow(deprecated)]
     pub fn end_qpc_position_100ns(&self) -> Option<i64> {
         self.metadata.qpc_position_100ns
     }
@@ -126,6 +151,8 @@ pub enum AudioEvent {
 mod tests {
     use super::*;
     use crate::format::AudioSampleFormat;
+    use proptest::prelude::*;
+    use snow_core::timestamp::TickFormat;
 
     fn make_packet(frames: u32) -> AudioPacket {
         let format = AudioFormat::new(48_000, 2, AudioSampleFormat::I16);
@@ -142,6 +169,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn packet_duration_and_qpc_range_are_consistent() {
         let mut packet = make_packet(960);
         packet.metadata.qpc_position_100ns = Some(1_000_000);
@@ -152,6 +180,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn packet_start_capture_time_is_duration_before_end() {
         let mut packet = make_packet(4_800);
         let end = Instant::now();
@@ -164,5 +193,20 @@ mod tests {
             end.saturating_duration_since(start),
             Duration::from_millis(100)
         );
+    }
+
+    // Feature: unified-crate-architecture, Property 5: AudioPacketMetadata carries Hns100 StreamTimestamp
+    // **Validates: Requirements 2.7**
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn prop_audio_metadata_hns100_timestamp(qpc_value in proptest::num::i64::ANY) {
+            let mut meta = AudioPacketMetadata::default();
+            meta.set_timing(Some(Instant::now()), Some(qpc_value));
+
+            let ts = meta.stream_timestamp.as_ref().unwrap();
+            prop_assert_eq!(ts.tick_format, TickFormat::Hns100);
+            prop_assert_eq!(ts.raw_os_ticks, Some(qpc_value));
+        }
     }
 }

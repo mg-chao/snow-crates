@@ -9,6 +9,7 @@ cursor = ["dep:snow-cursor-capture"]
 tokio-stream = ["dep:tokio"]
 
 [dependencies]
+snow-core = { path = "../snow-core" }
 snow-cursor-capture = { path = "../snow-cursor-capture", optional = true }
 anyhow.workspace = true
 rustc-hash.workspace = true
@@ -42,6 +43,7 @@ windows = { workspace = true, features = [
 
 [dev-dependencies]
 image.workspace = true
+proptest = "1"
 
 [[example]]
 name = "capture"

@@ -270,13 +270,16 @@ impl PacketAccumulator {
             format: self.format,
             frames: self.target_frames,
             data,
-            metadata: AudioPacketMetadata {
-                capture_time: pending.capture_time,
-                qpc_position_100ns: pending.qpc_position_100ns,
-                device_position_frames: pending.device_position_frames,
-                discontinuity: pending.discontinuity,
-                is_silent: pending.is_silent,
-                sequence: *sequence,
+            metadata: {
+                let mut meta = AudioPacketMetadata {
+                    device_position_frames: pending.device_position_frames,
+                    discontinuity: pending.discontinuity,
+                    is_silent: pending.is_silent,
+                    sequence: *sequence,
+                    ..Default::default()
+                };
+                meta.set_timing(pending.capture_time, pending.qpc_position_100ns);
+                meta
             },
         })
     }

@@ -306,6 +306,62 @@ impl Drop for StreamHandle {
     }
 }
 
+// ---------------------------------------------------------------------------
+// snow_core::StreamHandle<CaptureEvent> implementation
+// ---------------------------------------------------------------------------
+
+impl snow_core::streaming::StreamHandle<CaptureEvent> for StreamHandle {
+    type RecvError = std::sync::mpsc::RecvError;
+    type TryRecvError = std::sync::mpsc::TryRecvError;
+    type RecvTimeoutError = std::sync::mpsc::RecvTimeoutError;
+
+    fn recv(&self) -> Result<CaptureEvent, Self::RecvError> {
+        self.recv()
+    }
+
+    fn try_recv(&self) -> Result<CaptureEvent, Self::TryRecvError> {
+        self.try_recv()
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, Self::RecvTimeoutError> {
+        self.recv_timeout(timeout)
+    }
+
+    fn stop(&self) {
+        self.stop()
+    }
+
+    fn pause(&self) {
+        self.pause()
+    }
+
+    fn resume(&self) {
+        self.resume()
+    }
+
+    fn is_paused(&self) -> bool {
+        self.is_paused()
+    }
+
+    fn is_running(&self) -> bool {
+        self.is_running()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// snow_core::StreamStats implementation
+// ---------------------------------------------------------------------------
+
+impl snow_core::streaming::StreamStats for StreamHandle {
+    fn snapshot(&self) -> snow_core::streaming::StreamStatsSnapshot {
+        snow_core::streaming::StreamStatsSnapshot {
+            total_events: self.stats.frames_captured.load(Ordering::Relaxed),
+            dropped_events: self.stats.frames_dropped.load(Ordering::Relaxed),
+            buffer_fill_ratio: self.buffer_fill_percent(),
+        }
+    }
+}
+
 fn stream_loop(
     session: &mut CaptureSession,
     target: &CaptureTarget,

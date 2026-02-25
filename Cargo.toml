@@ -1,5 +1,6 @@
 ﻿[workspace]
 members = [
+    "crates/snow-core",
     "crates/snow-capture",
     "crates/snow-audio-recorder",
     "crates/snow-screen-recorder",

@@ -1,6 +1,7 @@
 pub(crate) mod audio;
 #[cfg(not(feature = "cursor"))]
 pub(crate) mod cursor;
+pub(crate) mod stream_bridge;
 pub(crate) mod video;
 
 use crate::error::Result;
