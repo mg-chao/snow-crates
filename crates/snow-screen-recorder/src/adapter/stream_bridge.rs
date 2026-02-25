@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
@@ -108,9 +108,7 @@ where
         if let Some(handle) = self.forward_thread.take() {
             handle
                 .join()
-                .map_err(|_| {
-                    ScreenRecorderError::Encode("stream bridge thread panicked".into())
-                })?
+                .map_err(|_| ScreenRecorderError::Encode("stream bridge thread panicked".into()))?
         } else {
             Ok(())
         }
@@ -140,6 +138,14 @@ where
     F: Fn(E) -> RecordingEvent + Send + 'static,
 {
     loop {
+        // Always drain control commands before polling the source handle.
+        // Without this, hot streams that never hit timeout/backpressure can
+        // starve Pause/Resume/Stop indefinitely.
+        match drain_commands(&cmd_rx, &handle) {
+            CommandResult::Continue => {}
+            CommandResult::Stop => break,
+        }
+
         match handle.recv_timeout(RECV_TIMEOUT).map_err(Into::into) {
             Ok(event) => {
                 let recording_event = mapper(event);
@@ -155,12 +161,10 @@ where
                     break;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                match drain_commands(&cmd_rx, &handle) {
-                    CommandResult::Continue => {}
-                    CommandResult::Stop => break,
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => match drain_commands(&cmd_rx, &handle) {
+                CommandResult::Continue => {}
+                CommandResult::Stop => break,
+            },
             Err(RecvTimeoutError::Disconnected) => {
                 break;
             }
@@ -261,7 +265,6 @@ mod tests {
 
     use super::StreamBridge;
 
-
     struct MockStreamHandle<E: Clone + Send> {
         events: Vec<E>,
         index: Arc<AtomicUsize>,
@@ -330,6 +333,136 @@ mod tests {
         fn is_running(&self) -> bool {
             !self.stopped.load(Ordering::Acquire)
         }
+    }
+
+    #[derive(Default)]
+    struct CommandCounters {
+        pause_calls: AtomicUsize,
+        resume_calls: AtomicUsize,
+        stop_calls: AtomicUsize,
+    }
+
+    struct CommandResponsiveStreamHandle {
+        counters: Arc<CommandCounters>,
+        produced: AtomicUsize,
+        produced_limit: usize,
+        stopped: AtomicBool,
+        per_event_delay: Duration,
+    }
+
+    impl CommandResponsiveStreamHandle {
+        fn new(
+            counters: Arc<CommandCounters>,
+            produced_limit: usize,
+            per_event_delay: Duration,
+        ) -> Self {
+            Self {
+                counters,
+                produced: AtomicUsize::new(0),
+                produced_limit,
+                stopped: AtomicBool::new(false),
+                per_event_delay,
+            }
+        }
+    }
+
+    impl StreamHandle<u8> for CommandResponsiveStreamHandle {
+        type RecvError = CoreRecvError;
+        type TryRecvError = CoreTryRecvError;
+        type RecvTimeoutError = CoreRecvTimeoutError;
+
+        fn recv(&self) -> std::result::Result<u8, Self::RecvError> {
+            self.recv_timeout(Duration::from_millis(0))
+                .map_err(|_| CoreRecvError::Disconnected)
+        }
+
+        fn try_recv(&self) -> std::result::Result<u8, Self::TryRecvError> {
+            self.recv_timeout(Duration::from_millis(0))
+                .map_err(|_| CoreTryRecvError::Disconnected)
+        }
+
+        fn recv_timeout(
+            &self,
+            _timeout: Duration,
+        ) -> std::result::Result<u8, Self::RecvTimeoutError> {
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(CoreRecvTimeoutError::Disconnected);
+            }
+
+            let produced = self.produced.fetch_add(1, Ordering::AcqRel);
+            if produced >= self.produced_limit {
+                self.stopped.store(true, Ordering::Release);
+                return Err(CoreRecvTimeoutError::Disconnected);
+            }
+
+            std::thread::sleep(self.per_event_delay);
+            Ok(1)
+        }
+
+        fn stop(&self) {
+            self.counters.stop_calls.fetch_add(1, Ordering::AcqRel);
+            self.stopped.store(true, Ordering::Release);
+        }
+
+        fn pause(&self) {
+            self.counters.pause_calls.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn resume(&self) {
+            self.counters.resume_calls.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn is_paused(&self) -> bool {
+            false
+        }
+
+        fn is_running(&self) -> bool {
+            !self.stopped.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn control_commands_are_drained_on_hot_streams() {
+        let (event_tx, _event_rx) = crossbeam_channel::bounded::<RecordingEvent>(512);
+        let counters = Arc::new(CommandCounters::default());
+        let handle = CommandResponsiveStreamHandle::new(
+            Arc::clone(&counters),
+            200,
+            Duration::from_millis(1),
+        );
+
+        let mut bridge = StreamBridge::start(
+            handle,
+            |_v: u8| RecordingEvent::Video(VideoCaptureEvent::FrameDropped { sequence: 1 }),
+            event_tx,
+            Duration::from_millis(10),
+            "test-hot-stream-bridge",
+        )
+        .expect("bridge should start");
+
+        std::thread::sleep(Duration::from_millis(10));
+        bridge.pause().expect("pause command should enqueue");
+        bridge.resume().expect("resume command should enqueue");
+        bridge.stop().expect("stop command should enqueue");
+        bridge
+            .join()
+            .expect("bridge should stop after control commands");
+
+        assert_eq!(
+            counters.pause_calls.load(Ordering::Acquire),
+            1,
+            "pause should be propagated to handle exactly once"
+        );
+        assert_eq!(
+            counters.resume_calls.load(Ordering::Acquire),
+            1,
+            "resume should be propagated to handle exactly once"
+        );
+        assert_eq!(
+            counters.stop_calls.load(Ordering::Acquire),
+            1,
+            "stop should be propagated to handle exactly once"
+        );
     }
 
     proptest! {
