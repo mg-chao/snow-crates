@@ -27,8 +27,8 @@ const VIDEO_CHANNEL_CAPACITY: usize = 8;
 /// Channel capacity for audio source.
 const AUDIO_CHANNEL_CAPACITY: usize = 4;
 /// Channel capacity for cursor source (standalone path).
+#[cfg(not(feature = "cursor"))]
 const CURSOR_CHANNEL_CAPACITY: usize = 4;
-
 /// Build a `StreamMultiplexer<RecordingEvent>` from the given leaf stream handles.
 ///
 /// Registers:

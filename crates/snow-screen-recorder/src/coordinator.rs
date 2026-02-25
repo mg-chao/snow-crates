@@ -119,18 +119,6 @@ impl RecordingCoordinator {
         self.capture_ended && self.audio_ended && self.cursor_ended
     }
 
-    /// Returns `true` when every source in the active set has ended.
-    ///
-    /// Unlike `all_streams_ended()` which hard-codes three boolean flags,
-    /// this method is source-set aware: if a source was never registered
-    /// (e.g. audio not configured, or cursor unavailable), it does not
-    /// block completion.
-    pub(crate) fn all_active_sources_ended(&self) -> bool {
-        self.active_sources
-            .iter()
-            .all(|s| self.ended_sources.contains(s))
-    }
-
     /// Mark a source as ended (used by the multiplexer-based event loop
     /// when receiving `MuxStatus` events).
     pub(crate) fn mark_source_ended(&mut self, source: SourceId) {
@@ -491,45 +479,6 @@ mod tests {
         assert_ne!(VIDEO_SOURCE, AUDIO_SOURCE);
         assert_ne!(VIDEO_SOURCE, CURSOR_SOURCE);
         assert_ne!(AUDIO_SOURCE, CURSOR_SOURCE);
-    }
-
-    #[test]
-    fn all_active_sources_ended_requires_all_active() {
-        let mut coord = test_coordinator();
-        // Initially all three sources are active and none ended.
-        assert!(!coord.all_active_sources_ended());
-
-        coord.ended_sources.insert(VIDEO_SOURCE);
-        assert!(!coord.all_active_sources_ended());
-
-        coord.ended_sources.insert(AUDIO_SOURCE);
-        assert!(!coord.all_active_sources_ended());
-
-        coord.ended_sources.insert(CURSOR_SOURCE);
-        assert!(coord.all_active_sources_ended());
-    }
-
-    #[test]
-    fn all_active_sources_ended_with_subset() {
-        let mut coord = test_coordinator();
-        // Remove audio from active set — simulates audio not configured.
-        coord.active_sources.remove(&AUDIO_SOURCE);
-
-        assert!(!coord.all_active_sources_ended());
-
-        coord.ended_sources.insert(VIDEO_SOURCE);
-        assert!(!coord.all_active_sources_ended());
-
-        coord.ended_sources.insert(CURSOR_SOURCE);
-        assert!(coord.all_active_sources_ended());
-    }
-
-    #[test]
-    fn all_active_sources_ended_empty_active_set() {
-        let mut coord = test_coordinator();
-        coord.active_sources.clear();
-        // No active sources means trivially all ended.
-        assert!(coord.all_active_sources_ended());
     }
 
     #[test]
