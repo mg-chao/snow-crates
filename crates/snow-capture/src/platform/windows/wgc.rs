@@ -988,8 +988,6 @@ impl WindowsGraphicsCaptureCapturer {
         } else {
             None
         };
-        // Create the F16 converter for non-HDR F16 sources.
-        // Non-fatal if it fails -- we fall back to CPU conversion.
         let gpu_f16_converter = if pixel_format == DirectXPixelFormat::R16G16B16A16Float {
             GpuF16Converter::new(&device).ok()
         } else {
@@ -1166,7 +1164,6 @@ impl WindowsGraphicsCaptureCapturer {
         allow_stale_return: bool,
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
-            // Mirror the full-frame low-latency path for region capture.
             if self.region.pending_slot.is_some() {
                 if let Some(fresh) = self.try_take_latest_frame()? {
                     self.relax_stale_timeout();

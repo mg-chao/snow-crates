@@ -73,8 +73,7 @@ pub trait Classify {
     fn class(&self) -> ErrorClass;
 }
 
-// From impls: std::sync::mpsc errors → snow_core error types
-//
+// From impls: std::sync::mpsc errors -> snow_core error types
 // These live in snow-core (where the target types are defined) to satisfy
 // Rust's orphan rules. Leaf crates that use std::sync::mpsc channels
 // (e.g. snow-capture) get these conversions for free.

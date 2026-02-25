@@ -23,13 +23,12 @@ pub(crate) fn create_video_mapper(
     move |event: CaptureEvent| -> RecordingEvent {
         match event {
             CaptureEvent::Frame(frame) => {
-                // Extract cursor data if present and cursor_tx is available.
                 #[cfg(feature = "cursor")]
                 if let Some(ref ctx) = cursor_tx {
                     if let Some(cursor_data) = &frame.metadata.cursor {
                         let cursor_event =
                             RecordingEvent::Cursor(CursorCaptureEvent::Sample(cursor_data.clone()));
-                        // Best-effort send for cursor — don't block video pipeline.
+                        // Best-effort send for cursor - don't block video pipeline.
                         let _ = ctx.send_timeout(cursor_event, SEND_TIMEOUT);
                     }
                 }
@@ -150,7 +149,6 @@ pub(crate) fn resolve_capture_target(
         }
         RecordingTarget::Window(selector) => {
             let window_id = snow_capture::WindowId::from_raw_handle(selector.raw_handle);
-            // Validate the window is still alive and capturable (Windows-only).
             #[cfg(target_os = "windows")]
             {
                 use windows::Win32::Foundation::HWND;
@@ -538,7 +536,7 @@ mod tests {
         /// arbitrary cursor samples. When the cursor feature is enabled,
         /// embedded cursor data in a frame produces exactly one cursor
         /// event on the cursor channel. When disabled, the video path
-        /// never produces cursor events — cursor data comes exclusively
+        /// never produces cursor events - cursor data comes exclusively
         /// from CursorStreamAdapter.
         #[test]
         fn prop_cursor_data_path_exclusivity(

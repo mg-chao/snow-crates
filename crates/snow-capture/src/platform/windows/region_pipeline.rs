@@ -12,13 +12,10 @@ use crate::frame::DirtyRect;
 
 use super::surface::{self, StagingSampleDesc};
 
-// Spin-poll tuning constants shared by both GPU backends.
-
 pub(crate) const REGION_SPIN_INITIAL_POLLS: u32 = 4;
 pub(crate) const REGION_SPIN_MIN_POLLS: u32 = 2;
 pub(crate) const REGION_SPIN_MAX_POLLS: u32 = 64;
 pub(crate) const REGION_SPIN_INCREASE_STEP: u32 = 4;
-
 
 /// Trait abstracting the slot reset behavior that differs between backends.
 ///
@@ -29,8 +26,6 @@ pub(crate) trait RegionSlot: Default {
     fn soft_reset(&mut self);
     fn hard_reset(&mut self);
 }
-
-// needed by the shared pipeline helpers.
 
 /// Provides access to the common staging-slot fields that the shared region
 /// pipeline helpers need.  Each backend implements this for its own slot type.
@@ -100,10 +95,6 @@ impl<S: RegionSlot, const N: usize> RegionPipelineState<S, N> {
         self.blit = Some(blit);
     }
 }
-
-// slot references.  These encapsulate the mechanical D3D11 operations that
-// are identical between DXGI and WGC.
-
 /// Check whether a D3D11 event query has been signalled.
 ///
 /// The DXGI backend intentionally ignores the `data` value (for

@@ -17,8 +17,8 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// Generic adapter that bridges any `StreamHandle<E>` into a crossbeam channel.
 ///
-/// `E` — event type from the leaf crate.
-/// `F` — mapping closure `Fn(E) -> RecordingEvent`.
+/// `E` - event type from the leaf crate.
+/// `F` - mapping closure `Fn(E) -> RecordingEvent`.
 ///
 /// Replaces the near-identical `VideoStreamAdapter` and `AudioStreamAdapter`
 /// forwarding-thread implementations with a single generic version.
@@ -117,7 +117,7 @@ where
     }
 }
 
-/// The generic forwarding loop that bridges any `StreamHandle<E>` → crossbeam channel.
+/// The generic forwarding loop that bridges any `StreamHandle<E>` -> crossbeam channel.
 ///
 /// Owns the handle and polls it for events via `recv_timeout`. Maps each event
 /// through `mapper` and sends the result on `event_tx`. Polls `cmd_rx` on
@@ -125,8 +125,8 @@ where
 ///
 /// Stopped detection: when `recv_timeout` returns `Disconnected`, the loop
 /// checks `handle.is_running()`:
-/// - `true` → unexpected disconnect, source still alive but channel closed
-/// - `false` → clean stop (someone called `stop()`), exit without sentinel
+/// - `true` -> unexpected disconnect, source still alive but channel closed
+/// - `false` -> clean stop (someone called `stop()`), exit without sentinel
 fn forward_loop<E, H, F>(
     handle: H,
     mapper: F,
@@ -156,31 +156,12 @@ where
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                // No event available — drain commands and retry.
                 match drain_commands(&cmd_rx, &handle) {
                     CommandResult::Continue => {}
                     CommandResult::Stop => break,
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                // Channel closed. Distinguish "stopped by command" from
-                // "source crashed / unexpected close":
-                if handle.is_running() {
-                    // Source thread still alive but channel closed — unexpected.
-                    // The caller (task 6.4/6.5) provides a mapper that can
-                    // produce StreamEnded events, but the generic bridge
-                    // cannot fabricate an E. Instead we note the unexpected
-                    // disconnect; the coordinator will detect the adapter
-                    // stopped and treat it as stream-ended.
-                    //
-                    // Note: the design says "send StreamEnded sentinel" but
-                    // the generic bridge has no way to construct an E value.
-                    // The coordinator already handles adapter exit as stream
-                    // end, so this is safe.
-                }
-                // If !is_running(), the bridge (or someone) called stop(),
-                // which set the stop flag, the thread exited, and the channel
-                // closed. Clean exit, no sentinel needed.
                 break;
             }
         }
@@ -251,7 +232,6 @@ where
             Ok(()) => return SendOutcome::Sent,
             Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
                 event = returned;
-                // Poll command channel during backpressure.
                 match drain_commands(cmd_rx, handle) {
                     CommandResult::Continue => {}
                     CommandResult::Stop => return SendOutcome::Break,

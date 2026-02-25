@@ -12,7 +12,7 @@ use crate::event::{CursorCaptureEvent, RecordingEvent};
 /// Default send timeout for backpressure handling (10ms).
 const SEND_TIMEOUT: Duration = Duration::from_millis(10);
 
-/// Adapts `snow_cursor_capture::CursorSampler` → `RecordingEvent::Cursor`.
+/// Adapts `snow_cursor_capture::CursorSampler` -> `RecordingEvent::Cursor`.
 ///
 /// Only created when `snow-capture` is built without the `cursor` feature.
 /// Polls `CursorSampler` at the target FPS on a dedicated thread.
@@ -108,7 +108,7 @@ fn cursor_forward_loop(
     loop {
         let tick_start = Instant::now();
 
-        // Drain commands — CursorSampler has no pause/resume API,
+        // Drain commands - CursorSampler has no pause/resume API,
         // so we track paused state locally.
         match drain_commands(&cmd_rx, &mut paused) {
             CommandResult::Continue => {}
@@ -134,14 +134,12 @@ fn cursor_forward_loop(
             }
         }
 
-        // Sleep for remaining time in the poll interval.
         let elapsed = tick_start.elapsed();
         if let Some(remaining) = poll_interval.checked_sub(elapsed) {
             std::thread::sleep(remaining);
         }
     }
 
-    // Send StreamEnded after the loop exits.
     let _ = cursor_tx.send_timeout(
         RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded),
         SEND_TIMEOUT,
@@ -204,7 +202,6 @@ fn send_with_backpressure(
             Ok(()) => return SendOutcome::Sent,
             Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
                 event = returned;
-                // Poll command channel during backpressure.
                 match drain_commands(cmd_rx, paused) {
                     CommandResult::Continue => {}
                     CommandResult::Stop => return SendOutcome::Break,

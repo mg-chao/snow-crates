@@ -364,9 +364,7 @@ impl CaptureSession {
     }
 
     #[cfg(not(feature = "cursor"))]
-    fn attach_cursor_metadata(&mut self, _frame: &mut Frame) {
-        // No-op when cursor feature is disabled.
-    }
+    fn attach_cursor_metadata(&mut self, _frame: &mut Frame) {}
 
     fn resolve_target(&self, target: &CaptureTarget) -> CaptureResult<MonitorId> {
         match target {
@@ -451,7 +449,6 @@ impl CaptureSession {
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
 
-        // First attempt -- may use the reuse buffer.
         let cap_start = std::time::Instant::now();
         let first_result =
             get_capturer(self)?.capture_with_history_hint(reuse, destination_has_history);
@@ -470,7 +467,6 @@ impl CaptureSession {
             Err(error) => return Err(error),
         }
 
-        // Retry loop after capturer reset.
         for attempt in 0..max_retries {
             let retry_start = std::time::Instant::now();
             let result = get_capturer(self)?.capture_with_history_hint(None, false);
@@ -627,7 +623,6 @@ impl CaptureSession {
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
 
-        // Prepare output frame.
         let mut out_frame = reuse.unwrap_or_else(Frame::empty);
         let had_region_history = self.region_output_history_valid;
         self.region_output_history_valid = false;
@@ -638,7 +633,6 @@ impl CaptureSession {
             && !out_frame.as_rgba_bytes().is_empty();
         out_frame.ensure_rgba_capacity(out_w, out_h)?;
         out_frame.reset_metadata();
-        // Initialize only when first created or when the region target changed.
         if !destination_has_history {
             out_frame.as_mut_rgba_bytes().fill(0);
         }

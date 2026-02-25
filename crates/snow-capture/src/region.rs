@@ -173,7 +173,6 @@ fn snapshot_windows_from_monitors(monitors: Vec<MonitorId>) -> CaptureResult<Mon
         return Err(CaptureError::MonitorLost);
     }
 
-    // Compute virtual desktop bounding box.
     let mut vl = i32::MAX;
     let mut vt = i32::MAX;
     let mut vr = i32::MIN;

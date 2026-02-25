@@ -1136,7 +1136,6 @@ impl GdiResources {
     fn refresh_screen_dc(&mut self) -> CaptureResult<()> {
         self.release_window_dc();
 
-        // Release the old DC first.
         if !self.screen_dc.0.is_null() {
             unsafe {
                 let _ = ReleaseDC(None, self.screen_dc);
@@ -1970,7 +1969,6 @@ impl GdiResources {
             }
         }
 
-        // write directly into the Frame to avoid an extra memcpy.
         unsafe {
             match mode {
                 CaptureMode::ScreenRecording => convert::convert_bgra_to_rgba_nt_unchecked(
@@ -2476,8 +2474,6 @@ impl WindowsMonitorCapturer {
     fn refresh_geometry(&mut self) -> CaptureResult<()> {
         let current_gen = self.resolver.display_generation();
 
-        // When backed by the event-driven DisplayInfoCache, skip the
-        // WM_DISPLAYCHANGE has fired since our last check.
         if let (Some(current), Some(last)) = (current_gen, self.last_display_generation)
             && current == last
         {
@@ -2486,8 +2482,6 @@ impl WindowsMonitorCapturer {
 
         self.last_display_generation = current_gen;
 
-        // capture from a stale device context after resolution /
-        // composition changes.
         self.resources.refresh_screen_dc()?;
 
         match geometry_from_handle(self.geometry.handle) {

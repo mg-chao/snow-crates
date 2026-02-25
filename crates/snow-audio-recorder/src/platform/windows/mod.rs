@@ -100,7 +100,7 @@ struct WasapiEngine {
 // SAFETY: WasapiEngine is moved into and used by a single dedicated worker thread.
 // All COM interfaces are initialized in MTA on that thread and never shared.
 // The inner `ComState` is `!Send` by construction, so it cannot be independently
-// sent across threads — only the outer engine (which owns it) crosses the thread
+// sent across threads; only the outer engine (which owns it) crosses the thread
 // boundary via this impl.
 unsafe impl Send for WasapiEngine {}
 
@@ -111,7 +111,6 @@ impl SourceRetryState {
             started: now,
             attempts: 0,
             current_backoff: initial_backoff,
-            // First attempt is immediate — no initial delay.
             next_attempt_at: now,
             last_error,
         }
@@ -279,9 +278,7 @@ impl WasapiEngine {
 
     /// Start a deferred retry sequence for the given source. If a retry is
     /// already in progress it is reset (e.g. a new device-change notification
-    /// arrived while we were still retrying).
     fn begin_retry(&mut self, kind: AudioSourceKind, last_error: Option<AudioError>) {
-        // Drop the broken source so the retry creates a fresh one.
         if let Some(com) = self.com.as_mut() {
             match kind {
                 AudioSourceKind::System => com.system_source = None,
@@ -309,8 +306,6 @@ impl WasapiEngine {
         kind: AudioSourceKind,
         out: &mut Vec<AudioEvent>,
     ) -> AudioResult<()> {
-        // Check whether a retry is pending and ready — using a short-lived
-        // borrow so we don't hold `&mut self` across the attempt.
         let is_ready = match kind {
             AudioSourceKind::System => self.system_retry.as_ref().is_some_and(|r| r.is_ready()),
             AudioSourceKind::Microphone => {
@@ -334,7 +329,6 @@ impl WasapiEngine {
         let max_attempts = self.config.restart_policy.max_attempts.max(1);
         let max_backoff = self.config.restart_policy.max_backoff;
 
-        // Attempt a single restart.
         let result = if let Some(source) = slot.as_mut() {
             source.restart()
         } else {
@@ -356,7 +350,6 @@ impl WasapiEngine {
                 };
                 let downtime = retry_state.map_or(Duration::ZERO, |r| r.downtime());
 
-                // Clear retry state — source is healthy again.
                 match kind {
                     AudioSourceKind::System => self.system_retry = None,
                     AudioSourceKind::Microphone => self.microphone_retry = None,
@@ -378,11 +371,9 @@ impl WasapiEngine {
                     state.record_failure(err.clone(), max_backoff);
 
                     if state.attempts >= max_attempts {
-                        // Exhausted all attempts.
                         let last_err = state.last_error.take().unwrap_or_else(|| err.clone());
                         let required = source_config.required;
 
-                        // Clear retry state and source slot.
                         match kind {
                             AudioSourceKind::System => {
                                 self.system_retry = None;
@@ -414,7 +405,6 @@ impl WasapiEngine {
         kind: AudioSourceKind,
         out: &mut Vec<AudioEvent>,
     ) -> AudioResult<()> {
-        // Skip draining while a retry is in progress — the source is down.
         let retry_active = match kind {
             AudioSourceKind::System => self.system_retry.is_some(),
             AudioSourceKind::Microphone => self.microphone_retry.is_some(),
@@ -448,14 +438,12 @@ impl WasapiEngine {
             }
             Err(err) if err.is_retryable() || err.requires_worker_reset() => {
                 self.begin_retry(kind, Some(err.clone()));
-                // Immediately tick so the first (no-delay) attempt runs now.
                 self.tick_source_retry(kind, out)?;
                 let still_retrying = match kind {
                     AudioSourceKind::System => self.system_retry.is_some(),
                     AudioSourceKind::Microphone => self.microphone_retry.is_some(),
                 };
                 if still_retrying {
-                    // Still retrying — not recovered yet, but not fatal.
                     Ok(())
                 } else {
                     let source_gone = match kind {
@@ -532,7 +520,6 @@ impl AudioRecorderEngine for WasapiEngine {
                 events.extend(self.process_control_notifications()?);
             }
 
-            // Even on WAIT_TIMEOUT we still drain and tick retries below.
         }
 
         self.drain_source(AudioSourceKind::System, &mut events)?;

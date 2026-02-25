@@ -13,9 +13,6 @@ use windows::core::Interface;
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
 
-// Try to use pre-compiled shader bytecode from build.rs (fxc.exe at build time).
-// Falls back to runtime D3DCompile if the build-time compilation was skipped.
-
 /// HLSL source kept as fallback for runtime compilation when fxc.exe
 /// was not available at build time.
 #[cfg(not(has_precompiled_shader))]
@@ -167,7 +164,7 @@ struct GpuParams {
 }
 
 /// Threshold below which we use the 1D dispatch path.
-/// For textures smaller than 512px on either axis, the 16脳16 thread
+/// For textures smaller than 512px on either axis, the 16x16 thread
 /// groups waste significant threads on boundary tiles.
 const SMALL_TEXTURE_THRESHOLD: u32 = 512;
 
@@ -177,7 +174,7 @@ const SMALL_TEXTURE_THRESHOLD: u32 = 512;
 /// texture/UAV management, SRV caching, and the dispatch call.
 struct GpuComputePass {
     cs: ID3D11ComputeShader,
-    /// 1D compute shader for small textures (256脳1 thread groups).
+    /// 1D compute shader for small textures (256x1 thread groups).
     cs_1d: Option<ID3D11ComputeShader>,
     cbuf: ID3D11Buffer,
     output_tex: Option<ID3D11Texture2D>,
@@ -369,7 +366,6 @@ impl GpuComputePass {
                 context.Dispatch(groups_x, groups_y, 1);
             }
 
-            // Unbind resources
             let no_srv: Option<ID3D11ShaderResourceView> = None;
             context.CSSetShaderResources(0, Some(&[no_srv]));
             context.CSSetUnorderedAccessViews(0, 1, Some(&None as *const _), None);
@@ -416,7 +412,6 @@ impl GpuTonemapper {
         let height = source_desc.Height;
         self.pass.ensure_output(device, width, height)?;
 
-        // Update the constant buffer when params or dimensions have changed.
         let needs_cbuf_update = self
             .cached_cbuf_state
             .map_or(true, |(p, w, h)| p != params || w != width || h != height);

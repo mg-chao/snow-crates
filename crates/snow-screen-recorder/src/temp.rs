@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::path::PathBuf;
 
 use crate::config::RecordingConfig;
@@ -25,7 +25,6 @@ impl TempLayout {
             output_dir: config.output_dir.clone(),
             session_dir: session_dir.clone(),
             manifest_path: session_dir.join("manifest.json"),
-            // Primary recording video written incrementally during capture.
             video_temp_path: session_dir.join("video_recording.mp4"),
             audio_system_path: session_dir.join("audio_system.pcm"),
             audio_mic_path: session_dir.join("audio_mic.pcm"),

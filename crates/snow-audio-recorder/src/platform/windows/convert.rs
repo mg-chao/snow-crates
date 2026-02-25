@@ -31,8 +31,6 @@ impl NativeAudioFormat {
     }
 }
 
-// Pluggable resampler
-
 /// Trait for sample-rate conversion implementations.
 ///
 /// Implementations must be stateful to handle continuity across chunk
@@ -59,8 +57,6 @@ impl Resampler for ResamplerKind {
         }
     }
 }
-
-// AudioConverter
 
 pub(crate) struct AudioConverter {
     input: NativeAudioFormat,
@@ -152,8 +148,6 @@ impl AudioConverter {
     }
 }
 
-// Sample format decoding / encoding
-
 fn decode_interleaved_to_f32(
     input: &[u8],
     frames: u32,
@@ -219,16 +213,16 @@ fn decode_interleaved_to_f32(
 /// - **Downmix to mono** (`out == 1`): average all input channels.
 /// - **Upmix from mono** (`in == 1`): duplicate to every output channel.
 ///
-/// # Limitations – arbitrary surround layouts
+/// # Limitations - arbitrary surround layouts
 ///
-/// For all other combinations the function applies a *naïve* strategy that
+/// For all other combinations the function applies a *naive* strategy that
 /// does **not** consult speaker-position masks:
 ///
 /// - **Downmix** (`out < in`): each output channel is the average of the
 ///   input channels that map to it via round-robin (`idx % out_channels`).
 ///   This preserves energy better than simple truncation but does not
 ///   implement ITU / Dolby fold-down coefficients, so spatial information
-///   from surround layouts (e.g. 5.1 → stereo) will be mixed incorrectly.
+///   from surround layouts (e.g. 5.1 -> stereo) will be mixed incorrectly.
 ///
 /// - **Upmix** (`out > in`): extra output channels are filled by cycling
 ///   through the input channels (`idx % in_channels`). This is essentially
@@ -256,14 +250,14 @@ fn convert_channels(input: &[f32], in_channels: u16, out_channels: u16, output: 
     output.reserve(frame_count * out_ch);
 
     for frame in input.chunks_exact(in_ch) {
-        // Downmix to mono – average all input channels.
+        // Downmix to mono - average all input channels.
         if out_ch == 1 {
             let sum: f32 = frame.iter().copied().sum();
             output.push(sum / in_ch as f32);
             continue;
         }
 
-        // Upmix from mono – duplicate to every output channel.
+        // Upmix from mono - duplicate to every output channel.
         if in_ch == 1 {
             for _ in 0..out_ch {
                 output.push(frame[0]);
@@ -337,8 +331,6 @@ fn encode_from_f32_into(
     Ok(())
 }
 
-// LinearResampler
-
 /// A simple linear-interpolation resampler.
 ///
 /// This is the cheapest possible sample-rate converter: it walks through the
@@ -410,8 +402,6 @@ impl Resampler for LinearResampler {
         }
     }
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {

@@ -37,9 +37,6 @@ pub(crate) fn run_event_loop(
     let mut cursor_disconnected = false;
 
     loop {
-        // Drain up to AUDIO_DRAIN_BATCH audio events before entering
-        // the select! wait. This ensures audio gets priority to reduce
-        // underrun risk.
         if !audio_disconnected {
             for _ in 0..AUDIO_DRAIN_BATCH {
                 match adapters.audio_rx.try_recv() {
@@ -61,13 +58,10 @@ pub(crate) fn run_event_loop(
             return Ok(coordinator);
         }
 
-        // Build a dynamic Select that only includes live channels.
         let mut sel = Select::new();
 
-        // Control channel is always included (independent of data-plane).
         let control_idx = sel.recv(&adapters.control_rx);
 
-        // Only include data channels that haven't disconnected.
         let video_idx = if !video_disconnected {
             Some(sel.recv(&adapters.video_rx))
         } else {
@@ -101,7 +95,6 @@ pub(crate) fn run_event_loop(
                             }
                         }
                         Err(_) => {
-                            // Control channel disconnected — treat as stop.
                             return Ok(coordinator);
                         }
                     }
@@ -141,7 +134,6 @@ pub(crate) fn run_event_loop(
                 }
             }
             Err(_timeout) => {
-                // Timeout — check if all data channels are disconnected.
                 if video_disconnected && audio_disconnected && cursor_disconnected {
                     return Ok(coordinator);
                 }
@@ -164,23 +156,15 @@ pub(crate) fn graceful_shutdown(
     coordinator: &mut RecordingCoordinator,
     adapters: &mut RecordingAdapters,
 ) -> Result<()> {
-    // 1. Signal all adapters to stop (non-blocking).
     adapters.stop_all();
 
-    // 2. Continue draining channels with audio-first priority
-    //    while any adapter forwarding thread is still running.
-    //    This catches events that were in-flight when stop was signaled.
     while adapters.any_running() {
         drain_all_channels(coordinator, adapters)?;
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    // 3. Join all adapter threads (should return immediately since
-    //    we waited for them to finish in step 2).
     adapters.join_all();
 
-    // 4. Final drain pass — process any events that arrived between
-    //    the last drain and the thread joins.
     drain_all_channels(coordinator, adapters)?;
 
     Ok(())
@@ -191,13 +175,12 @@ pub(crate) fn graceful_shutdown(
 /// channels are empty (or disconnected).
 ///
 /// During shutdown drain we propagate errors but ignore the
-/// `EventAction` return — the purpose is to process ALL remaining
+/// `EventAction` return - the purpose is to process ALL remaining
 /// events regardless of termination conditions.
 fn drain_all_channels(
     coordinator: &mut RecordingCoordinator,
     adapters: &RecordingAdapters,
 ) -> Result<()> {
-    // Audio-first: drain all available audio events first.
     loop {
         match adapters.audio_rx.try_recv() {
             Ok(event) => {
@@ -207,7 +190,6 @@ fn drain_all_channels(
         }
     }
 
-    // Then drain video events.
     loop {
         match adapters.video_rx.try_recv() {
             Ok(event) => {
@@ -217,7 +199,6 @@ fn drain_all_channels(
         }
     }
 
-    // Then drain cursor events.
     loop {
         match adapters.cursor_rx.try_recv() {
             Ok(event) => {
@@ -227,7 +208,6 @@ fn drain_all_channels(
         }
     }
 
-    // Also drain control channel (though it's less critical during shutdown).
     loop {
         match adapters.control_rx.try_recv() {
             Ok(cmd) => {

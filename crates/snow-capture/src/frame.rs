@@ -24,8 +24,8 @@ pub enum ColorSpace {
 }
 
 /// Minimum allocation size to attempt large-page backing.
-/// 4K RGBA = 3840×2160×4 ≈ 33 MB — well above the 2 MB large page size.
-/// We only bother for allocations ≥ 4 MB to avoid overhead on small captures.
+/// 4K RGBA = 3840x2160x4 ~= 33 MB - well above the 2 MB large page size.
+/// We only bother for allocations >= 4 MB to avoid overhead on small captures.
 const LARGE_PAGE_MIN_BYTES: usize = 4 * 1024 * 1024;
 
 /// A rectangle describing a dirty (changed) region of the screen.
@@ -59,7 +59,7 @@ pub struct FrameMetadata {
     /// capture pipeline itself is the bottleneck vs. the encoder.
     pub capture_duration: Option<Duration>,
     /// Whether this frame's content is identical to the previous frame.
-    /// `true` means no new desktop present occurred — a recorder can skip
+    /// `true` means no new desktop present occurred - a recorder can skip
     /// encoding this frame to save bitrate.
     pub is_duplicate: bool,
     /// Dirty rectangles describing which regions changed since the last
@@ -210,7 +210,6 @@ fn try_alloc_large_pages(size: usize) -> Option<LargePageAlloc> {
         return None;
     }
 
-    // Round up to large page boundary
     let aligned_size = (size + large_page_size - 1) & !(large_page_size - 1);
 
     let ptr = unsafe {
@@ -285,7 +284,6 @@ impl FrameBuffer {
             return;
         }
 
-        // If current backing can hold the new size, just adjust length.
         if len <= self.capacity() {
             match self {
                 FrameBuffer::Vec(v) => unsafe { v.set_len(len) },
@@ -295,7 +293,6 @@ impl FrameBuffer {
             return;
         }
 
-        // Need a new allocation — try large pages first on Windows.
         #[cfg(target_os = "windows")]
         if len >= LARGE_PAGE_MIN_BYTES {
             if let Some(mut lp) = try_alloc_large_pages(len) {
@@ -305,7 +302,6 @@ impl FrameBuffer {
             }
         }
 
-        // Fall back to Vec with headroom.
         let headroom = len / 8;
         let mut v = Vec::with_capacity(len + headroom);
         unsafe { v.set_len(len) };

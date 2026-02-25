@@ -64,11 +64,8 @@ impl DisplayInfoCache {
             running: AtomicBool::new(false),
         });
 
-        // Perform initial enumeration synchronously so callers have data
-        // right away.
         cache.refresh()?;
 
-        // Spawn the background listener.
         cache.start_listener()?;
 
         Ok(cache)
@@ -186,7 +183,6 @@ impl DisplayInfoCache {
         };
 
         if let Some(hwnd) = hwnd {
-            // Post our custom quit message to break the GetMessage loop.
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_QUIT_LISTENER, WPARAM(0), LPARAM(0));
             }
@@ -210,8 +206,6 @@ impl Drop for DisplayInfoCache {
         self.stop_listener();
     }
 }
-
-// Listener thread
 
 /// Class name for our message-only window.
 const CLASS_NAME: &str = "SnowCaptureDisplayChangeListener";

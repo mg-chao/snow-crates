@@ -284,7 +284,6 @@ impl StreamHandle {
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
         }
-        // Drain everything left in the channel.
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
             events.push(event);
@@ -303,8 +302,6 @@ impl Drop for StreamHandle {
         }
     }
 }
-
-// snow_core::StreamHandle<CaptureEvent> implementation
 
 impl snow_core::streaming::StreamHandle<CaptureEvent> for StreamHandle {
     type RecvError = std::sync::mpsc::RecvError;
@@ -344,8 +341,6 @@ impl snow_core::streaming::StreamHandle<CaptureEvent> for StreamHandle {
     }
 }
 
-// snow_core::StreamStats implementation
-
 impl snow_core::streaming::StreamStats for StreamHandle {
     fn snapshot(&self) -> snow_core::streaming::StreamStatsSnapshot {
         snow_core::streaming::StreamStatsSnapshot {
@@ -382,31 +377,19 @@ fn stream_loop(
     let mut last_width: u32 = 0;
     let mut last_height: u32 = 0;
 
-    // Smooth adaptive pacing state (EWMA-based).
     let mut current_interval = base_interval;
-    // Exponential smoothing factor for adaptive pacing.
-    // Higher values react faster to backpressure changes.
     const ADAPTIVE_ALPHA: f64 = 0.15;
-    // When the drop ratio over the recent window exceeds this,
-    // the interval is nudged longer.
     const DROP_RATIO_THRESHOLD: f64 = 0.10;
-    // Size of the sliding window for drop ratio calculation.
     const ADAPTIVE_WINDOW: u32 = 30;
     let mut window_drops: u32 = 0;
     let mut window_total: u32 = 0;
 
-    // Capture latency EWMA state.
     let mut latency_avg_ns: f64 = 0.0;
     const LATENCY_ALPHA: f64 = 0.1;
 
-    // counter. The producer (this loop) increments on successful send,
-    // and the consumer decrements via StreamHandle::recv* methods.
-
-    // FPS measurement.
     let mut fps_counter: u64 = 0;
     let mut fps_epoch = Instant::now();
 
-    // Pause/resume lifecycle tracking.
     let mut was_paused = false;
     let mut pause_started: Option<Instant> = None;
 
@@ -415,7 +398,6 @@ fn stream_loop(
             break;
         }
 
-        // Pause handling with lifecycle events.
         if pause.load(Ordering::Acquire) {
             if !was_paused {
                 let now = Instant::now();
@@ -424,7 +406,6 @@ fn stream_loop(
                 was_paused = true;
             }
             std::thread::sleep(Duration::from_millis(50));
-            // Reset FPS counter across pause boundaries.
             fps_counter = 0;
             fps_epoch = Instant::now();
             continue;
@@ -451,10 +432,8 @@ fn stream_loop(
             Ok(mut frame) => {
                 consecutive_errors = 0;
 
-                // Record capture latency on the frame.
                 frame.metadata.capture_duration = Some(capture_elapsed);
 
-                // Update EWMA capture latency.
                 let sample_ns = capture_elapsed.as_nanos() as f64;
                 latency_avg_ns = LATENCY_ALPHA * sample_ns + (1.0 - LATENCY_ALPHA) * latency_avg_ns;
                 stats
@@ -463,7 +442,6 @@ fn stream_loop(
 
                 let seq = frame.metadata.sequence;
 
-                // Detect resolution changes.
                 let (w, h) = frame.dimensions();
                 if last_width != 0 && last_height != 0 && (w != last_width || h != last_height) {
                     let event = CaptureEvent::ResolutionChanged {
@@ -474,7 +452,6 @@ fn stream_loop(
                     };
                     let _ = tx.try_send(event);
 
-                    // Auto-pause on resolution change if configured.
                     if config.pause_on_resolution_change {
                         pause.store(true, Ordering::Release);
                     }
@@ -488,7 +465,6 @@ fn stream_loop(
                     Ok(()) => {
                         stats.buffer_fill.fetch_add(1, Ordering::Release);
 
-                        // Adaptive pacing: smooth EWMA-based approach.
                         window_total += 1;
                         if config.adaptive_fps && window_total >= ADAPTIVE_WINDOW {
                             let drop_ratio = window_drops as f64 / window_total as f64;
@@ -497,10 +473,8 @@ fn stream_loop(
                             {
                                 let cur_ns = cur.as_nanos() as f64;
                                 let target_ns = if drop_ratio > DROP_RATIO_THRESHOLD {
-                                    // Nudge slower toward min_fps.
                                     (cur_ns * 1.5).min(max.as_nanos() as f64)
                                 } else {
-                                    // Nudge faster toward target_fps.
                                     (cur_ns * 0.8).max(base.as_nanos() as f64)
                                 };
                                 let smoothed =
@@ -550,7 +524,6 @@ fn stream_loop(
                 consecutive_errors += 1;
                 stats.errors_recovered.fetch_add(1, Ordering::Relaxed);
                 if consecutive_errors >= config.max_consecutive_errors {
-                    // Send fatal error event before exiting.
                     let _ = tx.try_send(CaptureEvent::Error(e.clone()));
                     break;
                 }
@@ -563,7 +536,6 @@ fn stream_loop(
             }
         }
 
-        // Update FPS counter.
         fps_counter += 1;
         let fps_elapsed = fps_epoch.elapsed();
         if fps_elapsed >= Duration::from_secs(1) {
@@ -573,7 +545,6 @@ fn stream_loop(
             fps_epoch = Instant::now();
         }
 
-        // Frame pacing.
         if let Some(interval) = current_interval {
             let elapsed = frame_start.elapsed();
             if elapsed < interval {
@@ -601,8 +572,6 @@ fn spin_sleep(duration: Duration) {
         std::hint::spin_loop();
     }
 }
-
-// Async (tokio) stream wrapper
 
 /// Async wrapper around `StreamHandle` for tokio-based recording pipelines.
 ///

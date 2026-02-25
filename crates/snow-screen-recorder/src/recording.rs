@@ -870,7 +870,6 @@ fn new_recording_worker(
         timeline, video, audio, cursor, frame_interval_ms,
     );
 
-    // Create adapter channels.
     let (senders, receivers) = crate::adapter::create_adapter_channels();
 
     // Determine whether cursor data is embedded in video frames.
@@ -881,10 +880,8 @@ fn new_recording_worker(
     #[cfg(not(feature = "cursor"))]
     let cursor_tx_for_video: Option<crossbeam_channel::Sender<crate::event::RecordingEvent>> = None;
 
-    // Default send timeout for backpressure handling (10ms).
     let send_timeout = Duration::from_millis(10);
 
-    // Start video adapter via StreamBridge.
     let video_mapper = crate::adapter::video::create_video_mapper(cursor_tx_for_video);
     let video_adapter = crate::adapter::stream_bridge::StreamBridge::start(
         capture_stream,
@@ -894,7 +891,6 @@ fn new_recording_worker(
         "snow-video-bridge",
     )?;
 
-    // Start audio adapter via StreamBridge (if audio is enabled).
     let audio_adapter = match audio_stream {
         Some(handle) => {
             let audio_mapper = crate::adapter::audio::create_audio_mapper();
@@ -952,17 +948,13 @@ fn new_recording_worker(
         cursor_adapter,
     };
 
-    // Run the event loop.
     let mut coordinator = event_loop::run_event_loop(coordinator, &adapters)?;
 
-    // Graceful shutdown: stop adapters, drain remaining events, join threads.
     event_loop::graceful_shutdown(&mut coordinator, &mut adapters)?;
 
-    // Finalize: flush encoders, close writers, produce outcome.
     let finalize_at = Instant::now();
     let (outcome, mouse_store) = coordinator.finalize(finalize_at)?;
 
-    // Write mouse records to disk.
     write_mouse_records(&layout.mouse_path, &mouse_store)?;
 
     Ok(outcome)

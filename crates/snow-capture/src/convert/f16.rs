@@ -4,11 +4,11 @@ use std::sync::OnceLock;
 
 /// Convert a linear-light value in [0, 1] to an sRGB-encoded byte in [0, 255].
 ///
-/// Implements the sRGB electro-optical transfer function (EOTF⁻¹) defined in
+/// Implements the sRGB electro-optical transfer function (EOTF/OETF) defined in
 /// IEC 61966-2-1:1999, Section 4.7:
 ///
-///   - Linear segment:  C_srgb = 12.92 · C_linear          when C_linear ≤ 0.0031308
-///   - Gamma segment:   C_srgb = 1.055 · C_linear^(1/2.4) − 0.055   otherwise
+///   - Linear segment:  C_srgb = 12.92 * C_linear          when C_linear <= 0.0031308
+///   - Gamma segment:   C_srgb = 1.055 * C_linear^(1/2.4) - 0.055   otherwise
 ///
 /// The threshold 0.0031308 and the constants 12.92, 1.055, 0.055, and the
 /// exponent 1/2.4 are all specified by the standard to ensure a smooth
@@ -26,24 +26,24 @@ pub(crate) fn linear_to_srgb_u8(v: f32) -> u8 {
 /// Constants for the SMPTE ST 2084 Perceptual Quantizer (PQ) transfer function.
 ///
 /// Defined by SMPTE ST 2084:2014, the PQ EOTF maps a non-linear signal value
-/// V to absolute luminance L (in cd/m²) as:
+/// V to absolute luminance L (in cd/m^2) as:
 ///
-///   Y  = max(V^(1/m2) − c1, 0) / (c2 − c3 · V^(1/m2))
-///   L  = 10000 · Y^(1/m1)
+///   Y  = max(V^(1/m2) - c1, 0) / (c2 - c3 * V^(1/m2))
+///   L  = 10000 * Y^(1/m1)
 ///
 /// The inverse (OETF) used by `linear_to_st2084` is:
 ///
 ///   Y  = (L / 10000)^m1
-///   V  = ((c1 + c2 · Y) / (1 + c3 · Y))^m2
+///   V  = ((c1 + c2 * Y) / (1 + c3 * Y))^m2
 ///
 /// The constants below are the exact rational values from the spec, expressed
 /// as their f32 approximations:
 ///
 ///   m1 = 2610 / 16384       = 0.1593017578125
-///   m2 = 2523 / 4096 × 128  = 78.84375
-///   c1 = 3424 / 4096         = 0.8359375          (also: c3 − c2 + 1)
-///   c2 = 2413 / 4096 × 32   = 18.8515625
-///   c3 = 2392 / 4096 × 32   = 18.6875
+///   m2 = 2523 / 4096 x 128  = 78.84375
+///   c1 = 3424 / 4096         = 0.8359375          (also: c3 - c2 + 1)
+///   c2 = 2413 / 4096 x 32   = 18.8515625
+///   c3 = 2392 / 4096 x 32   = 18.6875
 const PQ_M1: f32 = 0.159_301_758;
 const PQ_M2: f32 = 78.843_75;
 const PQ_C1: f32 = 0.835_937_5;
@@ -51,13 +51,13 @@ const PQ_C2: f32 = 18.851_562_5;
 const PQ_C3: f32 = 18.687_5;
 
 /// Working reference luminance used to normalize PQ input in this pipeline.
-/// ST 2084 itself is absolute (0..10,000 cd/m²); this code chooses
+/// ST 2084 itself is absolute (0..10,000 cd/m^2); this code chooses
 /// 1.0 = 1000 nits internally, so the PQ helpers operate on
 /// `L / HDR_NITS_REFERENCE`.
 const HDR_NITS_REFERENCE: f32 = 1000.0;
 
 /// Encode a normalised linear luminance (1.0 = `HDR_NITS_REFERENCE` nits)
-/// into a PQ non-linear signal value using the SMPTE ST 2084 EOTF⁻¹.
+/// into a PQ non-linear signal value using the SMPTE ST 2084 OETF.
 ///
 /// See SMPTE ST 2084:2014, Section 5.1 (Equation 1).
 fn linear_to_st2084(v: f32) -> f32 {
@@ -76,7 +76,7 @@ fn st2084_to_linear(v: f32) -> f32 {
     (numerator / denominator).powf(1.0 / PQ_M1)
 }
 
-/// Step 1 of the HDR→SDR tonemap: white-point adjustment.
+/// Step 1 of the HDR->SDR tonemap: white-point adjustment.
 ///
 /// The HDR surface is authored with a "paper white" reference level
 /// (`hdr_paper_white_nits`), while the SDR display expects a different
@@ -96,7 +96,7 @@ fn adjust_hdr_whites(rgb: &mut [f32; 3], params: HdrToSdrParams) {
     rgb[2] /= white_adjust;
 }
 
-/// Step 2 of the HDR→SDR tonemap: channel-max peak limiting.
+/// Step 2 of the HDR->SDR tonemap: channel-max peak limiting.
 ///
 /// The brightest channel is encoded with SMPTE ST 2084, clamped to the
 /// configured peak (`hdr_maximum_nits`), decoded back to linear, and the
@@ -132,7 +132,7 @@ fn adjust_hdr_maximum_nits(rgb: &mut [f32; 3], params: HdrToSdrParams) {
 ///   `linear_to_srgb_u8(f16::from_bits(i).to_f32())`
 ///
 /// This trades memory for speed: a single table lookup replaces the
-/// per-channel `powf(1/2.4)` call in the scalar F16→sRGB path, turning
+/// per-channel `powf(1/2.4)` call in the scalar F16->sRGB path, turning
 /// the conversion into three byte loads per pixel (plus one for alpha).
 fn f16_to_srgb_lut() -> &'static [u8; 65_536] {
     static LUT: OnceLock<[u8; 65_536]> = OnceLock::new();
@@ -186,9 +186,6 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_scalar_unchecked(
     let mut dst_px = dst as *mut u32;
     let mut remaining = pixel_count;
 
-    // batch of pixels so they're in L1/L2 by the time we need them.
-    // Uses NTA hint since the LUT is 64 KB and we don't want to evict
-    // other hot data from the cache hierarchy.
     macro_rules! prefetch_lut_entries {
         ($base:expr) => {
             #[cfg(target_arch = "x86_64")]
@@ -297,14 +294,14 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_scalar_unchecked(
     }
 }
 
-/// Scalar HDR→SDR conversion for a row of RGBA16Float pixels.
+/// Scalar HDR->SDR conversion for a row of RGBA16Float pixels.
 ///
 /// Pipeline per pixel:
 ///   1. Decode four IEEE 754 half-precision floats (R, G, B, A) to f32.
-///   2. White-point adjustment — rescale linear RGB so that the HDR
+///   2. White-point adjustment - rescale linear RGB so that the HDR
 ///      "paper white" level maps to the SDR display's white level
 ///      (see `adjust_hdr_whites`).
-///   3. Peak-luminance limiting — map the brightest channel through the
+///   3. Peak-luminance limiting - map the brightest channel through the
 ///      SMPTE ST 2084 PQ curve, clamp to `hdr_maximum_nits`, and scale
 ///      all channels by the resulting ratio to preserve hue
 ///      (see `adjust_hdr_maximum_nits`).

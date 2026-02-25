@@ -188,8 +188,6 @@ impl Drop for AudioStreamHandle {
     }
 }
 
-// snow_core::StreamHandle<AudioEvent> implementation
-
 impl snow_core::streaming::StreamHandle<AudioEvent> for AudioStreamHandle {
     type RecvError = crate::error::RecvError;
     type TryRecvError = crate::error::TryRecvError;
@@ -227,8 +225,6 @@ impl snow_core::streaming::StreamHandle<AudioEvent> for AudioStreamHandle {
         self.is_running()
     }
 }
-
-// snow_core::StreamStats implementation
 
 impl snow_core::streaming::StreamStats for AudioStreamHandle {
     fn snapshot(&self) -> snow_core::streaming::StreamStatsSnapshot {
@@ -383,7 +379,6 @@ impl BackpressureState {
                 });
             }
         } else {
-            // Dropped back below threshold — arm for the next crossing.
             self.signalled = false;
         }
         None
@@ -401,7 +396,7 @@ fn push_event_with_drop_notice(
         .buffer_fill
         .store(outcome.len as u64, Ordering::Release);
 
-    // Check backpressure *before* handling drops — this is the proactive signal.
+    // Check backpressure *before* handling drops; this is the proactive signal.
     if let Some(pressure_event) = bp.check(outcome.len) {
         // BufferPressure is a control event, so it goes into the unbounded lane.
         let _ = queue.push(pressure_event);

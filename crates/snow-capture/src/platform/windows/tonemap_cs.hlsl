@@ -12,16 +12,13 @@ cbuffer Params : register(b0) {
 Texture2D<float4> src_tex : register(t0);
 RWTexture2D<unorm float4> dst_tex : register(u0);
 
-// ---------------------------------------------------------------------------
 // SMPTE ST 2084 (PQ) constants (from SMPTE ST 2084:2014).
-//
 // These are the exact rational values from the specification:
-//   m1 = 2610/16384       ≈ 0.159301758
-//   m2 = 2523/4096 × 128  = 78.84375
-//   c1 = 3424/4096         = 0.8359375   (also: c3 − c2 + 1)
-//   c2 = 2413/4096 × 32   = 18.8515625
-//   c3 = 2392/4096 × 32   = 18.6875
-// ---------------------------------------------------------------------------
+//   m1 = 2610/16384       = 0.159301758
+//   m2 = 2523/4096 x 128  = 78.84375
+//   c1 = 3424/4096         = 0.8359375   (also: c3 - c2 + 1)
+//   c2 = 2413/4096 x 32   = 18.8515625
+//   c3 = 2392/4096 x 32   = 18.6875
 static const float PQ_M1 = 0.159301758;
 static const float PQ_M2 = 78.84375;
 static const float PQ_C1 = 0.8359375;
@@ -29,18 +26,18 @@ static const float PQ_C2 = 18.8515625;
 static const float PQ_C3 = 18.6875;
 
 // Reference luminance for normalising PQ input.  The PQ curve's absolute
-// range is 0–10 000 cd/m², but HDR content is typically mastered with a
+// range is 0-10,000 cd/m^2, but HDR content is typically mastered with a
 // peak of ~1 000 nits, so we normalise linear values as L / 1000.
 static const float HDR_NITS_REF = 1000.0;
 
-// SMPTE ST 2084 EOTF⁻¹: linear luminance → PQ non-linear signal.
+// SMPTE ST 2084 OETF: linear luminance -> PQ non-linear signal.
 // See SMPTE ST 2084:2014, Section 5.1 (Equation 1).
 float linear_to_st2084(float v) {
     float p = pow(max(v, 0.0), PQ_M1);
     return pow((PQ_C1 + PQ_C2 * p) / (1.0 + PQ_C3 * p), PQ_M2);
 }
 
-// SMPTE ST 2084 EOTF: PQ non-linear signal → linear luminance.
+// SMPTE ST 2084 EOTF: PQ non-linear signal -> linear luminance.
 // See SMPTE ST 2084:2014, Section 5.2 (Equation 2).
 float st2084_to_linear(float v) {
     float p = pow(max(v, 0.0), 1.0 / PQ_M2);
@@ -49,7 +46,7 @@ float st2084_to_linear(float v) {
     return pow(max(num / den, 0.0), 1.0 / PQ_M1);
 }
 
-// sRGB EOTF⁻¹ (linear → sRGB gamma), per IEC 61966-2-1:1999, Section 4.7.
+// sRGB OETF (linear -> sRGB gamma), per IEC 61966-2-1:1999, Section 4.7.
 float linear_to_srgb(float c) {
     c = saturate(c);
     return (c <= 0.0031308) ? (c * 12.92) : (1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055);
@@ -90,7 +87,6 @@ void tonemap_pixel(uint2 coord, uint w, uint h) {
     }
 
     // Step 3: Apply the IEC 61966-2-1 sRGB gamma curve.
-    // Linear to sRGB gamma
     float3 srgb = float3(linear_to_srgb(rgb.r), linear_to_srgb(rgb.g), linear_to_srgb(rgb.b));
     dst_tex[coord] = float4(srgb, 1.0);
 }
@@ -109,12 +105,10 @@ void main_1d(uint3 dtid : SV_DispatchThreadID) {
     tonemap_pixel(uint2(dtid.x, dtid.y), tex_width, tex_height);
 }
 
-// ---------------------------------------------------------------------------
-// Plain F16 linear → sRGB conversion (no HDR tonemapping)
-// ---------------------------------------------------------------------------
+// Plain F16 linear -> sRGB conversion (no HDR tonemapping)
 // Used when the source is RGBA16Float but no HDR-to-SDR tonemap is needed.
 // Converts linear light values directly to sRGB gamma, avoiding the
-// expensive CPU-side F16→sRGB SIMD path entirely.
+// expensive CPU-side F16->sRGB SIMD path entirely.
 
 void convert_f16_pixel(uint2 coord, uint w, uint h) {
     if (coord.x >= w || coord.y >= h) {

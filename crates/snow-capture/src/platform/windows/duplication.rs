@@ -893,7 +893,6 @@ impl StagingRing {
             }
         }
 
-        // Create event queries for active slots only.
         for i in 0..target_slots {
             if self.queries[i].is_none() {
                 let query_desc = D3D11_QUERY_DESC {
@@ -985,7 +984,6 @@ impl StagingRing {
     ) -> CaptureResult<Option<usize>> {
         let prev_pending = self.pending;
         let read_idx = if prev_pending {
-            // The previous write slot becomes the new read slot.
             Some(self.write_idx)
         } else {
             None
@@ -1006,7 +1004,6 @@ impl StagingRing {
         if let Some(ridx) = read_idx {
             let needs_flush = self.queries[ridx].as_ref().is_none_or(|q| {
                 let mut data: u32 = 0;
-                // D3D11_ASYNC_GETDATA_DONOTFLUSH = 0x1
                 unsafe {
                     context.GetData(
                         q,
@@ -1021,7 +1018,6 @@ impl StagingRing {
                 unsafe { context.Flush() };
             }
         } else {
-            // First frame -- flush to kick off the copy immediately.
             unsafe { context.Flush() };
         }
 
@@ -1066,8 +1062,7 @@ impl StagingRing {
             return Ok(());
         }
 
-        // D3D11_ASYNC_GETDATA_DONOTFLUSH = 0x1 -- avoids an implicit
-        // Flush() inside GetData which would stall the GPU pipeline.
+        // Avoid implicit Flush() calls in GetData while polling query completion.
         const DO_NOT_FLUSH: u32 = 0x1;
 
         if let Some(ref query) = self.queries[slot] {
@@ -2207,7 +2202,6 @@ impl OutputCapturer {
                 }
             };
 
-        // Populate frame metadata from DXGI frame info.
         frame.metadata.set_timing(
             Some(capture_time),
             if frame_info.LastPresentTime != 0 { Some(frame_info.LastPresentTime) } else { None },
