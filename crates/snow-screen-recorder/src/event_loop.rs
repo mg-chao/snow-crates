@@ -314,7 +314,6 @@ mod tests {
         let (cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // Drop all senders to disconnect channels.
         drop(video_tx);
         drop(audio_tx);
         drop(cursor_tx);
@@ -336,7 +335,6 @@ mod tests {
         let (_cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // Send a Stop command.
         control_tx.send(ControlCommand::Stop).unwrap();
 
         let coordinator = test_coordinator();
@@ -353,7 +351,6 @@ mod tests {
         let (cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // Send StreamEnded on all three channels.
         video_tx
             .send(RecordingEvent::Video(VideoCaptureEvent::StreamEnded))
             .unwrap();
@@ -400,14 +397,12 @@ mod tests {
         let (_cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // Audio error is non-fatal — loop should continue.
         audio_tx
             .send(RecordingEvent::Audio(AudioCaptureEvent::Error(
                 "audio device lost".into(),
             )))
             .unwrap();
 
-        // Then send a Stop to terminate the loop.
         control_tx.send(ControlCommand::Stop).unwrap();
 
         let coordinator = test_coordinator();
@@ -426,14 +421,10 @@ mod tests {
         let (_cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // Fill audio channel with StreamEnded events — the first one
-        // should be picked up in the audio-first drain phase.
         audio_tx
             .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
             .unwrap();
 
-        // Also end video and cursor so the loop terminates via AllStreamsEnded.
-        // Use control stop to terminate after audio drain processes the event.
         control_tx.send(ControlCommand::Stop).unwrap();
 
         let coordinator = test_coordinator();
@@ -442,7 +433,6 @@ mod tests {
         let result = run_event_loop(coordinator, &adapters);
         assert!(result.is_ok());
         let coord = result.unwrap();
-        // Audio ended flag should be set from the drain phase.
         assert!(coord.audio_ended());
     }
 
@@ -453,7 +443,6 @@ mod tests {
         let (_cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
         let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // Fill video and audio channels with non-terminal events.
         for _ in 0..8 {
             let _ = video_tx.try_send(RecordingEvent::Video(VideoCaptureEvent::FrameDropped {
                 sequence: 1,
@@ -466,7 +455,6 @@ mod tests {
             }));
         }
 
-        // Send Stop — should be honored even with data backpressure.
         control_tx.send(ControlCommand::Stop).unwrap();
 
         let coordinator = test_coordinator();
@@ -477,7 +465,6 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(result.is_ok());
-        // Stop should be honored well within 100ms.
         assert!(
             elapsed < Duration::from_millis(100),
             "Stop should be honored within 100ms, took {:?}",
@@ -521,7 +508,6 @@ mod tests {
         let (cursor_tx, cursor_rx) = crossbeam_channel::bounded(8);
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // Pre-fill channels with events that will be in-flight at shutdown.
         video_tx
             .send(RecordingEvent::Video(VideoCaptureEvent::StreamEnded))
             .unwrap();
@@ -546,7 +532,6 @@ mod tests {
         let result = graceful_shutdown(&mut coordinator, &mut adapters);
         assert!(result.is_ok(), "graceful_shutdown should succeed");
 
-        // All stream-ended events should have been drained and processed.
         assert!(
             coordinator.capture_ended(),
             "video StreamEnded should be processed"
@@ -568,7 +553,6 @@ mod tests {
         let (_cursor_tx, cursor_rx) = crossbeam_channel::bounded(8);
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // Put audio StreamEnded in the channel — audio should be drained first.
         audio_tx
             .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
             .unwrap();
@@ -587,7 +571,6 @@ mod tests {
         let result = graceful_shutdown(&mut coordinator, &mut adapters);
         assert!(result.is_ok());
 
-        // Audio should be processed (drained first due to audio-first priority).
         assert!(
             coordinator.audio_ended(),
             "audio events should be drained first"
@@ -601,11 +584,8 @@ mod tests {
         let (_cursor_tx, cursor_rx) = crossbeam_channel::bounded(8);
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
-        // The video adapter starts as "running" and transitions to stopped
-        // when stop() is called.
         let running = Arc::new(AtomicBool::new(true));
 
-        // Pre-fill channels with events.
         audio_tx
             .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
             .unwrap();
@@ -629,9 +609,7 @@ mod tests {
         let result = graceful_shutdown(&mut coordinator, &mut adapters);
         assert!(result.is_ok());
 
-        // The adapter should no longer be running.
         assert!(!running.load(Ordering::SeqCst), "adapter should be stopped");
-        // Events should have been drained during the while-loop.
         assert!(coordinator.audio_ended(), "audio events should be drained");
         assert!(
             coordinator.capture_ended(),
@@ -642,17 +620,6 @@ mod tests {
 
     use proptest::prelude::*;
 
-    //
-    // Property 11: Event completeness across shutdown
-    //
-    // For any set of events placed in channels before shutdown, ALL
-    // of them are processed by the coordinator before finalization.
-    // We verify this by pre-filling channels with a random number of
-    // non-terminal events plus StreamEnded on each channel, dropping
-    // all senders (simulating adapter threads exiting), running the
-    // event loop followed by graceful_shutdown, and asserting that
-    // all three stream-ended flags are set — proving every event
-    // (including the final StreamEnded) was processed.
     proptest! {
         #[test]
         fn prop_event_completeness_across_shutdown(
@@ -664,7 +631,6 @@ mod tests {
             let (cursor_tx, cursor_rx) = crossbeam_channel::bounded(16);
             let (_control_tx, control_rx) = crossbeam_channel::unbounded();
 
-            // Fill audio channel: n_audio_extra BufferPressure events + StreamEnded.
             for _ in 0..n_audio_extra {
                 audio_tx
                     .send(RecordingEvent::Audio(AudioCaptureEvent::BufferPressure {
@@ -677,7 +643,6 @@ mod tests {
                 .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
                 .unwrap();
 
-            // Fill video channel: n_video_extra FrameDropped events + StreamEnded.
             for i in 0..n_video_extra {
                 video_tx
                     .send(RecordingEvent::Video(VideoCaptureEvent::FrameDropped {
@@ -689,21 +654,14 @@ mod tests {
                 .send(RecordingEvent::Video(VideoCaptureEvent::StreamEnded))
                 .unwrap();
 
-            // Cursor channel: just StreamEnded (CursorCaptureEvent has no
-            // lightweight non-terminal variant without constructing a full
-            // CursorFrameSample, and the key property is that StreamEnded
-            // is always processed).
             cursor_tx
                 .send(RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded))
                 .unwrap();
 
-            // Drop all senders to simulate adapter forwarding threads exiting.
             drop(video_tx);
             drop(audio_tx);
             drop(cursor_tx);
 
-            // Run the event loop — it will process events and exit when
-            // all streams end or all channels disconnect.
             let coordinator = test_coordinator();
             let adapters = test_adapters(video_rx, audio_rx, cursor_rx, control_rx);
 
@@ -712,7 +670,6 @@ mod tests {
 
             let mut coordinator = result.unwrap();
 
-            // Run graceful shutdown to drain any remaining events.
             let mut shutdown_adapters = RecordingAdapters {
                 video_rx: adapters.video_rx.clone(),
                 audio_rx: adapters.audio_rx.clone(),
@@ -725,9 +682,6 @@ mod tests {
             let shutdown_result = graceful_shutdown(&mut coordinator, &mut shutdown_adapters);
             prop_assert!(shutdown_result.is_ok(), "graceful_shutdown should succeed");
 
-            // Assert event completeness: every StreamEnded event was
-            // processed by the coordinator, proving all events in the
-            // channels at stop time were handled before finalization.
             prop_assert!(
                 coordinator.capture_ended(),
                 "video StreamEnded must be processed: {} extra video events + StreamEnded were in channel",
@@ -745,16 +699,6 @@ mod tests {
         }
     }
 
-    //
-    // Property 3: Audio-first drain priority
-    //
-    // For any number of audio events n_audio in 1..=8 (within one
-    // drain batch), if the audio channel contains n_audio-1
-    // BufferPressure events followed by a StreamEnded event, and a
-    // ControlCommand::Stop is queued on the control channel, the
-    // event loop processes all audio events (including StreamEnded)
-    // during the audio-first drain phase — proving audio gets
-    // priority before the select! wait processes the Stop command.
     proptest! {
         #[test]
         fn prop_audio_first_drain_priority(
@@ -766,9 +710,6 @@ mod tests {
             let (_cursor_tx, cursor_rx) = crossbeam_channel::bounded(4);
             let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
-            // Fill audio channel: n_audio-1 BufferPressure events + 1 StreamEnded.
-            // All fit within one AUDIO_DRAIN_BATCH (8), so the drain phase
-            // should process every one of them before entering select!.
             for _ in 0..(n_audio - 1) {
                 audio_tx
                     .send(RecordingEvent::Audio(AudioCaptureEvent::BufferPressure {
@@ -781,7 +722,6 @@ mod tests {
                 .send(RecordingEvent::Audio(AudioCaptureEvent::StreamEnded))
                 .unwrap();
 
-            // Fill video channel with non-terminal events.
             for i in 0..n_video {
                 video_tx
                     .send(RecordingEvent::Video(VideoCaptureEvent::FrameDropped {
@@ -790,8 +730,6 @@ mod tests {
                     .unwrap();
             }
 
-            // Queue Stop — the loop should process all audio events in the
-            // drain phase first, then encounter Stop in the select! phase.
             control_tx.send(ControlCommand::Stop).unwrap();
 
             let coordinator = test_coordinator();
@@ -801,8 +739,6 @@ mod tests {
             prop_assert!(result.is_ok(), "event loop should exit cleanly");
 
             let coord = result.unwrap();
-            // The audio drain phase processed all n_audio events including
-            // StreamEnded, so audio_ended must be true.
             prop_assert!(
                 coord.audio_ended(),
                 "audio_ended must be true: the drain phase should have \

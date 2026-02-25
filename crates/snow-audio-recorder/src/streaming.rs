@@ -521,10 +521,8 @@ mod tests {
     fn backpressure_state_fires_once_per_episode() {
         let mut bp = BackpressureState::new(0.5, 4);
 
-        // Below threshold — no signal.
         assert!(bp.check(1).is_none());
 
-        // Cross threshold — should fire.
         let event = bp.check(2);
         assert!(
             matches!(event, Some(AudioEvent::BufferPressure { fill_ratio, buffer_depth })
@@ -532,14 +530,11 @@ mod tests {
             "should emit BufferPressure on first crossing"
         );
 
-        // Still above — should NOT fire again.
         assert!(bp.check(3).is_none());
         assert!(bp.check(4).is_none());
 
-        // Drop below threshold — resets.
         assert!(bp.check(1).is_none());
 
-        // Cross again — should fire again.
         let event = bp.check(3);
         assert!(
             matches!(event, Some(AudioEvent::BufferPressure { .. })),
@@ -551,7 +546,6 @@ mod tests {
     fn backpressure_disabled_at_threshold_1() {
         let mut bp = BackpressureState::new(1.0, 4);
 
-        // Only fires when completely full.
         assert!(bp.check(3).is_none());
         assert!(bp.check(4).is_some());
         assert!(bp.check(4).is_none()); // already signalled

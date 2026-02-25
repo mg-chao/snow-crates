@@ -281,9 +281,6 @@ mod tests {
 
     use super::StreamBridge;
 
-    // Mock StreamHandle that yields events from a pre-loaded Vec.
-    // Returns Disconnected after all events are consumed.
-    // is_running() returns false after all events are consumed.
 
     struct MockStreamHandle<E: Clone + Send> {
         events: Vec<E>,
@@ -361,14 +358,12 @@ mod tests {
         fn prop_stream_bridge_forwards_all_events_in_order(
             values in prop::collection::vec(0u32..u32::MAX, 1..50)
         ) {
-            // Use an unbounded channel so backpressure never blocks.
             let (event_tx, event_rx) = crossbeam_channel::unbounded::<RecordingEvent>();
 
             let expected: Vec<u64> = values.iter().map(|&v| v as u64).collect();
 
             let handle = MockStreamHandle::new(values);
 
-            // Mapper: wrap each u32 as VideoCaptureEvent::FrameDropped { sequence }.
             let mut bridge = StreamBridge::start(
                 handle,
                 |v: u32| RecordingEvent::Video(VideoCaptureEvent::FrameDropped { sequence: v as u64 }),
@@ -378,10 +373,8 @@ mod tests {
             )
             .expect("bridge should start");
 
-            // Wait for the bridge thread to finish (it exits on Disconnected).
             bridge.join().expect("bridge join should succeed");
 
-            // Collect all received events.
             let mut received = Vec::new();
             while let Ok(evt) = event_rx.try_recv() {
                 match evt {

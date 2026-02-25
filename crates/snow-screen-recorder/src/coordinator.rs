@@ -486,23 +486,19 @@ mod tests {
     fn evaluate_termination_precedence() {
         let mut coord = test_coordinator();
 
-        // No conditions → Continue
         assert!(matches!(
             coord.evaluate_termination(),
             EventAction::Continue
         ));
 
-        // AllStreamsEnded → Stop
         coord.capture_ended = true;
         coord.audio_ended = true;
         coord.cursor_ended = true;
         assert!(matches!(coord.evaluate_termination(), EventAction::Stop));
 
-        // ControlStop takes precedence over AllStreamsEnded
         coord.control_stop = true;
         assert!(matches!(coord.evaluate_termination(), EventAction::Stop));
 
-        // FatalError takes highest precedence
         coord.fatal_error = true;
         assert!(matches!(coord.evaluate_termination(), EventAction::Stop));
     }
@@ -514,15 +510,12 @@ mod tests {
         coord.observe_video_time(100);
         assert_eq!(coord.last_observed_ts_ms(), Some(100));
 
-        // Same value — stays the same
         coord.observe_video_time(100);
         assert_eq!(coord.last_observed_ts_ms(), Some(100));
 
-        // Lower value — stays at previous
         coord.observe_video_time(50);
         assert_eq!(coord.last_observed_ts_ms(), Some(100));
 
-        // Higher value — updates
         coord.observe_video_time(200);
         assert_eq!(coord.last_observed_ts_ms(), Some(200));
     }
@@ -552,7 +545,6 @@ mod tests {
             .handle_event(RecordingEvent::Video(VideoCaptureEvent::StreamEnded))
             .unwrap();
         assert!(coord.capture_ended());
-        // Not all streams ended yet
         assert!(matches!(action, EventAction::Continue));
     }
 
@@ -614,7 +606,6 @@ mod tests {
             )))
             .unwrap();
         assert!(coord.audio_ended());
-        // Not all streams ended, so continue
         assert!(matches!(action, EventAction::Continue));
     }
 
@@ -635,7 +626,6 @@ mod tests {
         let mut coord = test_coordinator();
         let now = Instant::now();
 
-        // Send audio Paused/Resumed — timeline should have no intervals
         coord
             .handle_event(RecordingEvent::Audio(AudioCaptureEvent::Paused { at: now }))
             .unwrap();
@@ -679,7 +669,6 @@ mod tests {
     fn frame_dropped_synthesizes_cursor_and_advances_timestamp() {
         let mut coord = test_coordinator();
 
-        // Set an initial timestamp
         coord.observe_video_time(100);
 
         coord
@@ -688,7 +677,6 @@ mod tests {
             }))
             .unwrap();
 
-        // Timestamp should advance by frame_interval_ms (33)
         assert_eq!(coord.last_observed_ts_ms(), Some(133));
     }
 
@@ -700,9 +688,6 @@ mod tests {
             qpc_100ns: None,
         };
 
-        // A frame event should go through the video processor path
-        // (resolution change). We can verify by checking width/height
-        // get set on the video processor.
         coord
             .handle_event(RecordingEvent::Video(VideoCaptureEvent::Frame {
                 rgba: vec![0u8; 4], // 1x1 pixel
@@ -735,27 +720,16 @@ mod tests {
 
     #[test]
     fn finalize_returns_outcome_with_correct_audio_flags() {
-        // Without a real ffmpeg encoder we can't produce a successful
-        // finalize (it requires at least one encoded frame). The error
-        // path is validated by `finalize_errors_when_no_frames_encoded`.
-        //
-        // Here we verify that finalize at least calls audio.finish()
-        // and cursor.into_mouse_store() by confirming it doesn't panic
-        // when those processors are in their default state.
         let coord = test_coordinator();
         let at = Instant::now() + Duration::from_secs(1);
         let result = coord.finalize(at);
-        // Should fail because no frames were encoded, but audio/cursor
-        // cleanup should have completed without panic.
         assert!(result.is_err());
     }
 
     #[test]
     fn finalize_finalizes_timeline() {
-        // Verify that finalize calls timeline.finalize (closes open pause)
         let started_at = Instant::now();
         let mut timeline = PauseTimeline::new(started_at);
-        // Start a pause that won't be resumed — finalize should close it
         timeline.mark_pause(started_at + Duration::from_millis(100));
 
         let video = VideoProcessor::new(
@@ -769,12 +743,7 @@ mod tests {
         let coord = RecordingCoordinator::new(timeline, video, audio, cursor, 33);
 
         let at = started_at + Duration::from_millis(500);
-        // This will error because no frames were encoded, but the timeline
-        // should still have been finalized (pause closed) before the error.
         let _ = coord.finalize(at);
-        // We can't inspect the timeline after finalize consumes self,
-        // but the fact that finalize doesn't panic on an open pause
-        // confirms timeline.finalize(at) was called.
     }
 
     #[test]
@@ -858,15 +827,6 @@ mod tests {
         })
     }
 
-    //
-    // Property 7: Event dispatch correctness
-    //
-    // For any RecordingEvent, calling handle_event dispatches to the
-    // correct processor: Audio events do NOT change video processor
-    // state (width/height) or cursor processor state (frame count);
-    // Cursor events do NOT change video processor state or audio
-    // processor state (recorded_system/recorded_mic); Video events
-    // do NOT change audio processor state.
     proptest! {
         #[test]
         fn prop_audio_events_do_not_affect_video_or_cursor(
@@ -932,12 +892,6 @@ mod tests {
         }
     }
 
-    //
-    // Property 9: Stream termination completeness
-    //
-    // For every combination of stream-ended booleans, sending the
-    // corresponding StreamEnded events sets exactly the matching
-    // flags, and `all_streams_ended()` is true iff all three are true.
     proptest! {
         #[test]
         fn prop_stream_termination_completeness(
@@ -968,11 +922,6 @@ mod tests {
         }
     }
 
-    //
-    // Property 10: Timestamp monotonicity
-    //
-    // For any sequence of u64 timestamps fed to `observe_video_time`,
-    // `last_observed_ts_ms` is monotonically non-decreasing after each call.
     proptest! {
         #[test]
         fn prop_timestamp_monotonicity(
@@ -996,13 +945,6 @@ mod tests {
         }
     }
 
-    //
-    // Property 15: Audio error is non-fatal
-    //
-    // For any sequence of audio lifecycle events followed by an
-    // AudioCaptureEvent::Error, the coordinator marks audio_ended = true,
-    // does NOT set fatal_error, and continues to process subsequent
-    // video and cursor events normally.
     proptest! {
         #[test]
         fn prop_audio_error_is_non_fatal(
@@ -1011,7 +953,6 @@ mod tests {
             let mut coord = test_coordinator();
             let now = Instant::now();
 
-            // 1. Send a random number of audio lifecycle events before the error.
             for i in 0..pre_error_count {
                 let lifecycle_event = match i % 3 {
                     0 => AudioCaptureEvent::Paused { at: now },
@@ -1025,61 +966,44 @@ mod tests {
                     },
                 };
                 let action = coord.handle_event(RecordingEvent::Audio(lifecycle_event)).unwrap();
-                // Lifecycle events should not trigger stop
                 prop_assert!(matches!(action, EventAction::Continue),
                     "audio lifecycle event should return Continue");
             }
 
-            // audio_ended should still be false before the error
             prop_assert!(!coord.audio_ended(),
                 "audio_ended must be false before error");
             prop_assert!(!coord.fatal_error,
                 "fatal_error must be false before audio error");
 
-            // 2. Inject the audio error (plain string error → falls back to Transient)
             let action = coord.handle_event(
                 RecordingEvent::Audio(AudioCaptureEvent::Error("device lost".into()))
             ).unwrap();
 
-            // 3. Assert audio_ended is set and fatal_error is NOT set
             prop_assert!(coord.audio_ended(),
                 "audio_ended must be true after AudioCaptureEvent::Error");
             prop_assert!(!coord.fatal_error,
                 "fatal_error must NOT be set by a transient audio error");
-            // handle_event returned Ok (we called .unwrap() above) and should be Continue
-            // because not all streams have ended yet
             prop_assert!(matches!(action, EventAction::Continue),
                 "audio error should return Continue (video/cursor still active)");
 
-            // 4. Verify video events still process: StreamEnded sets capture_ended
             let action = coord.handle_event(
                 RecordingEvent::Video(VideoCaptureEvent::StreamEnded)
             ).unwrap();
             prop_assert!(coord.capture_ended(),
                 "capture_ended must be true after video StreamEnded");
-            // Still not all ended (cursor still active)
             prop_assert!(matches!(action, EventAction::Continue),
                 "should Continue because cursor stream is still active");
 
-            // 5. Verify cursor events still process: StreamEnded sets cursor_ended
             let action = coord.handle_event(
                 RecordingEvent::Cursor(CursorCaptureEvent::StreamEnded)
             ).unwrap();
             prop_assert!(coord.cursor_ended(),
                 "cursor_ended must be true after cursor StreamEnded");
-            // Now all three streams ended → Stop
             prop_assert!(matches!(action, EventAction::Stop),
                 "should Stop when all three streams have ended");
         }
     }
 
-    //
-    //
-    // For any error from a leaf crate, if `Classify::class()` returns `Fatal`,
-    // the coordinator shall stop recording. If `Classify::class()` returns
-    // `Transient`, the coordinator shall mark the stream as ended and continue
-    // processing other streams. If `Classify::class()` returns `InvalidConfig`,
-    // the coordinator shall stop recording.
 
     /// Strategy that generates a `CaptureError` whose `Classify::class()` is `Fatal`.
     fn arb_fatal_capture_error() -> impl Strategy<Value = snow_capture::error::CaptureError> {
@@ -1171,7 +1095,6 @@ mod tests {
             let action = coord.handle_event(
                 RecordingEvent::Video(VideoCaptureEvent::Error(boxed))
             ).unwrap();
-            // Transient → marks capture_ended, but other streams still active → Continue
             prop_assert!(coord.capture_ended(),
                 "Transient CaptureError must set capture_ended");
             prop_assert!(!coord.fatal_error,
@@ -1215,7 +1138,6 @@ mod tests {
             let action = coord.handle_event(
                 RecordingEvent::Audio(AudioCaptureEvent::Error(boxed))
             ).unwrap();
-            // Transient → marks audio_ended, but other streams still active → Continue
             prop_assert!(coord.audio_ended(),
                 "Transient AudioError must set audio_ended");
             prop_assert!(!coord.fatal_error,

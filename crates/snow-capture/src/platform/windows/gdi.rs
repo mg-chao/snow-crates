@@ -2909,7 +2909,6 @@ mod tests {
             recommend_parallel_span_scan_mode(0, 0, 2560, 1440),
             ParallelSpanScanMode::CompareThenDiff
         );
-        // Roughly 50% dirty rows with narrow spans should stay on compare+diff.
         assert_eq!(
             recommend_parallel_span_scan_mode(720, 69_120, 2560, 1440),
             ParallelSpanScanMode::CompareThenDiff
@@ -2918,12 +2917,10 @@ mod tests {
 
     #[test]
     fn parallel_span_mode_recommendation_prefers_single_for_dense_damage() {
-        // High dirty-row coverage should force single-scan mode.
         assert_eq!(
             recommend_parallel_span_scan_mode(1300, 900_000, 2560, 1440),
             ParallelSpanScanMode::SingleScanDiff
         );
-        // Dense dirty rows + dirty pixels should also switch.
         assert_eq!(
             recommend_parallel_span_scan_mode(1000, 1_200_000, 2560, 1440),
             ParallelSpanScanMode::SingleScanDiff
@@ -2985,7 +2982,6 @@ mod tests {
         }
         let mut rhs = lhs.clone();
 
-        // Change only one channel of pixel 3 and pixel 9.
         rhs[3 * BGRA_BYTES_PER_PIXEL + 1] ^= 0x1F;
         rhs[9 * BGRA_BYTES_PER_PIXEL + 2] ^= 0x2A;
 
@@ -4232,8 +4228,6 @@ mod tests {
             "gdi parallel span benchmark: legacy={legacy_ms:.3} ms span={span_ms:.3} ms improvement={improvement_pct:.2}%"
         );
 
-        // Guardrail: keep the hybrid path from regressing relative to the
-        // previous parallel full-row incremental strategy.
         assert!(
             span_ms <= legacy_ms * 1.03,
             "parallel span path regressed: legacy={legacy_ms:.3}ms span={span_ms:.3}ms ({improvement_pct:.2}% improvement)"
@@ -4410,8 +4404,6 @@ mod tests {
         }
         let history = current.clone();
 
-        // Emulate sparse motion blocks, which is where span-bounded incremental
-        // conversion should dominate.
         let span_width_pixels = 96usize;
         let span_width_bytes = span_width_pixels * BGRA_BYTES_PER_PIXEL;
         for row in (0..height).step_by(3) {
@@ -4526,9 +4518,6 @@ mod tests {
             "gdi span single-scan benchmark: legacy={legacy_ms:.3} ms single={single_ms:.3} ms improvement={improvement_pct:.2}%"
         );
 
-        // Guardrail: allow minor timing noise, but fail if the optimized
-        // single-scan path regresses materially versus the legacy two-pass
-        // compare+span flow.
         assert!(
             single_ms <= legacy_ms * 1.02,
             "single-scan path regressed: legacy={legacy_ms:.3}ms single={single_ms:.3}ms ({improvement_pct:.2}% improvement)"

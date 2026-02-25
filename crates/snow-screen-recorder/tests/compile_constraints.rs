@@ -33,11 +33,10 @@ fn deprecated_audio_timestamp_anchor_resolves_to_core() {
 
 
 /// Verify that `snow_capture::StreamHandle` (the concrete type) is still
-/// publicly accessible. This is a compile-time-only check — we just need
+/// publicly accessible. This is a compile-time-only check; we just need
 /// the function to exist and reference the type.
 #[test]
 fn snow_capture_stream_handle_type_exists() {
-    // The concrete type must still be importable (Req 9.2).
     fn _assert_type_exists(_: &snow_capture::StreamHandle) {}
 }
 

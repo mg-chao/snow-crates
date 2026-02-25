@@ -186,7 +186,6 @@ mod tests {
     use snow_cursor_capture::CursorFrameSample;
     use std::time::{Duration, Instant};
 
-    // Strategies for generating arbitrary leaf-crate-level event data
 
     fn arb_stream_timestamp() -> impl Strategy<Value = (Instant, Option<i64>)> {
         (Just(Instant::now()), proptest::option::of(0i64..i64::MAX))
@@ -250,12 +249,6 @@ mod tests {
             })
     }
 
-    // Property 1: Event translation fidelity
-    //
-    //
-    // For any leaf-crate event data, translating it into the
-    // corresponding RecordingEvent variant and destructuring back
-    // must yield identical payload fields.
 
     proptest! {
         /// Video Frame translation preserves all payload fields.
@@ -268,7 +261,6 @@ mod tests {
                 qpc_100ns: qpc,
             };
 
-            // Translate: mirrors what video_forward_loop does for CaptureEvent::Frame
             let event = RecordingEvent::Video(VideoCaptureEvent::Frame {
                 rgba: rgba.clone(),
                 width,
@@ -345,7 +337,6 @@ mod tests {
             let resume_at = Instant::now();
             let gap = Duration::from_millis(gap_ms);
 
-            // Paused
             let paused = RecordingEvent::Video(VideoCaptureEvent::Paused { at: pause_at });
             match paused {
                 RecordingEvent::Video(VideoCaptureEvent::Paused { at }) => {
@@ -354,7 +345,6 @@ mod tests {
                 _ => prop_assert!(false, "expected Video(Paused) variant"),
             }
 
-            // Resumed
             let resumed = RecordingEvent::Video(VideoCaptureEvent::Resumed { at: resume_at, gap });
             match resumed {
                 RecordingEvent::Video(VideoCaptureEvent::Resumed { at, gap: out_gap }) => {
@@ -424,21 +414,12 @@ mod tests {
             }
         }
 
-        // Property 2: Embedded cursor extraction
-        //
-        //
-        // When a video frame carries embedded cursor data (non-None
-        // FrameMetadata::cursor), the adapter must produce both a
-        // RecordingEvent::Video and a RecordingEvent::Cursor whose
-        // CursorFrameSample matches the frame's embedded cursor data.
 
         /// Embedded cursor extraction preserves all cursor fields.
         #[test]
         fn prop_embedded_cursor_extraction_preserves_data(
             sample in arb_cursor_sample(),
         ) {
-            // Simulate what video_forward_loop does: clone the cursor data
-            // from the frame metadata and wrap it in a CursorCaptureEvent.
             let extracted = CursorCaptureEvent::Sample(sample.clone());
 
             match extracted {
@@ -465,7 +446,6 @@ mod tests {
         ) {
             let cursor_data: Option<CursorFrameSample> = None;
 
-            // Simulate the extraction check from video_forward_loop
             let cursor_event_produced = cursor_data.as_ref().map(|cd| {
                 CursorCaptureEvent::Sample(cd.clone())
             });
@@ -475,12 +455,6 @@ mod tests {
         }
     }
 
-    // Property 13: MonitorSelector resolution
-    //
-    //
-    // Matching stable_id resolves to the correct MonitorId.
-    // Non-matching stable_id returns InvalidConfig error containing
-    // the unresolved stable_id.
 
     proptest! {
         #[test]
@@ -493,7 +467,6 @@ mod tests {
             use super::resolve_monitor_selector;
             use snow_capture::region::MonitorGeometry;
 
-            // Build a set of monitors including one with the known stable_id.
             let target_stable_id = format!("{:016x}-{:016x}", adapter_luid, output_id);
             let target_monitor = snow_capture::MonitorId::from_parts(
                 adapter_luid, output_id, 0, "Test Monitor", false,
@@ -504,7 +477,6 @@ mod tests {
             };
 
             let mut monitors = vec![target_geo];
-            // Add extra monitors with different stable_ids.
             for i in 0..extra_monitors {
                 let other = snow_capture::MonitorId::from_parts(
                     i as u64 + 1000, i as u64 + 2000, 0,
@@ -516,13 +488,11 @@ mod tests {
                 });
             }
 
-            // Matching selector should resolve to the correct MonitorId.
             let selector = MonitorSelector::new(&target_stable_id);
             let result = resolve_monitor_selector(&selector, &monitors);
             prop_assert!(result.is_ok(), "matching stable_id should resolve");
             prop_assert_eq!(result.unwrap().stable_id(), target_stable_id);
 
-            // Non-matching selector should fail with InvalidConfig containing the stable_id.
             let bad_id = "0000000000000000-ffffffffffffffff";
             let bad_selector = MonitorSelector::new(bad_id);
             let bad_result = resolve_monitor_selector(&bad_selector, &monitors);
@@ -533,22 +503,6 @@ mod tests {
         }
     }
 
-    // Property 14: Cursor data path exclusivity
-    //
-    //
-    // Cursor data arrives through exactly one path, determined at
-    // compile time by the `cursor` feature flag:
-    //
-    // - cursor enabled:  VideoStreamAdapter extracts cursor from
-    //   frame.metadata.cursor → CursorCaptureEvent on cursor channel.
-    //   No CursorStreamAdapter is created.
-    //
-    // - cursor disabled: FrameMetadata has no cursor field.
-    //   CursorStreamAdapter polls CursorSampler independently.
-    //
-    // These tests verify the current configuration's path and assert
-    // that no duplicate cursor records can arise from both paths
-    // simultaneously.
 
     /// When cursor feature is enabled, FrameMetadata has a `cursor` field.
     /// This is a compile-time assertion: if the field doesn't exist, this
@@ -570,7 +524,6 @@ mod tests {
     #[cfg(not(feature = "cursor"))]
     #[test]
     fn cursor_path_is_standalone_when_feature_disabled() {
-        // CursorSampler must be available for the standalone adapter path.
         let _sampler_type = std::any::type_name::<snow_cursor_capture::CursorSampler>();
         assert!(
             !_sampler_type.is_empty(),
@@ -592,11 +545,9 @@ mod tests {
             sample in arb_cursor_sample(),
             has_cursor in proptest::bool::ANY,
         ) {
-            // Simulate the two channels the coordinator would receive from.
             let (video_tx, video_rx) = crossbeam_channel::unbounded::<RecordingEvent>();
             let (cursor_tx, cursor_rx) = crossbeam_channel::unbounded::<RecordingEvent>();
 
-            // Always produce a video event (the frame itself).
             let video_event = RecordingEvent::Video(VideoCaptureEvent::Frame {
                 rgba: vec![0u8; 4],
                 width: 1,
@@ -609,12 +560,8 @@ mod tests {
             });
             video_tx.send(video_event).unwrap();
 
-            // Simulate the cursor extraction logic from video_forward_loop.
-            // This mirrors the #[cfg(feature = "cursor")] block in the real code.
             #[cfg(feature = "cursor")]
             {
-                // Embedded path: if the frame has cursor data, extract and
-                // send on the cursor channel.
                 let cursor_data: Option<CursorFrameSample> = if has_cursor {
                     Some(sample.clone())
                 } else {
@@ -631,31 +578,22 @@ mod tests {
 
             #[cfg(not(feature = "cursor"))]
             {
-                // Standalone path: the video adapter never produces cursor
-                // events. Cursor data would come from CursorStreamAdapter,
-                // which we don't simulate here — the point is that the
-                // video path produces zero cursor events.
                 let _ = (&sample, has_cursor);
             }
 
-            // Drop senders so receivers can drain.
             drop(video_tx);
             drop(cursor_tx);
 
-            // Count events on each channel.
             let video_events: Vec<_> = video_rx.try_iter().collect();
             let cursor_events: Vec<_> = cursor_rx.try_iter().collect();
 
-            // There should always be exactly one video event.
             prop_assert_eq!(video_events.len(), 1, "exactly one video event expected");
 
             #[cfg(feature = "cursor")]
             {
-                // Embedded path: cursor events come from the video adapter.
                 if has_cursor {
                     prop_assert_eq!(cursor_events.len(), 1,
                         "exactly one cursor event when frame has cursor data");
-                    // Verify the cursor event matches the original sample.
                     match &cursor_events[0] {
                         RecordingEvent::Cursor(CursorCaptureEvent::Sample(out)) => {
                             prop_assert_eq!(out.position_x, sample.position_x);
@@ -673,25 +611,12 @@ mod tests {
 
             #[cfg(not(feature = "cursor"))]
             {
-                // Standalone path: video adapter never produces cursor events.
                 prop_assert_eq!(cursor_events.len(), 0,
                     "video adapter must not produce cursor events when cursor feature is disabled");
             }
         }
     }
 
-    // Property 7: resolve_capture_target preserves semantics
-    //
-    //
-    // For any valid RecordingTarget (non-zero dimensions, valid handles),
-    // resolve_capture_target returns a CaptureTarget that preserves the
-    // target semantics:
-    //   - PrimaryMonitor → PrimaryMonitor
-    //   - Region(r) → Region(cr) where coordinates match
-    //
-    // Note: Monitor(selector) requires a real MonitorLayout::snapshot()
-    // and Window(selector) requires a real window handle (IsWindow check
-    // on Windows), so those variants are not tested here.
 
     proptest! {
 
@@ -738,11 +663,6 @@ mod tests {
         }
     }
 
-    //
-    //
-    // For any RecordingRegion where width == 0 or height == 0,
-    // resolve_capture_target shall return an Err indicating invalid
-    // dimensions.
 
     proptest! {
         #[test]

@@ -130,14 +130,6 @@ mod tests {
         prop::collection::vec((1u64..=8, prop::bool::ANY), 1..=30)
     }
 
-    //
-    // Property 6: Cursor frame recording with coordinate translation
-    //
-    // For any cursor sample with position (position_x, position_y) and
-    // any capture origin (origin_x, origin_y), calling record_frame
-    // should append exactly one CursorFrameRecord with coordinates
-    // (position_x - origin_x, position_y - origin_y), and last_frame
-    // should equal the appended record.
     proptest! {
         #[test]
         fn prop_cursor_frame_coordinate_translation(
@@ -159,7 +151,6 @@ mod tests {
             let frames_before = proc.mouse_store().cursor_frames.len();
             proc.record_frame(42, &sample);
 
-            // Exactly one frame appended.
             prop_assert_eq!(
                 proc.mouse_store().cursor_frames.len(),
                 frames_before + 1,
@@ -167,12 +158,9 @@ mod tests {
 
             let record = proc.mouse_store().cursor_frames.last().unwrap();
 
-            // Coordinate translation: x = position_x - origin_x
             prop_assert_eq!(record.x, position_x - origin_x);
-            // Coordinate translation: y = position_y - origin_y
             prop_assert_eq!(record.y, position_y - origin_y);
 
-            // last_frame equals the appended record.
             let last = proc.last_frame().unwrap();
             prop_assert_eq!(last.timestamp_ms, record.timestamp_ms);
             prop_assert_eq!(last.x, record.x);
@@ -182,14 +170,6 @@ mod tests {
         }
     }
 
-    //
-    // Property 5: Cursor shape deduplication invariant
-    //
-    // For any sequence of cursor samples with varying shape_ids:
-    // - After each `record_frame` call, the number of stored shapes
-    //   equals the number of unique shape_ids seen so far.
-    // - After all calls, every `shape_id` referenced by a
-    //   `CursorFrameRecord` exists in `cursor_shapes`.
     proptest! {
         #[test]
         fn prop_cursor_shape_deduplication(
@@ -200,22 +180,17 @@ mod tests {
 
             for (i, (shape_id, first_occurrence)) in seq.iter().enumerate() {
                 let sample = if *first_occurrence && !unique_ids.contains(shape_id) {
-                    // First time we see this id — attach the shape payload.
                     sample_with_shape(*shape_id)
                 } else {
-                    // Repeat or explicitly no-shape — reference only.
                     sample_without_shape(*shape_id)
                 };
 
-                // Track which shape_ids carry a shape payload (only those
-                // can be inserted into the store).
                 if sample.shape.is_some() {
                     unique_ids.insert(*shape_id);
                 }
 
                 proc.record_frame(i as u64, &sample);
 
-                // Invariant: stored shapes == unique shape_ids seen so far.
                 prop_assert_eq!(
                     proc.mouse_store().cursor_shapes.len(),
                     unique_ids.len(),
@@ -226,9 +201,6 @@ mod tests {
                 );
             }
 
-            // After all calls: every shape_id in cursor_frames must
-            // exist in cursor_shapes (if it was ever emitted with a
-            // shape payload).
             let stored_ids: HashSet<u64> = proc
                 .mouse_store()
                 .cursor_shapes
@@ -294,7 +266,6 @@ mod tests {
         assert_eq!(proc.mouse_store().cursor_frames.len(), 2);
         let synth = &proc.mouse_store().cursor_frames[1];
         assert_eq!(synth.timestamp_ms, 200);
-        // Coordinates should match the original (already translated).
         assert_eq!(synth.x, 50 - 10);
         assert_eq!(synth.y, 60 - 20);
     }

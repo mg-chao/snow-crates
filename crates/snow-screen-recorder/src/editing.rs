@@ -2089,7 +2089,6 @@ mod tests {
             width: 4,
             height: 2,
             rgba: vec![
-                // row 0
                 10, 20, 30, 255, 20, 40, 60, 255, 100, 120, 140, 255, 0, 0, 0, 255, // row 1
                 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
             ],
@@ -2104,7 +2103,6 @@ mod tests {
                 height: 1,
                 mode: CursorShapeCompositionMode::MaskedColor,
                 shape_rgba: vec![
-                    // alpha=0xFF + zero mask => no-op
                     0, 0, 0, 0xFF, // alpha=0xFF + non-zero mask => XOR
                     0xFF, 0xFF, 0xFF, 0xFF, // alpha=0x00 => source copy
                     5, 6, 7, 0x00,

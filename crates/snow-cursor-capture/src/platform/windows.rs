@@ -370,12 +370,10 @@ mod tests {
     #[test]
     fn apply_color_mask_as_masked_composition_maps_and_bits_to_alpha_ops() {
         let mut rgba = vec![
-            // row 0
             10, 20, 30, 0, 40, 50, 60, 0, // row 1
             70, 80, 90, 0, 100, 110, 120, 0,
         ];
         let mask_rgba = vec![
-            // row 0: set, clear
             255, 255, 255, 255, 0, 0, 0, 255, // row 1: clear, set
             0, 0, 0, 255, 255, 255, 255, 255,
         ];
@@ -383,7 +381,6 @@ mod tests {
         let ok = apply_color_mask_as_masked_composition(&mut rgba, 2, 2, 2, 2, &mask_rgba);
         assert!(ok, "mask conversion should succeed");
 
-        // AND=1 -> XOR op -> alpha=255, AND=0 -> copy op -> alpha=0.
         assert_eq!(rgba[3], 255);
         assert_eq!(rgba[7], 0);
         assert_eq!(rgba[11], 0);

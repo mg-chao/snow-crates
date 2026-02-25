@@ -821,8 +821,6 @@ mod tests {
 
     impl MonitorCapturer for MetadataDrivenCapturer {
         fn capture(&mut self, reuse: Option<Frame>) -> CaptureResult<Frame> {
-            // Simulate backends that do not override `capture_with_history_hint`
-            // and infer destination history directly from frame metadata.
             #[allow(deprecated)]
             let inferred_history = reuse
                 .as_ref()
@@ -1227,9 +1225,6 @@ mod tests {
         let mut session = CaptureSession::builder().with_backend(backend).build()?;
         session.layout = Some(mock_layout(&monitor, 0, 0, 128, 128));
 
-        // Region extends beyond monitor bounds, so only a partial overlap is
-        // covered by monitor entries and the desktop-direct fast path should
-        // not run.
         let target = CaptureTarget::Region(CaptureRegion::new(-16, -16, 128, 128)?);
         let _frame = session.capture_frame(&target)?;
 

@@ -158,7 +158,6 @@ mod tests {
     fn same_resolution_is_accepted() {
         let mut proc = make_processor();
         proc.handle_resolution_change(1920, 1080).unwrap();
-        // Same resolution should succeed.
         proc.handle_resolution_change(1920, 1080).unwrap();
         assert_eq!(proc.width(), 1920);
         assert_eq!(proc.height(), 1080);
@@ -177,7 +176,6 @@ mod tests {
     #[test]
     fn handle_duplicate_is_noop() {
         let proc = make_processor();
-        // Duplicate handling should always succeed without side effects.
         proc.handle_duplicate().unwrap();
     }
 

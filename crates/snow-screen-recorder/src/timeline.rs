@@ -103,9 +103,7 @@ mod tests {
     /// strictly ordered so that the timeline sees a valid alternating
     /// pause/resume sequence.
     fn arb_pause_resume_pairs() -> impl Strategy<Value = Vec<(u64, u64)>> {
-        // Generate 1..=8 gap sizes, then build cumulative offsets.
         prop::collection::vec(
-            // (gap_before_pause, pause_duration) both in ms
             (1u64..500, 1u64..500),
             1..=8,
         )
@@ -123,14 +121,6 @@ mod tests {
         })
     }
 
-    //
-    // Property 8: Pause timeline uses backend timestamps
-    //
-    // For any sequence of pause/resume pairs with known offsets from
-    // `started_at`, the recorded intervals must use the backend-provided
-    // timestamps (the exact offsets we supply), not wall-clock time.
-    // Additionally, `active_elapsed_ms` must correctly subtract the
-    // total paused duration from the total elapsed time.
     proptest! {
         #[test]
         fn prop_pause_timeline_uses_backend_timestamps(
@@ -152,7 +142,6 @@ mod tests {
                 total_paused_ms += resume_ms - pause_ms;
             }
 
-            // --- Assert intervals match backend-provided timestamps exactly ---
             let intervals = timeline.intervals();
             prop_assert_eq!(
                 intervals.len(),
@@ -177,8 +166,6 @@ mod tests {
                 );
             }
 
-            // --- Assert active_elapsed_ms subtracts paused time ---
-            // Query at a point after the last resume + some extra active time.
             let last_resume_ms = pairs.last().map(|&(_, r)| r).unwrap_or(0);
             let query_ms = last_resume_ms + extra_active_ms;
             let query_at = started_at + Duration::from_millis(query_ms);

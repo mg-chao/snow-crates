@@ -168,7 +168,6 @@ mod tests {
             tick_format: TickFormat::Hns100,
         };
         let anchor = TimestampAnchor::new(origin);
-        // (200 - 100) * 100ns = 10_000ns = 10µs
         assert_eq!(anchor.stream_relative(&ts), Duration::from_nanos(10_000));
     }
 
@@ -186,7 +185,6 @@ mod tests {
             tick_format: TickFormat::RawQpc,
         };
         let anchor = TimestampAnchor::new(origin);
-        // Both instants are the same, so duration should be ~zero
         let dur = anchor.stream_relative(&ts);
         assert!(dur < Duration::from_millis(1));
     }
@@ -304,8 +302,6 @@ mod tests {
                 let anchor = TimestampAnchor::new_with_frequency(origin, 10_000_000);
                 let result = anchor.stream_relative(&ts);
 
-                // The result should equal `later.saturating_duration_since(now)` which is `delta`.
-                // Instant arithmetic is exact (no OS call involved), so the result should match.
                 prop_assert_eq!(result, delta);
             }
         }

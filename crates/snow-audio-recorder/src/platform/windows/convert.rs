@@ -497,10 +497,6 @@ mod tests {
 
     #[test]
     fn arbitrary_downmix_averages_round_robin() {
-        // 4-channel frame: [FL=1.0, FR=2.0, RL=3.0, RR=4.0]
-        // Downmix to 2 channels:
-        //   ch0 gets idx 0 (FL=1.0) and idx 2 (RL=3.0) → avg = 2.0
-        //   ch1 gets idx 1 (FR=2.0) and idx 3 (RR=4.0) → avg = 3.0
         let input = vec![1.0f32, 2.0, 3.0, 4.0];
         let mut out = Vec::new();
         convert_channels(&input, 4, 2, &mut out);

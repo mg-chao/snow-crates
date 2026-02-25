@@ -309,11 +309,9 @@ mod tests {
     fn buffer_pressure_survives_full_data_lane() {
         let queue = EventQueue::new(2);
 
-        // Fill the data lane completely.
         queue.push(AudioEvent::Packet(packet(1)));
         queue.push(AudioEvent::Packet(packet(2)));
 
-        // Push a BufferPressure event — it should go into the control lane.
         let outcome = queue.push(AudioEvent::BufferPressure {
             fill_ratio: 1.0,
             buffer_depth: 2,
@@ -323,7 +321,6 @@ mod tests {
             "BufferPressure should not evict anything"
         );
 
-        // Control events are delivered first.
         let first = queue.recv().unwrap().0;
         assert!(
             matches!(first, AudioEvent::BufferPressure { .. }),

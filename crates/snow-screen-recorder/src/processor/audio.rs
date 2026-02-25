@@ -159,12 +159,6 @@ mod tests {
         ]
     }
 
-    //
-    // Property 4: Audio track isolation and recording flags
-    //
-    // For any audio source kind and non-zero frame count, writing a
-    // packet routes to the correct writer and sets only the
-    // corresponding recording flag.
     proptest! {
         #[test]
         fn prop_track_isolation_with_both_writers(
@@ -180,7 +174,6 @@ mod tests {
             let (packet, bytes) = make_packet(source, frames);
             let appended = proc.write_packet(source, &packet, &bytes, &timeline).unwrap();
 
-            // With valid non-empty data, appended should be > 0.
             prop_assert!(appended > 0, "expected appended > 0, got {appended}");
 
             match source {
@@ -207,7 +200,6 @@ mod tests {
             source in arb_source(),
             frames in 1u32..=960,
         ) {
-            // Both writers are None — source is disabled.
             let mut proc = AudioProcessor::new(None, None);
             let timeline = PauseTimeline::new(Instant::now());
 
@@ -231,7 +223,6 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let timeline = PauseTimeline::new(Instant::now());
 
-            // Only system writer present — mic writes should be no-ops.
             {
                 let sys_writer = temp_writer(&dir, "sys_only.pcm");
                 let mut proc = AudioProcessor::new(Some(sys_writer), None);
@@ -243,7 +234,6 @@ mod tests {
                 prop_assert!(!proc.recorded_system());
             }
 
-            // Only mic writer present — system writes should be no-ops.
             {
                 let mic_writer = temp_writer(&dir, "mic_only.pcm");
                 let mut proc = AudioProcessor::new(None, Some(mic_writer));
