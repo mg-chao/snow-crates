@@ -63,12 +63,16 @@ impl<S: RegionSlot, const N: usize> RegionPipelineState<S, N> {
         }
     }
 
-    /// Soft-reset the pipeline: clear bookkeeping and soft-reset each slot.
-    pub fn reset(&mut self) {
+    fn clear_pipeline_state(&mut self) {
         self.pending_slot = None;
         self.next_write_slot = 0;
         self.adaptive_spin_polls = REGION_SPIN_INITIAL_POLLS;
         self.blit = None;
+    }
+
+    /// Soft-reset the pipeline: clear bookkeeping and soft-reset each slot.
+    pub fn reset(&mut self) {
+        self.clear_pipeline_state();
         for slot in &mut self.slots {
             slot.soft_reset();
         }
@@ -76,10 +80,7 @@ impl<S: RegionSlot, const N: usize> RegionPipelineState<S, N> {
 
     /// Hard-reset the pipeline: clear bookkeeping and fully invalidate each slot.
     pub fn invalidate(&mut self) {
-        self.pending_slot = None;
-        self.next_write_slot = 0;
-        self.adaptive_spin_polls = REGION_SPIN_INITIAL_POLLS;
-        self.blit = None;
+        self.clear_pipeline_state();
         for slot in &mut self.slots {
             slot.hard_reset();
         }

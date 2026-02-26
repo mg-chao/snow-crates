@@ -135,6 +135,19 @@ pub struct StreamHandle {
 }
 
 impl StreamHandle {
+    fn request_stop_and_join(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn note_consumed_event(&self, event: &CaptureEvent) {
+        if matches!(event, CaptureEvent::Frame(_)) {
+            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
+        }
+    }
+
     /// Start the streaming capture loop on a background thread.
     pub(crate) fn start(
         mut session: CaptureSession,
@@ -193,10 +206,7 @@ impl StreamHandle {
     ///
     /// **Note:** `buffer_fill` will no longer be updated after this call.
     pub fn into_receiver(mut self) -> mpsc::Receiver<CaptureEvent> {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+        self.request_stop_and_join();
         let this = std::mem::ManuallyDrop::new(self);
         unsafe { std::ptr::read(&this.receiver) }
     }
@@ -206,9 +216,7 @@ impl StreamHandle {
     /// when a `Frame` event is consumed.
     pub fn recv(&self) -> Result<CaptureEvent, mpsc::RecvError> {
         let event = self.receiver.recv()?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
+        self.note_consumed_event(&event);
         Ok(event)
     }
 
@@ -216,9 +224,7 @@ impl StreamHandle {
     /// updates `buffer_fill` when a `Frame` event is consumed.
     pub fn try_recv(&self) -> Result<CaptureEvent, mpsc::TryRecvError> {
         let event = self.receiver.try_recv()?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
+        self.note_consumed_event(&event);
         Ok(event)
     }
 
@@ -226,9 +232,7 @@ impl StreamHandle {
     /// `buffer_fill` when a `Frame` event is consumed.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, mpsc::RecvTimeoutError> {
         let event = self.receiver.recv_timeout(timeout)?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
+        self.note_consumed_event(&event);
         Ok(event)
     }
 
@@ -280,10 +284,7 @@ impl StreamHandle {
     /// events. Returns an iterator over the final events so the
     /// recorder can flush its encoder without losing the tail frames.
     pub fn stop_and_drain(mut self) -> Vec<CaptureEvent> {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+        self.request_stop_and_join();
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
             events.push(event);
@@ -296,10 +297,7 @@ impl StreamHandle {
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+        self.request_stop_and_join();
     }
 }
 
