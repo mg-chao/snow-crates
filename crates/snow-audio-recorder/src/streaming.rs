@@ -121,7 +121,10 @@ impl AudioStreamHandle {
         self.stats.buffer_fill.store(len as u64, Ordering::Release);
     }
 
-    fn map_recv_outcome<E>(&self, outcome: Result<(AudioEvent, usize), E>) -> Result<AudioEvent, E> {
+    fn map_recv_outcome<E>(
+        &self,
+        outcome: Result<(AudioEvent, usize), E>,
+    ) -> Result<AudioEvent, E> {
         outcome.map(|(event, len)| {
             self.update_buffer_fill(len);
             event
@@ -471,10 +474,7 @@ mod tests {
 
     impl ScriptedEngine {
         fn new(events: Vec<EngineEvent>) -> Self {
-            Self {
-                cursor: 0,
-                events,
-            }
+            Self { cursor: 0, events }
         }
     }
 
@@ -485,9 +485,7 @@ mod tests {
             if let Some(ev) = self.events.get(idx) {
                 match ev {
                     EngineEvent::Idle => Ok(EngineEvent::Idle),
-                    EngineEvent::Events(events) => {
-                        Ok(EngineEvent::Events(events.clone()))
-                    }
+                    EngineEvent::Events(events) => Ok(EngineEvent::Events(events.clone())),
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(5));

@@ -173,11 +173,6 @@ impl PacketAccumulator {
         })
     }
 
-    fn clear(&mut self) {
-        self.chunks.clear();
-        self.buffered_frames = 0;
-    }
-
     fn push_chunk(
         &mut self,
         bytes: &[u8],
@@ -322,11 +317,7 @@ fn merge_pending_meta(slot: &mut Option<PendingMetadata>, incoming: PendingMetad
 }
 
 pub(crate) struct WasapiSource {
-    kind: AudioSourceKind,
-    flow: DeviceFlow,
-    selector: DeviceSelector,
     config: SourceConfig,
-    enumerator: IMMDeviceEnumerator,
     event: EventHandle,
     runtime: SourceRuntime,
     converter: AudioConverter,
@@ -355,11 +346,7 @@ impl WasapiSource {
             PacketAccumulator::new(kind, config.output_format, config.packet_duration)?;
 
         Ok(Self {
-            kind,
-            flow,
-            selector,
             config,
-            enumerator,
             event,
             runtime,
             converter,
@@ -375,26 +362,6 @@ impl WasapiSource {
 
     pub fn event_handle(&self) -> windows::Win32::Foundation::HANDLE {
         self.event.raw()
-    }
-
-    pub fn restart(&mut self) -> AudioResult<(Option<String>, String)> {
-        let old_id = Some(self.runtime.device_id.clone());
-        let _ = unsafe { self.runtime.audio_client.Stop() };
-
-        self.accumulator.clear();
-
-        let (runtime, converter) = init_runtime(
-            self.kind,
-            self.flow,
-            &self.selector,
-            &self.config,
-            &self.enumerator,
-            self.event.raw(),
-        )?;
-        self.runtime = runtime;
-        self.converter = converter;
-
-        Ok((old_id, self.runtime.device_id.clone()))
     }
 
     pub fn drain_packets(&mut self) -> AudioResult<Vec<AudioPacket>> {

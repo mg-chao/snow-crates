@@ -23,8 +23,7 @@ use self::com::{CoInitGuard, EventHandle};
 use self::notification::NotificationClientGuard;
 use self::wasapi_source::WasapiSource;
 
-const SOURCE_KINDS: [AudioSourceKind; 2] =
-    [AudioSourceKind::System, AudioSourceKind::Microphone];
+const SOURCE_KINDS: [AudioSourceKind; 2] = [AudioSourceKind::System, AudioSourceKind::Microphone];
 
 /// Per-source deferred retry state. Instead of blocking the worker thread with
 /// `thread::sleep`, we record when the next attempt is allowed and let `poll()`
@@ -165,11 +164,7 @@ impl WasapiEngine {
             .min()
     }
 
-    fn source_should_rebind_on_default_change(
-        &self,
-        kind: AudioSourceKind,
-        changed: bool,
-    ) -> bool {
+    fn source_should_rebind_on_default_change(&self, kind: AudioSourceKind, changed: bool) -> bool {
         if !changed {
             return false;
         }
@@ -308,28 +303,24 @@ impl WasapiEngine {
         let mut events = Vec::new();
 
         let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
+        let changes = com.notification.state().take_changes();
 
         if !self.config.restart_policy.auto_rebind_on_default_change {
-            let state = com.notification.state();
-            let _ = state.take_render_default_changed();
-            let _ = state.take_capture_default_changed();
-            let _ = state.take_topology_changed();
             return Ok(events);
         }
 
-        let state = com.notification.state();
-        let render_changed = state.take_render_default_changed();
-        let capture_changed = state.take_capture_default_changed();
-        let topology_changed = state.take_topology_changed();
-
         for kind in SOURCE_KINDS {
-            let changed = Self::changed_for_kind(kind, render_changed, capture_changed);
+            let changed = Self::changed_for_kind(
+                kind,
+                changes.render_default_changed,
+                changes.capture_default_changed,
+            );
             if self.source_should_rebind_on_default_change(kind, changed) {
                 self.begin_retry(kind, None);
             }
         }
 
-        if topology_changed {
+        if changes.topology_changed {
             let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
             let kinds_to_retry: Vec<_> = SOURCE_KINDS
                 .iter()
@@ -380,31 +371,27 @@ impl WasapiEngine {
         let source_config = self.source_config(kind).clone();
         let max_attempts = self.config.restart_policy.max_attempts.max(1);
         let max_backoff = self.config.restart_policy.max_backoff;
+        let downtime = self
+            .retry_ref(kind)
+            .as_ref()
+            .map_or(Duration::ZERO, |r| r.downtime());
 
-        let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
-        let enumerator = com.enumerator.clone();
-        let slot = com.source_mut(kind);
-
-        let result = if let Some(source) = slot.as_mut() {
-            source.restart()
-        } else {
+        let result = {
+            let com = self.com.as_mut().ok_or(AudioError::WorkerDead)?;
+            let enumerator = com.enumerator.clone();
             WasapiSource::new(kind, source_config.clone(), enumerator).map(|source| {
                 let new_id = source.current_device_id().to_string();
-                *slot = Some(source);
-                (None, new_id)
+                *com.source_mut(kind) = Some(source);
+                new_id
             })
         };
 
         match result {
-            Ok((old_device_id, new_device_id)) => {
-                let downtime = self
-                    .retry_ref(kind)
-                    .as_ref()
-                    .map_or(Duration::ZERO, |r| r.downtime());
+            Ok(new_device_id) => {
                 *self.retry_mut(kind) = None;
                 out.push(AudioEvent::SourceRestarted {
                     source: kind,
-                    old_device_id,
+                    old_device_id: None,
                     new_device_id,
                     downtime,
                 });

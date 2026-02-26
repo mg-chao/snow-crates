@@ -26,7 +26,11 @@ impl AudioPacketMetadata {
     /// Set timing fields from a capture operation.
     ///
     /// Populates `stream_timestamp` from the capture time and QPC value.
-    pub(crate) fn set_timing(&mut self, capture_time: Option<Instant>, qpc_position_100ns: Option<i64>) {
+    pub(crate) fn set_timing(
+        &mut self,
+        capture_time: Option<Instant>,
+        qpc_position_100ns: Option<i64>,
+    ) {
         self.stream_timestamp = Some(StreamTimestamp {
             instant: capture_time.unwrap_or_else(Instant::now),
             raw_os_ticks: qpc_position_100ns,
@@ -68,7 +72,10 @@ impl AudioPacket {
 
     /// QPC position (100ns units) at packet end.
     pub fn end_qpc_position_100ns(&self) -> Option<i64> {
-        self.metadata.stream_timestamp.as_ref().and_then(|st| st.raw_os_ticks)
+        self.metadata
+            .stream_timestamp
+            .as_ref()
+            .and_then(|st| st.raw_os_ticks)
     }
 
     /// QPC position (100ns units) at packet start.

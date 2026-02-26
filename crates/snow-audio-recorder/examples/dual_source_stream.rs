@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use snow_audio_recorder::{
-    AudioEvent, AudioSession, AudioStreamConfig, AudioTimestampAnchorExt,
-    RecvTimeoutError, audio_anchor_from_origin_instant,
+    AudioEvent, AudioSession, AudioStreamConfig, AudioTimestampAnchorExt, RecvTimeoutError,
+    audio_anchor_from_origin_instant,
 };
 
 fn main() -> Result<()> {
