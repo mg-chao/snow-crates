@@ -393,34 +393,50 @@ impl CaptureSession {
         }
     }
 
+    fn get_or_create_capturer_in_map<K, F>(
+        map: &mut FxHashMap<K, Box<dyn MonitorCapturer>>,
+        key: K,
+        mode: CaptureMode,
+        create_capturer: F,
+    ) -> CaptureResult<&mut Box<dyn MonitorCapturer>>
+    where
+        K: Eq + std::hash::Hash,
+        F: FnOnce() -> CaptureResult<Box<dyn MonitorCapturer>>,
+    {
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut capturer = create_capturer()?;
+                capturer.set_capture_mode(mode);
+                Ok(entry.insert(capturer))
+            }
+        }
+    }
+
     fn get_or_create_capturer(
         &mut self,
         monitor: &MonitorId,
     ) -> CaptureResult<&mut Box<dyn MonitorCapturer>> {
-        let key = monitor.key();
-        match self.capturers.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let mut capturer = self.backend.create_monitor_capturer(monitor)?;
-                capturer.set_capture_mode(self.config.mode);
-                Ok(entry.insert(capturer))
-            }
-        }
+        let backend = Arc::clone(&self.backend);
+        Self::get_or_create_capturer_in_map(
+            &mut self.capturers,
+            monitor.key(),
+            self.config.mode,
+            || backend.create_monitor_capturer(monitor),
+        )
     }
 
     fn get_or_create_window_capturer(
         &mut self,
         window: &WindowId,
     ) -> CaptureResult<&mut Box<dyn MonitorCapturer>> {
-        let key = window.key();
-        match self.window_capturers.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let mut capturer = self.backend.create_window_capturer(window)?;
-                capturer.set_capture_mode(self.config.mode);
-                Ok(entry.insert(capturer))
-            }
-        }
+        let backend = Arc::clone(&self.backend);
+        Self::get_or_create_capturer_in_map(
+            &mut self.window_capturers,
+            window.key(),
+            self.config.mode,
+            || backend.create_window_capturer(window),
+        )
     }
 
     /// Shared capture-with-retry loop used by both monitor and window paths.
