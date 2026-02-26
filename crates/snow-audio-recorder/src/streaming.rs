@@ -394,9 +394,7 @@ fn push_event_with_drop_notice(
     bp: &mut BackpressureState,
 ) {
     let outcome = queue.push(event);
-    stats
-        .buffer_fill
-        .store(outcome.len as u64, Ordering::Release);
+    store_buffer_fill(stats, outcome.len);
 
     // Check backpressure *before* handling drops; this is the proactive signal.
     if let Some(pressure_event) = bp.check(outcome.len) {
@@ -404,27 +402,8 @@ fn push_event_with_drop_notice(
         let _ = queue.push(pressure_event);
     }
 
-    let Some(dropped) = outcome.dropped else {
-        return;
-    };
-    let Some((source, dropped_frames)) = dropped_packet_info(&dropped) else {
-        return;
-    };
-
-    record_dropped_packet(stats, dropped_frames);
-    let notice_outcome = queue.push(AudioEvent::PacketDropped {
-        source,
-        dropped_frames,
-    });
-    stats
-        .buffer_fill
-        .store(notice_outcome.len as u64, Ordering::Release);
-
-    let Some(dropped_notice_target) = notice_outcome.dropped else {
-        return;
-    };
-    if let Some((_, secondary_dropped_frames)) = dropped_packet_info(&dropped_notice_target) {
-        record_dropped_packet(stats, secondary_dropped_frames);
+    if let Some(dropped) = outcome.dropped {
+        handle_drop_notice(queue, stats, dropped);
     }
 }
 
@@ -441,6 +420,31 @@ fn dropped_packet_info(event: &AudioEvent) -> Option<(crate::packet::AudioSource
     match event {
         AudioEvent::Packet(AudioPacket { source, frames, .. }) => Some((*source, *frames as u64)),
         _ => None,
+    }
+}
+
+fn store_buffer_fill(stats: &AudioStreamStats, len: usize) {
+    stats.buffer_fill.store(len as u64, Ordering::Release);
+}
+
+fn handle_drop_notice(queue: &EventQueue, stats: &AudioStreamStats, dropped: AudioEvent) {
+    let Some((source, dropped_frames)) = dropped_packet_info(&dropped) else {
+        return;
+    };
+
+    record_dropped_packet(stats, dropped_frames);
+    let notice_outcome = queue.push(AudioEvent::PacketDropped {
+        source,
+        dropped_frames,
+    });
+    store_buffer_fill(stats, notice_outcome.len);
+
+    if let Some(secondary_dropped) = notice_outcome
+        .dropped
+        .and_then(|event| dropped_packet_info(&event))
+    {
+        let (_, secondary_dropped_frames) = secondary_dropped;
+        record_dropped_packet(stats, secondary_dropped_frames);
     }
 }
 

@@ -42,15 +42,11 @@ struct SourceRetryState {
     last_error: Option<AudioError>,
 }
 
-pub(crate) struct WasapiBackend {
-    kind: AudioBackendKind,
-}
+pub(crate) struct WasapiBackend;
 
 impl WasapiBackend {
-    pub fn new(kind: AudioBackendKind) -> AudioResult<Self> {
-        match kind {
-            AudioBackendKind::Auto | AudioBackendKind::Wasapi => Ok(Self { kind }),
-        }
+    pub fn new(_kind: AudioBackendKind) -> AudioResult<Self> {
+        Ok(Self)
     }
 }
 
@@ -65,11 +61,7 @@ impl AudioBackend for WasapiBackend {
         &self,
         config: AudioStreamConfig,
     ) -> AudioResult<Box<dyn AudioRecorderEngine>> {
-        match self.kind {
-            AudioBackendKind::Auto | AudioBackendKind::Wasapi => {
-                Ok(Box::new(WasapiEngine::new(config)))
-            }
-        }
+        Ok(Box::new(WasapiEngine::new(config)))
     }
 }
 
@@ -124,6 +116,17 @@ impl ComState {
 }
 
 impl WasapiEngine {
+    fn changed_for_kind(
+        kind: AudioSourceKind,
+        render_changed: bool,
+        capture_changed: bool,
+    ) -> bool {
+        match kind {
+            AudioSourceKind::System => render_changed,
+            AudioSourceKind::Microphone => capture_changed,
+        }
+    }
+
     fn retry_mut(&mut self, kind: AudioSourceKind) -> &mut Option<SourceRetryState> {
         match kind {
             AudioSourceKind::System => &mut self.system_retry,
@@ -238,16 +241,13 @@ impl WasapiEngine {
 
     fn ensure_initialized(&mut self) -> AudioResult<()> {
         let current_thread = std::thread::current().id();
-        match self.worker_thread_id {
-            Some(id) => {
-                debug_assert_eq!(
-                    id, current_thread,
-                    "WasapiEngine must only be used from its worker thread"
-                );
-            }
-            None => {
-                self.worker_thread_id = Some(current_thread);
-            }
+        if let Some(id) = self.worker_thread_id {
+            debug_assert_eq!(
+                id, current_thread,
+                "WasapiEngine must only be used from its worker thread"
+            );
+        } else {
+            self.worker_thread_id = Some(current_thread);
         }
 
         if self.com.is_some() {
@@ -323,10 +323,7 @@ impl WasapiEngine {
         let topology_changed = state.take_topology_changed();
 
         for kind in SOURCE_KINDS {
-            let changed = match kind {
-                AudioSourceKind::System => render_changed,
-                AudioSourceKind::Microphone => capture_changed,
-            };
+            let changed = Self::changed_for_kind(kind, render_changed, capture_changed);
             if self.source_should_rebind_on_default_change(kind, changed) {
                 self.begin_retry(kind, None);
             }
@@ -391,14 +388,11 @@ impl WasapiEngine {
         let result = if let Some(source) = slot.as_mut() {
             source.restart()
         } else {
-            match WasapiSource::new(kind, source_config.clone(), enumerator) {
-                Ok(source) => {
-                    let new_id = source.current_device_id().to_string();
-                    *slot = Some(source);
-                    Ok((None, new_id))
-                }
-                Err(err) => Err(err),
-            }
+            WasapiSource::new(kind, source_config.clone(), enumerator).map(|source| {
+                let new_id = source.current_device_id().to_string();
+                *slot = Some(source);
+                (None, new_id)
+            })
         };
 
         match result {
@@ -490,7 +484,8 @@ impl AudioRecorderEngine for WasapiEngine {
         self.ensure_initialized()?;
 
         let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
-        let mut handles = vec![com.control_event.raw()];
+        let mut handles = Vec::with_capacity(SOURCE_KINDS.len() + 1);
+        handles.push(com.control_event.raw());
         for kind in SOURCE_KINDS {
             if let Some(source) = com.source_ref(kind) {
                 handles.push(source.event_handle());
@@ -509,28 +504,21 @@ impl AudioRecorderEngine for WasapiEngine {
             timeout
         };
 
-        if handles.is_empty() && !has_pending_retry {
-            return Ok(EngineEvent::Idle);
-        }
-
         let mut events = Vec::new();
 
-        if !handles.is_empty() {
-            let timeout_ms = effective_timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-            let wait_result = unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) };
+        let timeout_ms = effective_timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        let wait_result = unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) };
 
-            if wait_result == WAIT_FAILED {
-                return Err(AudioError::platform(anyhow::anyhow!(
-                    "WaitForMultipleObjects failed"
-                )));
-            }
+        if wait_result == WAIT_FAILED {
+            return Err(AudioError::platform(anyhow::anyhow!(
+                "WaitForMultipleObjects failed"
+            )));
+        }
 
-            if wait_result == WAIT_OBJECT_0 {
-                let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
-                let _ = com.control_event.reset();
-                events.extend(self.process_control_notifications()?);
-            }
-
+        if wait_result == WAIT_OBJECT_0 {
+            let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
+            let _ = com.control_event.reset();
+            events.extend(self.process_control_notifications()?);
         }
 
         for kind in SOURCE_KINDS {
