@@ -61,10 +61,6 @@ pub(crate) fn run_mux_event_loop(
                 return Ok(coordinator);
             }
         }
-
-        if coordinator.evaluate_termination().is_stop() {
-            return Ok(coordinator);
-        }
     }
 }
 

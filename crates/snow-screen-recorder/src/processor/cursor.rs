@@ -58,10 +58,9 @@ impl CursorProcessor {
     /// Synthesize a cursor frame for a dropped video frame by cloning
     /// the last recorded frame with an updated timestamp.
     pub(crate) fn synthesize_frame_for_drop(&mut self, timestamp_ms: u64) {
-        if let Some(mut last) = self.last_frame.clone() {
+        if let Some(last) = self.last_frame.as_mut() {
             last.timestamp_ms = timestamp_ms;
-            self.last_frame = Some(last.clone());
-            self.mouse_store.cursor_frames.push(last);
+            self.mouse_store.cursor_frames.push(last.clone());
         }
     }
 

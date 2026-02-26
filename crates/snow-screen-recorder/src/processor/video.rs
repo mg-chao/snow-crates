@@ -56,10 +56,24 @@ impl VideoProcessor {
         Ok(())
     }
 
-    /// Handle a duplicate frame. Duplicate frames are skipped — no
-    /// encoding work is performed.
-    pub(crate) fn handle_duplicate(&self) -> Result<()> {
-        Ok(())
+    /// Lazily initialize the video encoder and return a mutable handle.
+    fn ensure_encoder(&mut self, width: u32, height: u32) -> Result<&mut LiveVideoEncoder> {
+        if self.encoder.is_none() {
+            self.encoder = Some(LiveVideoEncoder::create(
+                &self.video_temp_path,
+                width,
+                height,
+                self.target_fps,
+                self.video_format,
+                &self.video_config,
+            )?);
+        }
+
+        self.encoder.as_mut().ok_or_else(|| {
+            ScreenRecorderError::Encode(
+                "video encoder was not initialized before frame encoding".to_string(),
+            )
+        })
     }
 
     /// Encode a non-duplicate RGBA frame at the given timestamp.
@@ -74,21 +88,7 @@ impl VideoProcessor {
         height: u32,
         ts_ms: u64,
     ) -> Result<()> {
-        if self.encoder.is_none() {
-            self.encoder = Some(LiveVideoEncoder::create(
-                &self.video_temp_path,
-                width,
-                height,
-                self.target_fps,
-                self.video_format,
-                &self.video_config,
-            )?);
-        }
-        let encoder = self.encoder.as_mut().ok_or_else(|| {
-            ScreenRecorderError::Encode(
-                "video encoder was not initialized before frame encoding".to_string(),
-            )
-        })?;
+        let encoder = self.ensure_encoder(width, height)?;
         encoder.encode_frame(&rgba, ts_ms)?;
         self.last_encoded_rgba = Some(rgba);
         Ok(())
@@ -162,12 +162,6 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("dynamic resolution is unsupported"));
-    }
-
-    #[test]
-    fn handle_duplicate_is_noop() {
-        let proc = make_processor();
-        proc.handle_duplicate().unwrap();
     }
 
     #[test]

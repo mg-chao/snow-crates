@@ -43,10 +43,11 @@ pub(crate) fn build_multiplexer(
     #[cfg(not(feature = "cursor"))] cursor_handle: Option<snow_cursor_capture::CursorStreamHandle>,
 ) -> (StreamMultiplexer<RecordingEvent>, Vec<SourceId>) {
     let mut active_sources = Vec::new();
+    let priority_source = audio_handle.as_ref().map(|_| AUDIO_SOURCE);
 
     let mut builder = StreamMultiplexerBuilder::new(MultiplexerConfig {
         select_timeout: Duration::from_millis(25),
-        priority_source: Some(AUDIO_SOURCE),
+        priority_source,
         priority_drain_batch: 8,
         output_capacity: 16,
         output_send_timeout: Duration::from_millis(10),

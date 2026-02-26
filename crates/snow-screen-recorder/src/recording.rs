@@ -808,7 +808,8 @@ fn new_recording_worker(
     capture_origin_x: i32,
     capture_origin_y: i32,
 ) -> Result<WorkerOutcome> {
-    let frame_interval_ms = ((1000.0 / config.fps.max(1) as f32).round() as u32).max(1);
+    let target_fps = config.fps.max(1);
+    let frame_interval_ms = ((1000.0 / target_fps as f32).round() as u32).max(1);
     let sample_rate_hz = config.audio.sample_rate_hz.max(1);
     let channels = config.audio.channels.channels().max(1);
 
@@ -822,7 +823,7 @@ fn new_recording_worker(
     let mic_writer = make_writer(config.audio.microphone_enabled, &layout.audio_mic_path)?;
 
     let video = VideoProcessor::new(
-        config.fps.max(1),
+        target_fps,
         config.video_format,
         config.video.clone(),
         layout.video_temp_path.clone(),
@@ -838,15 +839,13 @@ fn new_recording_worker(
     // Resolve standalone cursor handle (only when cursor feature is disabled).
     #[cfg(not(feature = "cursor"))]
     let cursor_handle: Option<snow_cursor_capture::CursorStreamHandle> = {
-        match snow_cursor_capture::CursorStreamHandle::start(
+        snow_cursor_capture::CursorStreamHandle::start(
             snow_cursor_capture::CursorStreamConfig {
-                poll_interval: Duration::from_secs(1) / config.fps.max(1),
+                poll_interval: Duration::from_secs(1) / target_fps,
                 ..Default::default()
             },
-        ) {
-            Ok(handle) => Some(handle),
-            Err(_) => None,
-        }
+        )
+        .ok()
     };
 
     let (multiplexer, active_sources) = crate::adapter::multiplexer_setup::build_multiplexer(
@@ -858,7 +857,7 @@ fn new_recording_worker(
 
     coordinator.set_active_sources(active_sources);
 
-    let mut coordinator = event_loop::run_mux_event_loop(coordinator, &multiplexer, &control_rx)?;
+    coordinator = event_loop::run_mux_event_loop(coordinator, &multiplexer, &control_rx)?;
 
     event_loop::mux_graceful_shutdown(&mut coordinator, &multiplexer)?;
 

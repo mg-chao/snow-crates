@@ -141,14 +141,6 @@ impl RecordingCoordinator {
         }
     }
 
-    fn observe_video_at(&mut self, at: Instant) {
-        self.observe_video_time(self.timeline.active_elapsed_ms(at));
-    }
-
-    fn end_source(&mut self, source: SourceId) {
-        self.mark_source_ended(source);
-    }
-
     fn handle_source_error<E: Classify>(&mut self, source: SourceId, err: &E) {
         match err.class() {
             ErrorClass::Fatal => self.fatal_error = true,
@@ -262,7 +254,7 @@ impl RecordingCoordinator {
                 self.observe_video_time(ts_ms);
 
                 if frame.metadata.is_duplicate {
-                    return self.video.handle_duplicate();
+                    return Ok(());
                 }
 
                 let rgba = frame.as_rgba_bytes().to_vec();
@@ -270,7 +262,7 @@ impl RecordingCoordinator {
             }
 
             CaptureEvent::Paused { at } => {
-                self.observe_video_at(at);
+                self.observe_video_time(self.timeline.active_elapsed_ms(at));
                 self.timeline.mark_pause(at);
                 Ok(())
             }
@@ -281,7 +273,7 @@ impl RecordingCoordinator {
             }
 
             CaptureEvent::StreamEnded => {
-                self.end_source(VIDEO_SOURCE);
+                self.mark_source_ended(VIDEO_SOURCE);
                 Ok(())
             }
 
@@ -328,7 +320,7 @@ impl RecordingCoordinator {
             }
 
             AudioEvent::StreamEnded => {
-                self.end_source(AUDIO_SOURCE);
+                self.mark_source_ended(AUDIO_SOURCE);
                 Ok(())
             }
 
@@ -357,7 +349,7 @@ impl RecordingCoordinator {
             }
             CursorEvent::Paused { .. } | CursorEvent::Resumed { .. } => Ok(()),
             CursorEvent::StreamEnded | CursorEvent::Error(_) => {
-                self.end_source(CURSOR_SOURCE);
+                self.mark_source_ended(CURSOR_SOURCE);
                 Ok(())
             }
         }
