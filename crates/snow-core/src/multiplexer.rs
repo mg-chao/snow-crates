@@ -341,15 +341,14 @@ fn forwarding_thread<E, H, F, O>(
 
         let mapped = mapper(tagged);
 
-        if !mapped.is_empty() {
-            if tx.send_timeout(SourceMsg::Events(mapped), send_timeout).is_err() {
-                // Channel full or disconnected 鈥?drop events.
-                if is_terminal {
-                    let _ = tx.send_timeout(SourceMsg::StreamEnded, send_timeout);
-                    break;
-                }
-                continue;
+        if !mapped.is_empty() && tx.send_timeout(SourceMsg::Events(mapped), send_timeout).is_err()
+        {
+            // Channel full or disconnected 鈥?drop events.
+            if is_terminal {
+                let _ = tx.send_timeout(SourceMsg::StreamEnded, send_timeout);
+                break;
             }
+            continue;
         }
 
         if is_terminal {
@@ -410,33 +409,33 @@ fn main_loop<O: Send + 'static>(
         }
 
         // Audio-priority pre-drain.
-        if let Some(prio_id) = priority_source {
-            if let Some(prio_idx) = alive.iter().position(|(id, _)| *id == prio_id) {
-                for _ in 0..config.priority_drain_batch {
-                    match alive[prio_idx].1.try_recv() {
-                        Ok(SourceMsg::Events(events)) => {
-                            for item in events {
-                                send_output(
-                                    &output_tx,
-                                    item,
-                                    config.output_send_timeout,
-                                    &drop_counter,
-                                );
-                            }
+        if let Some(prio_id) = priority_source
+            && let Some(prio_idx) = alive.iter().position(|(id, _)| *id == prio_id)
+        {
+            for _ in 0..config.priority_drain_batch {
+                match alive[prio_idx].1.try_recv() {
+                    Ok(SourceMsg::Events(events)) => {
+                        for item in events {
+                            send_output(
+                                &output_tx,
+                                item,
+                                config.output_send_timeout,
+                                &drop_counter,
+                            );
                         }
-                        Ok(SourceMsg::StreamEnded) => {
-                            let _ = status_tx.send(MuxStatus::SourceEnded(prio_id));
-                            terminated_count += 1;
-                            remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
-                            break;
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            check_forwarder_panic(&mut joins, prio_id, &status_tx);
-                            terminated_count += 1;
-                            remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
-                            break;
-                        }
+                    }
+                    Ok(SourceMsg::StreamEnded) => {
+                        let _ = status_tx.send(MuxStatus::SourceEnded(prio_id));
+                        terminated_count += 1;
+                        remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        check_forwarder_panic(&mut joins, prio_id, &status_tx);
+                        terminated_count += 1;
+                        remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
+                        break;
                     }
                 }
             }
@@ -518,17 +517,17 @@ fn shutdown_drain<O: Send + 'static>(
     terminated_count: &mut usize,
 ) {
     // Phase 1: Drain priority source first.
-    if let Some(prio_id) = config.priority_source {
-        if let Some(prio_idx) = alive.iter().position(|(id, _)| *id == prio_id) {
-            drain_source(
-                &alive[prio_idx],
-                output_tx,
-                status_tx,
-                drop_counter,
-                config.output_send_timeout,
-                terminated_count,
-            );
-        }
+    if let Some(prio_id) = config.priority_source
+        && let Some(prio_idx) = alive.iter().position(|(id, _)| *id == prio_id)
+    {
+        drain_source(
+            &alive[prio_idx],
+            output_tx,
+            status_tx,
+            drop_counter,
+            config.output_send_timeout,
+            terminated_count,
+        );
     }
 
     // Phase 2: Drain remaining sources.
