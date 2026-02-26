@@ -22,7 +22,6 @@ use crate::recording::{WorkerOutcome, audio_packet_to_i16_le_bytes};
 use crate::timeline::PauseTimeline;
 
 /// Coordinates the recording pipeline.
-/// Coordinates the recording pipeline.
 ///
 /// Owns the pause timeline, receives unified events, and dispatches
 /// to the appropriate processor. Tracks stream-ended states via
@@ -91,7 +90,7 @@ impl RecordingCoordinator {
 
     /// Handle a control-plane command, separate from data-plane routing.
     ///
-    /// Pause/Resume are acknowledged but do not mutate the timeline —
+    /// Pause/Resume are acknowledged but do not mutate the timeline -
     /// authoritative timestamps come from the backend via capture events.
     pub(crate) fn handle_control(&mut self, cmd: ControlCommand) -> Result<EventAction> {
         if let ControlCommand::Stop = cmd {
@@ -126,13 +125,11 @@ impl RecordingCoordinator {
     /// 2. Control stop
     /// 3. All registered sources ended
     pub(crate) fn evaluate_termination(&self) -> EventAction {
-        if self.fatal_error || self.invalid_config_error {
-            return EventAction::Stop;
-        }
-        if self.control_stop {
-            return EventAction::Stop;
-        }
-        if self.all_streams_ended() {
+        if self.fatal_error
+            || self.invalid_config_error
+            || self.control_stop
+            || self.all_streams_ended()
+        {
             return EventAction::Stop;
         }
         EventAction::Continue
@@ -142,6 +139,23 @@ impl RecordingCoordinator {
     pub(crate) fn observe_video_time(&mut self, ts_ms: u64) {
         if self.last_observed_ts_ms.is_none_or(|prev| ts_ms > prev) {
             self.last_observed_ts_ms = Some(ts_ms);
+        }
+    }
+
+    fn observe_video_at(&mut self, at: Instant) {
+        self.observe_video_time(self.timeline.active_elapsed_ms(at));
+    }
+
+    fn end_source(&mut self, source: SourceId) -> Result<()> {
+        self.mark_source_ended(source);
+        Ok(())
+    }
+
+    fn handle_source_error<E: Classify>(&mut self, source: SourceId, err: &E) {
+        match err.class() {
+            ErrorClass::Fatal => self.fatal_error = true,
+            ErrorClass::Transient => self.mark_source_ended(source),
+            ErrorClass::InvalidConfig => self.invalid_config_error = true,
         }
     }
 
@@ -258,8 +272,7 @@ impl RecordingCoordinator {
             }
 
             CaptureEvent::Paused { at } => {
-                let ts_ms = self.timeline.active_elapsed_ms(at);
-                self.observe_video_time(ts_ms);
+                self.observe_video_at(at);
                 self.timeline.mark_pause(at);
                 Ok(())
             }
@@ -269,17 +282,10 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            CaptureEvent::StreamEnded => {
-                self.mark_source_ended(VIDEO_SOURCE);
-                Ok(())
-            }
+            CaptureEvent::StreamEnded => self.end_source(VIDEO_SOURCE),
 
             CaptureEvent::Error(err) => {
-                match Classify::class(&err) {
-                    ErrorClass::Fatal => self.fatal_error = true,
-                    ErrorClass::Transient => self.mark_source_ended(VIDEO_SOURCE),
-                    ErrorClass::InvalidConfig => self.invalid_config_error = true,
-                }
+                self.handle_source_error(VIDEO_SOURCE, &err);
                 Ok(())
             }
 
@@ -322,21 +328,14 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            AudioEvent::StreamEnded => {
-                self.mark_source_ended(AUDIO_SOURCE);
-                Ok(())
-            }
+            AudioEvent::StreamEnded => self.end_source(AUDIO_SOURCE),
 
             AudioEvent::Error(err) => {
-                match Classify::class(&err) {
-                    ErrorClass::Fatal => self.fatal_error = true,
-                    ErrorClass::Transient => self.mark_source_ended(AUDIO_SOURCE),
-                    ErrorClass::InvalidConfig => self.invalid_config_error = true,
-                }
+                self.handle_source_error(AUDIO_SOURCE, &err);
                 Ok(())
             }
 
-            // Diagnostics-only events – no state mutation.
+            // Diagnostics-only events - no state mutation.
             AudioEvent::Paused { .. }
             | AudioEvent::Resumed { .. }
             | AudioEvent::SourceRestarted { .. }
@@ -351,19 +350,8 @@ impl RecordingCoordinator {
                 self.cursor.record_frame(ts_ms, &sample);
                 Ok(())
             }
-
             CursorEvent::Paused { .. } | CursorEvent::Resumed { .. } => Ok(()),
-
-            CursorEvent::StreamEnded => {
-                self.mark_source_ended(CURSOR_SOURCE);
-                Ok(())
-            }
-
-            CursorEvent::Error(_err) => {
-                // Cursor errors are always non-fatal — mark ended and continue.
-                self.mark_source_ended(CURSOR_SOURCE);
-                Ok(())
-            }
+            CursorEvent::StreamEnded | CursorEvent::Error(_) => self.end_source(CURSOR_SOURCE),
         }
     }
 }

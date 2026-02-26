@@ -126,6 +126,23 @@ impl RecordingSession {
             .map_err(|_| ScreenRecorderError::InvalidConfig("capture_origin lock poisoned".to_string()))
     }
 
+    fn transition_state(
+        &self,
+        from: RecordingState,
+        to: RecordingState,
+        command: ControlCommand,
+        invalid_state_message: &'static str,
+    ) -> Result<()> {
+        if self.state() != from {
+            return Err(ScreenRecorderError::InvalidConfig(
+                invalid_state_message.to_string(),
+            ));
+        }
+        self.send_control(command)?;
+        self.state.store(to.as_u8(), Ordering::Release);
+        Ok(())
+    }
+
     pub fn start(&mut self) -> Result<()> {
         if self.state() != RecordingState::Created {
             return Err(ScreenRecorderError::InvalidConfig(
@@ -197,27 +214,21 @@ impl RecordingSession {
     }
 
     pub fn pause(&self) -> Result<()> {
-        if self.state() != RecordingState::Running {
-            return Err(ScreenRecorderError::InvalidConfig(
-                "pause is only allowed while recording is Running".to_string(),
-            ));
-        }
-        self.send_control(ControlCommand::Pause)?;
-        self.state
-            .store(RecordingState::Paused.as_u8(), Ordering::Release);
-        Ok(())
+        self.transition_state(
+            RecordingState::Running,
+            RecordingState::Paused,
+            ControlCommand::Pause,
+            "pause is only allowed while recording is Running",
+        )
     }
 
     pub fn resume(&self) -> Result<()> {
-        if self.state() != RecordingState::Paused {
-            return Err(ScreenRecorderError::InvalidConfig(
-                "resume is only allowed while recording is Paused".to_string(),
-            ));
-        }
-        self.send_control(ControlCommand::Resume)?;
-        self.state
-            .store(RecordingState::Running.as_u8(), Ordering::Release);
-        Ok(())
+        self.transition_state(
+            RecordingState::Paused,
+            RecordingState::Running,
+            ControlCommand::Resume,
+            "resume is only allowed while recording is Paused",
+        )
     }
 
     pub fn stop(self) -> Result<RecordingArtifact> {
@@ -303,25 +314,24 @@ fn start_audio_stream_if_enabled(
     );
     let packet_duration = Duration::from_millis(20);
 
-    let mut stream_config = AudioStreamConfig::default();
-    stream_config.system = SourceConfig {
-        enabled: config.audio.system_audio_enabled,
-        required: config.audio.system_audio_enabled,
-        device: DeviceSelector::DefaultRender,
+    let source_config = |enabled: bool, device: DeviceSelector| SourceConfig {
+        enabled,
+        required: enabled,
+        device,
         output_format: format,
         packet_duration,
     };
-    stream_config.microphone = SourceConfig {
-        enabled: config.audio.microphone_enabled,
-        required: config.audio.microphone_enabled,
-        device: config
+
+    let mut stream_config = AudioStreamConfig::default();
+    stream_config.system = source_config(config.audio.system_audio_enabled, DeviceSelector::DefaultRender);
+    stream_config.microphone = source_config(
+        config.audio.microphone_enabled,
+        config
             .audio
             .microphone_device
             .clone()
             .unwrap_or(DeviceSelector::DefaultCapture),
-        output_format: format,
-        packet_duration,
-    };
+    );
 
     let session = AudioSession::new()?;
     let stream = session.start_streaming(stream_config)?;
@@ -352,34 +362,30 @@ fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
                 Ok((0, 0))
             }
         }
-        RecordingTarget::PrimaryMonitor | RecordingTarget::Monitor(_) => {
+        RecordingTarget::PrimaryMonitor => {
             let layout = snow_capture::MonitorLayout::snapshot()?;
-            let monitor_geo = match target {
-                RecordingTarget::PrimaryMonitor => layout
-                    .monitors
-                    .iter()
-                    .find(|m| m.monitor.is_primary())
-                    .ok_or_else(|| {
-                        ScreenRecorderError::Capture(
-                            snow_capture::error::CaptureError::InvalidTarget(
-                                "primary monitor not found".to_string(),
-                            ),
-                        )
-                    })?,
-                RecordingTarget::Monitor(selector) => layout
-                    .monitors
-                    .iter()
-                    .find(|m| m.monitor.stable_id() == selector.stable_id)
-                    .ok_or_else(|| {
-                        ScreenRecorderError::Capture(
-                            snow_capture::error::CaptureError::InvalidTarget(format!(
-                                "monitor with stable_id '{}' not found",
-                                selector.stable_id
-                            )),
-                        )
-                    })?,
-                _ => unreachable!(),
-            };
+            let monitor_geo = layout
+                .monitors
+                .iter()
+                .find(|m| m.monitor.is_primary())
+                .ok_or_else(|| {
+                    ScreenRecorderError::Capture(snow_capture::error::CaptureError::InvalidTarget(
+                        "primary monitor not found".to_string(),
+                    ))
+                })?;
+            Ok((monitor_geo.x, monitor_geo.y))
+        }
+        RecordingTarget::Monitor(selector) => {
+            let layout = snow_capture::MonitorLayout::snapshot()?;
+            let monitor_geo = layout
+                .monitors
+                .iter()
+                .find(|m| m.monitor.stable_id() == selector.stable_id)
+                .ok_or_else(|| {
+                    ScreenRecorderError::Capture(snow_capture::error::CaptureError::InvalidTarget(
+                        format!("monitor with stable_id '{}' not found", selector.stable_id),
+                    ))
+                })?;
             Ok((monitor_geo.x, monitor_geo.y))
         }
     }
@@ -436,15 +442,9 @@ impl PcmTrackWriter {
             return Ok(0);
         }
 
-        let channels = usize::from(self.channels);
-        if bytes.len() % (channels * 2) != 0 {
-            return Err(ScreenRecorderError::Encode(
-                "PCM bytes are not channel aligned".to_string(),
-            ));
-        }
+        let frames = self.i16_frame_count(bytes.len(), "PCM bytes are not channel aligned")?;
 
         self.writer.write_all(bytes)?;
-        let frames = (bytes.len() / 2 / channels) as u64;
         self.written_frames = self.written_frames.saturating_add(frames);
         Ok(frames)
     }
@@ -456,13 +456,8 @@ impl PcmTrackWriter {
         timeline: &PauseTimeline,
     ) -> Result<u64> {
         let channels = usize::from(self.channels);
-        if bytes.len() % (channels * 2) != 0 {
-            return Err(ScreenRecorderError::Encode(
-                "audio packet bytes are not channel aligned".to_string(),
-            ));
-        }
-
-        let packet_frames = (bytes.len() / 2 / channels) as u64;
+        let packet_frames =
+            self.i16_frame_count(bytes.len(), "audio packet bytes are not channel aligned")?;
         if packet_frames == 0 {
             return Ok(0);
         }
@@ -498,6 +493,14 @@ impl PcmTrackWriter {
         })?;
 
         self.append_i16_bytes(&bytes[skip_bytes..])
+    }
+
+    fn i16_frame_count(&self, bytes_len: usize, alignment_error: &'static str) -> Result<u64> {
+        let bytes_per_frame = usize::from(self.channels) * std::mem::size_of::<i16>();
+        if bytes_len % bytes_per_frame != 0 {
+            return Err(ScreenRecorderError::Encode(alignment_error.to_string()));
+        }
+        Ok((bytes_len / bytes_per_frame) as u64)
     }
 
     pub(crate) fn finish(mut self) -> Result<()> {
@@ -797,27 +800,14 @@ fn new_recording_worker(
     let sample_rate_hz = config.audio.sample_rate_hz.max(1);
     let channels = config.audio.channels.channels().max(1);
 
-    let system_writer = if config.audio.system_audio_enabled {
-        Some(PcmTrackWriter::create(
-            &layout.audio_system_path,
-            sample_rate_hz,
-            channels,
-            started_at,
-        )?)
-    } else {
-        None
+    let make_writer = |enabled: bool, path: &std::path::Path| -> Result<Option<PcmTrackWriter>> {
+        enabled
+            .then(|| PcmTrackWriter::create(path, sample_rate_hz, channels, started_at))
+            .transpose()
     };
 
-    let mic_writer = if config.audio.microphone_enabled {
-        Some(PcmTrackWriter::create(
-            &layout.audio_mic_path,
-            sample_rate_hz,
-            channels,
-            started_at,
-        )?)
-    } else {
-        None
-    };
+    let system_writer = make_writer(config.audio.system_audio_enabled, &layout.audio_system_path)?;
+    let mic_writer = make_writer(config.audio.microphone_enabled, &layout.audio_mic_path)?;
 
     let video = VideoProcessor::new(
         config.fps.max(1),
