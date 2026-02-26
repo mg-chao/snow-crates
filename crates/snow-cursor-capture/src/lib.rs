@@ -419,23 +419,20 @@ mod tests {
 
         #[test]
         fn prop_cursor_tick_format_matches_source(event in arb_cursor_sample_from_handle()) {
-            match &event {
-                CursorEvent::Sample { stream_timestamp, .. } => {
-                    prop_assert_eq!(
-                        stream_timestamp.tick_format,
-                        TickFormat::RawQpc,
-                        "Cursor samples from CursorStreamHandle must use TickFormat::RawQpc"
-                    );
-                    // The poll_loop always sets raw_os_ticks = None
-                    prop_assert!(
-                        stream_timestamp.raw_os_ticks.is_none(),
-                        "Cursor samples from CursorStreamHandle should have raw_os_ticks = None"
-                    );
-                }
-                _ => {
-                    prop_assert!(false, "Generator should only produce Sample variants");
-                }
-            }
+            let CursorEvent::Sample { stream_timestamp, .. } = &event else {
+                unreachable!("Generator should only produce Sample variants");
+            };
+
+            prop_assert_eq!(
+                stream_timestamp.tick_format,
+                TickFormat::RawQpc,
+                "Cursor samples from CursorStreamHandle must use TickFormat::RawQpc"
+            );
+            // The poll_loop always sets raw_os_ticks = None
+            prop_assert!(
+                stream_timestamp.raw_os_ticks.is_none(),
+                "Cursor samples from CursorStreamHandle should have raw_os_ticks = None"
+            );
         }
     }
 

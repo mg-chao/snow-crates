@@ -216,6 +216,21 @@ fn checked_rgba_len(width: u32, height: u32) -> Option<usize> {
         .checked_mul(4)
 }
 
+fn validated_mask_scan_region(
+    width: u32,
+    height: u32,
+    mask_width: u32,
+    mask_height: u32,
+    mask_rgba: &[u8],
+) -> Option<(u32, u32)> {
+    let (rows, cols) = mask_overlap(width, height, mask_width, mask_height)?;
+    let mask_len = checked_rgba_len(mask_width, rows)?;
+    if mask_rgba.len() < mask_len {
+        return None;
+    }
+    Some((rows, cols))
+}
+
 fn pixel_is_set(pixel: &[u8]) -> bool {
     pixel[0] > 127 || pixel[1] > 127 || pixel[2] > 127
 }
@@ -238,16 +253,11 @@ fn apply_mask_alpha(
     mask_height: u32,
     mask_rgba: &[u8],
 ) -> bool {
-    let Some((rows, cols)) = mask_overlap(width, height, mask_width, mask_height) else {
+    let Some((rows, cols)) =
+        validated_mask_scan_region(width, height, mask_width, mask_height, mask_rgba)
+    else {
         return false;
     };
-
-    let Some(mask_len) = checked_rgba_len(mask_width, rows) else {
-        return false;
-    };
-    if mask_rgba.len() < mask_len {
-        return false;
-    }
 
     let Some(rgba_len) = checked_rgba_len(width, rows) else {
         return false;
@@ -305,16 +315,11 @@ fn mask_has_set_bits(
     mask_height: u32,
     mask_rgba: &[u8],
 ) -> bool {
-    let Some((rows, cols)) = mask_overlap(width, height, mask_width, mask_height) else {
+    let Some((rows, cols)) =
+        validated_mask_scan_region(width, height, mask_width, mask_height, mask_rgba)
+    else {
         return false;
     };
-
-    let Some(mask_len) = checked_rgba_len(mask_width, rows) else {
-        return false;
-    };
-    if mask_rgba.len() < mask_len {
-        return false;
-    }
 
     for y in 0..rows {
         for x in 0..cols {

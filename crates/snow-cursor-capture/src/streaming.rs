@@ -189,30 +189,32 @@ fn poll_loop(
                 pause_started = Some(now);
                 let _ = tx.send(CursorEvent::Paused { at: now });
             }
-        } else {
-            if let Some(start) = pause_started.take() {
-                let now = Instant::now();
-                let gap = now.duration_since(start);
-                let _ = tx.send(CursorEvent::Resumed { at: now, gap });
-            }
+            std::thread::sleep(config.poll_interval);
+            continue;
+        }
 
-            match sampler.sample() {
-                Ok(sample) => {
-                    let stream_timestamp = StreamTimestamp {
-                        instant: Instant::now(),
-                        raw_os_ticks: None,
-                        tick_format: TickFormat::RawQpc,
-                    };
-                    // Best-effort send: if the channel is full, drop the sample
-                    // to avoid blocking the poll loop.
-                    let _ = tx.try_send(CursorEvent::Sample {
-                        sample,
-                        stream_timestamp,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(CursorEvent::Error(e));
-                }
+        if let Some(start) = pause_started.take() {
+            let now = Instant::now();
+            let gap = now.duration_since(start);
+            let _ = tx.send(CursorEvent::Resumed { at: now, gap });
+        }
+
+        match sampler.sample() {
+            Ok(sample) => {
+                let stream_timestamp = StreamTimestamp {
+                    instant: Instant::now(),
+                    raw_os_ticks: None,
+                    tick_format: TickFormat::RawQpc,
+                };
+                // Best-effort send: if the channel is full, drop the sample
+                // to avoid blocking the poll loop.
+                let _ = tx.try_send(CursorEvent::Sample {
+                    sample,
+                    stream_timestamp,
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(CursorEvent::Error(e));
             }
         }
 
