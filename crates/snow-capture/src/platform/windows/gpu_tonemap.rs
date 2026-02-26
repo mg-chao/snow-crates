@@ -294,10 +294,8 @@ impl GpuComputePass {
         source: &ID3D11Texture2D,
     ) -> CaptureResult<ID3D11ShaderResourceView> {
         let source_ptr = source.as_raw() as usize;
-        if source_ptr == self.cached_srv_source {
-            if let Some(ref srv) = self.cached_srv {
-                return Ok(srv.clone());
-            }
+        if source_ptr == self.cached_srv_source && let Some(ref srv) = self.cached_srv {
+            return Ok(srv.clone());
         }
 
         let mut srv: Option<ID3D11ShaderResourceView> = None;
@@ -358,11 +356,11 @@ impl GpuComputePass {
             context.CSSetUnorderedAccessViews(0, 1, Some(&Some(uav.clone()) as *const _), None);
 
             if use_1d {
-                let groups_x = (width + 255) / 256;
+                let groups_x = width.div_ceil(256);
                 context.Dispatch(groups_x, height, 1);
             } else {
-                let groups_x = (width + 15) / 16;
-                let groups_y = (height + 15) / 16;
+                let groups_x = width.div_ceil(16);
+                let groups_y = height.div_ceil(16);
                 context.Dispatch(groups_x, groups_y, 1);
             }
 
@@ -414,7 +412,7 @@ impl GpuTonemapper {
 
         let needs_cbuf_update = self
             .cached_cbuf_state
-            .map_or(true, |(p, w, h)| p != params || w != width || h != height);
+            .is_none_or(|(p, w, h)| p != params || w != width || h != height);
         if needs_cbuf_update {
             let gpu_params = GpuParams {
                 hdr_paper_white_nits: params.hdr_paper_white_nits,

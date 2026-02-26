@@ -8,18 +8,13 @@ use crate::monitor::MonitorId;
 use crate::window::WindowId;
 
 /// Capture intent used to tune backend behavior for latency/throughput.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CaptureMode {
     /// Favor low-overhead single-shot behavior for snapshots.
+    #[default]
     Screenshot,
     /// Favor sustained throughput for continuous recording pipelines.
     ScreenRecording,
-}
-
-impl Default for CaptureMode {
-    fn default() -> Self {
-        Self::Screenshot
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

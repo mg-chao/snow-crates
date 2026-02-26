@@ -43,7 +43,7 @@ pub struct DirtyRect {
 pub type CursorData = CursorFrameSample;
 
 /// Metadata attached to each captured frame for recording pipelines.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FrameMetadata {
     /// Wall-clock time spent inside the capture call (GPU readback,
     /// staging copy, pixel conversion). Lets recorders detect when the
@@ -70,21 +70,6 @@ pub struct FrameMetadata {
     pub color_space: ColorSpace,
     /// Unified timestamp. `tick_format` is `RawQpc`.
     pub stream_timestamp: Option<StreamTimestamp>,
-}
-
-impl Default for FrameMetadata {
-    fn default() -> Self {
-        Self {
-            capture_duration: None,
-            is_duplicate: false,
-            dirty_rects: Vec::new(),
-            #[cfg(feature = "cursor")]
-            cursor: None,
-            sequence: 0,
-            color_space: ColorSpace::default(),
-            stream_timestamp: None,
-        }
-    }
 }
 
 impl FrameMetadata {
@@ -313,12 +298,10 @@ impl FrameBuffer {
         }
 
         #[cfg(target_os = "windows")]
-        if len >= LARGE_PAGE_MIN_BYTES {
-            if let Some(mut lp) = try_alloc_large_pages(len) {
-                lp.len = len;
-                *self = FrameBuffer::LargePage(lp);
-                return;
-            }
+        if len >= LARGE_PAGE_MIN_BYTES && let Some(mut lp) = try_alloc_large_pages(len) {
+            lp.len = len;
+            *self = FrameBuffer::LargePage(lp);
+            return;
         }
 
         let headroom = len / 8;

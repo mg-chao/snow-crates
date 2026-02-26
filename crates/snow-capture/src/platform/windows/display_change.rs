@@ -21,20 +21,11 @@ use super::monitor::ResolvedMonitor;
 const WM_QUIT_LISTENER: u32 = WM_USER + 1;
 
 /// Shared state that the listener thread writes to and readers consume.
+#[derive(Default)]
 struct DisplayCacheState {
     monitors: Vec<MonitorId>,
     resolved: Vec<ResolvedMonitor>,
     refreshed_at: Option<Instant>,
-}
-
-impl Default for DisplayCacheState {
-    fn default() -> Self {
-        Self {
-            monitors: Vec::new(),
-            resolved: Vec::new(),
-            refreshed_at: None,
-        }
-    }
 }
 
 /// A display information cache that refreshes when Windows sends

@@ -272,9 +272,7 @@ impl StreamHandle {
 
     /// Check whether the stream thread is still running.
     pub fn is_running(&self) -> bool {
-        self.join_handle
-            .as_ref()
-            .map_or(false, |h| !h.is_finished())
+        self.join_handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// Get a reference to the live stream statistics.
