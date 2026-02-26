@@ -117,22 +117,34 @@ impl AudioStreamHandle {
         })
     }
 
-    pub fn recv(&self) -> Result<AudioEvent, RecvError> {
-        let (event, len) = self.queue.recv()?;
+    fn update_buffer_fill(&self, len: usize) {
         self.stats.buffer_fill.store(len as u64, Ordering::Release);
-        Ok(event)
+    }
+
+    fn map_recv_outcome<E>(&self, outcome: Result<(AudioEvent, usize), E>) -> Result<AudioEvent, E> {
+        outcome.map(|(event, len)| {
+            self.update_buffer_fill(len);
+            event
+        })
+    }
+
+    fn stop_and_join_worker(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+
+    pub fn recv(&self) -> Result<AudioEvent, RecvError> {
+        self.map_recv_outcome(self.queue.recv())
     }
 
     pub fn try_recv(&self) -> Result<AudioEvent, TryRecvError> {
-        let (event, len) = self.queue.try_recv()?;
-        self.stats.buffer_fill.store(len as u64, Ordering::Release);
-        Ok(event)
+        self.map_recv_outcome(self.queue.try_recv())
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<AudioEvent, RecvTimeoutError> {
-        let (event, len) = self.queue.recv_timeout(timeout)?;
-        self.stats.buffer_fill.store(len as u64, Ordering::Release);
-        Ok(event)
+        self.map_recv_outcome(self.queue.recv_timeout(timeout))
     }
 
     pub fn stop(&self) {
@@ -168,10 +180,7 @@ impl AudioStreamHandle {
     }
 
     pub fn stop_and_drain(mut self) -> Vec<AudioEvent> {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+        self.stop_and_join_worker();
         let drained = self.queue.drain();
         self.queue.close();
         drained
@@ -180,10 +189,7 @@ impl AudioStreamHandle {
 
 impl Drop for AudioStreamHandle {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(join_handle) = self.join_handle.take() {
-            let _ = join_handle.join();
-        }
+        self.stop_and_join_worker();
         self.queue.close();
     }
 }
@@ -311,25 +317,21 @@ fn stream_loop(
                 consecutive_errors += 1;
                 stats.errors_recovered.fetch_add(1, Ordering::Relaxed);
                 if consecutive_errors >= config.max_consecutive_errors {
-                    push_event_with_drop_notice(
-                        queue,
-                        stats,
-                        AudioEvent::Error(err.clone()),
-                        &mut bp,
-                    );
+                    emit_terminal_error(queue, stats, &mut bp, &err);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(16));
                 continue;
             }
             Err(err) => {
-                push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.clone()), &mut bp);
+                emit_terminal_error(queue, stats, &mut bp, &err);
                 break;
             }
         }
 
-        if packet_epoch.elapsed() >= Duration::from_secs(1) {
-            let elapsed = packet_epoch.elapsed().as_secs_f64().max(0.000_001);
+        let elapsed = packet_epoch.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let elapsed = elapsed.as_secs_f64().max(0.000_001);
             let rate = packet_counter as f64 / elapsed;
             stats
                 .current_packet_rate
@@ -402,24 +404,37 @@ fn push_event_with_drop_notice(
         let _ = queue.push(pressure_event);
     }
 
-    if let Some(dropped) = outcome.dropped
-        && let Some((source, dropped_frames)) = dropped_packet_info(&dropped)
-    {
-        record_dropped_packet(stats, dropped_frames);
-        let notice_outcome = queue.push(AudioEvent::PacketDropped {
-            source,
-            dropped_frames,
-        });
-        stats
-            .buffer_fill
-            .store(notice_outcome.len as u64, Ordering::Release);
-        if let Some(dropped_notice_target) = notice_outcome.dropped
-            && let Some((_, secondary_dropped_frames)) =
-                dropped_packet_info(&dropped_notice_target)
-        {
-            record_dropped_packet(stats, secondary_dropped_frames);
-        }
+    let Some(dropped) = outcome.dropped else {
+        return;
+    };
+    let Some((source, dropped_frames)) = dropped_packet_info(&dropped) else {
+        return;
+    };
+
+    record_dropped_packet(stats, dropped_frames);
+    let notice_outcome = queue.push(AudioEvent::PacketDropped {
+        source,
+        dropped_frames,
+    });
+    stats
+        .buffer_fill
+        .store(notice_outcome.len as u64, Ordering::Release);
+
+    let Some(dropped_notice_target) = notice_outcome.dropped else {
+        return;
+    };
+    if let Some((_, secondary_dropped_frames)) = dropped_packet_info(&dropped_notice_target) {
+        record_dropped_packet(stats, secondary_dropped_frames);
     }
+}
+
+fn emit_terminal_error(
+    queue: &EventQueue,
+    stats: &AudioStreamStats,
+    bp: &mut BackpressureState,
+    err: &AudioError,
+) {
+    push_event_with_drop_notice(queue, stats, AudioEvent::Error(err.clone()), bp);
 }
 
 fn dropped_packet_info(event: &AudioEvent) -> Option<(crate::packet::AudioSourceKind, u64)> {

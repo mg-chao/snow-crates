@@ -23,6 +23,9 @@ use self::com::{CoInitGuard, EventHandle};
 use self::notification::NotificationClientGuard;
 use self::wasapi_source::WasapiSource;
 
+const SOURCE_KINDS: [AudioSourceKind; 2] =
+    [AudioSourceKind::System, AudioSourceKind::Microphone];
+
 /// Per-source deferred retry state. Instead of blocking the worker thread with
 /// `thread::sleep`, we record when the next attempt is allowed and let `poll()`
 /// keep servicing the healthy source in the meantime.
@@ -140,6 +143,55 @@ impl WasapiEngine {
             AudioSourceKind::System => &self.config.system,
             AudioSourceKind::Microphone => &self.config.microphone,
         }
+    }
+
+    fn has_pending_retry(&self) -> bool {
+        SOURCE_KINDS
+            .iter()
+            .copied()
+            .any(|kind| self.retry_ref(kind).is_some())
+    }
+
+    fn nearest_retry_delay(&self) -> Option<Duration> {
+        let now = Instant::now();
+        SOURCE_KINDS
+            .iter()
+            .copied()
+            .filter_map(|kind| self.retry_ref(kind).as_ref())
+            .map(|retry| retry.next_attempt_at.saturating_duration_since(now))
+            .min()
+    }
+
+    fn source_should_rebind_on_default_change(
+        &self,
+        kind: AudioSourceKind,
+        changed: bool,
+    ) -> bool {
+        if !changed {
+            return false;
+        }
+        let config = self.source_config(kind);
+        if !config.enabled {
+            return false;
+        }
+        matches!(
+            (kind, &config.device),
+            (
+                AudioSourceKind::System,
+                crate::device::DeviceSelector::DefaultRender
+            ) | (
+                AudioSourceKind::Microphone,
+                crate::device::DeviceSelector::DefaultCapture
+            )
+        )
+    }
+
+    fn source_needs_optional_rebind(&self, com: &ComState, kind: AudioSourceKind) -> bool {
+        let config = self.source_config(kind);
+        com.source_ref(kind).is_none()
+            && config.enabled
+            && !config.required
+            && self.retry_ref(kind).is_none()
     }
 }
 
@@ -270,42 +322,25 @@ impl WasapiEngine {
         let capture_changed = state.take_capture_default_changed();
         let topology_changed = state.take_topology_changed();
 
-        if render_changed
-            && self.config.system.enabled
-            && matches!(
-                self.config.system.device,
-                crate::device::DeviceSelector::DefaultRender
-            )
-        {
-            self.begin_retry(AudioSourceKind::System, None);
-        }
-
-        if capture_changed
-            && self.config.microphone.enabled
-            && matches!(
-                self.config.microphone.device,
-                crate::device::DeviceSelector::DefaultCapture
-            )
-        {
-            self.begin_retry(AudioSourceKind::Microphone, None);
+        for kind in SOURCE_KINDS {
+            let changed = match kind {
+                AudioSourceKind::System => render_changed,
+                AudioSourceKind::Microphone => capture_changed,
+            };
+            if self.source_should_rebind_on_default_change(kind, changed) {
+                self.begin_retry(kind, None);
+            }
         }
 
         if topology_changed {
             let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
-            let needs_system = com.system_source.is_none()
-                && self.config.system.enabled
-                && !self.config.system.required
-                && self.system_retry.is_none();
-            let needs_mic = com.microphone_source.is_none()
-                && self.config.microphone.enabled
-                && !self.config.microphone.required
-                && self.microphone_retry.is_none();
-
-            if needs_system {
-                self.begin_retry(AudioSourceKind::System, None);
-            }
-            if needs_mic {
-                self.begin_retry(AudioSourceKind::Microphone, None);
+            let kinds_to_retry: Vec<_> = SOURCE_KINDS
+                .iter()
+                .copied()
+                .filter(|&kind| self.source_needs_optional_rebind(com, kind))
+                .collect();
+            for kind in kinds_to_retry {
+                self.begin_retry(kind, None);
             }
         }
 
@@ -330,8 +365,9 @@ impl WasapiEngine {
     /// retry and whose backoff deadline has elapsed. Returns immediately if the
     /// deadline hasn't passed yet, allowing the other source to keep flowing.
     fn tick_retries(&mut self, out: &mut Vec<AudioEvent>) -> AudioResult<()> {
-        self.tick_source_retry(AudioSourceKind::System, out)?;
-        self.tick_source_retry(AudioSourceKind::Microphone, out)?;
+        for kind in SOURCE_KINDS {
+            self.tick_source_retry(kind, out)?;
+        }
         Ok(())
     }
 
@@ -455,25 +491,19 @@ impl AudioRecorderEngine for WasapiEngine {
 
         let com = self.com.as_ref().ok_or(AudioError::WorkerDead)?;
         let mut handles = vec![com.control_event.raw()];
-        if let Some(source) = &com.system_source {
-            handles.push(source.event_handle());
-        }
-        if let Some(source) = &com.microphone_source {
-            handles.push(source.event_handle());
+        for kind in SOURCE_KINDS {
+            if let Some(source) = com.source_ref(kind) {
+                handles.push(source.event_handle());
+            }
         }
 
         // If any source has a pending retry, use a short timeout so we come
         // back quickly to tick the retry without starving the healthy source.
-        let has_pending_retry = self.system_retry.is_some() || self.microphone_retry.is_some();
+        let has_pending_retry = self.has_pending_retry();
         let effective_timeout = if has_pending_retry {
             // Use the minimum of the requested timeout and the nearest retry
             // deadline so we wake up in time for the next attempt.
-            let nearest = [&self.system_retry, &self.microphone_retry]
-                .iter()
-                .filter_map(|r| r.as_ref())
-                .map(|r| r.next_attempt_at.saturating_duration_since(Instant::now()))
-                .min()
-                .unwrap_or(Duration::ZERO);
+            let nearest = self.nearest_retry_delay().unwrap_or(Duration::ZERO);
             timeout.min(nearest.max(Duration::from_millis(1)))
         } else {
             timeout
@@ -503,8 +533,9 @@ impl AudioRecorderEngine for WasapiEngine {
 
         }
 
-        self.drain_source(AudioSourceKind::System, &mut events)?;
-        self.drain_source(AudioSourceKind::Microphone, &mut events)?;
+        for kind in SOURCE_KINDS {
+            self.drain_source(kind, &mut events)?;
+        }
 
         // Tick any pending retries (the drain methods may have started new ones,
         // or existing ones may have reached their backoff deadline).
