@@ -161,7 +161,6 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-
     fn arb_composition_mode() -> impl Strategy<Value = snow_cursor_capture::CursorCompositionMode> {
         prop_oneof![
             Just(snow_cursor_capture::CursorCompositionMode::AlphaBlend),
@@ -179,15 +178,17 @@ mod tests {
             arb_composition_mode(),
             proptest::collection::vec(any::<u8>(), 0..256),
         )
-            .prop_map(|(sid, hx, hy, w, h, mode, rgba)| snow_cursor_capture::CursorShape {
-                shape_id: sid,
-                hotspot_x: hx,
-                hotspot_y: hy,
-                width: w,
-                height: h,
-                composition_mode: mode,
-                shape_rgba: rgba,
-            })
+            .prop_map(
+                |(sid, hx, hy, w, h, mode, rgba)| snow_cursor_capture::CursorShape {
+                    shape_id: sid,
+                    hotspot_x: hx,
+                    hotspot_y: hy,
+                    width: w,
+                    height: h,
+                    composition_mode: mode,
+                    shape_rgba: rgba,
+                },
+            )
     }
 
     fn arb_cursor_frame_sample() -> impl Strategy<Value = snow_cursor_capture::CursorFrameSample> {
@@ -197,15 +198,16 @@ mod tests {
             any::<bool>(),
             proptest::option::of(any::<u64>()),
         )
-            .prop_map(|(px, py, vis, sid)| snow_cursor_capture::CursorFrameSample {
-                position_x: px,
-                position_y: py,
-                visible: vis,
-                shape_id: sid,
-                shape: None,
-            })
+            .prop_map(
+                |(px, py, vis, sid)| snow_cursor_capture::CursorFrameSample {
+                    position_x: px,
+                    position_y: py,
+                    visible: vis,
+                    shape_id: sid,
+                    shape: None,
+                },
+            )
     }
-
 
     proptest! {
         /// From conversion on CursorCompositionMode preserves semantic

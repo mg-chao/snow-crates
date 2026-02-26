@@ -26,12 +26,7 @@ pub(crate) fn run_mux_event_loop(
     loop {
         // Poll control commands (non-blocking) and forward to multiplexer.
         while let Ok(cmd) = control_rx.try_recv() {
-            let mux_cmd = match &cmd {
-                ControlCommand::Pause => MuxCommand::Pause,
-                ControlCommand::Resume => MuxCommand::Resume,
-                ControlCommand::Stop => MuxCommand::Stop,
-            };
-            let _ = multiplexer.send_command(mux_cmd);
+            let _ = multiplexer.send_command(mux_command_from_control(&cmd));
 
             if coordinator.handle_control(cmd)?.is_stop() {
                 return Ok(coordinator);
@@ -40,17 +35,10 @@ pub(crate) fn run_mux_event_loop(
 
         // Poll multiplexer status (non-blocking) for source lifecycle.
         while let Ok(status) = multiplexer.try_recv_status() {
-            match status {
-                MuxStatus::SourceEnded(sid)
-                | MuxStatus::SourceDisconnected(sid)
-                | MuxStatus::SourceForwarderPanicked(sid) => {
-                    coordinator.mark_source_ended(sid);
-                }
-                MuxStatus::Completed => {
-                    // All sources done — drain remaining output and exit.
-                    drain_mux_output(&mut coordinator, multiplexer)?;
-                    return Ok(coordinator);
-                }
+            if handle_mux_status(&mut coordinator, status) {
+                // All sources done - drain remaining output and exit.
+                drain_mux_output(&mut coordinator, multiplexer)?;
+                return Ok(coordinator);
             }
         }
 
@@ -66,10 +54,10 @@ pub(crate) fn run_mux_event_loop(
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // No events available — loop back to check control/status.
+                // No events available - loop back to check control/status.
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                // Output channel closed — multiplexer shut down.
+                // Output channel closed - multiplexer shut down.
                 return Ok(coordinator);
             }
         }
@@ -77,6 +65,29 @@ pub(crate) fn run_mux_event_loop(
         if coordinator.evaluate_termination().is_stop() {
             return Ok(coordinator);
         }
+    }
+}
+
+fn mux_command_from_control(cmd: &ControlCommand) -> MuxCommand {
+    match cmd {
+        ControlCommand::Pause => MuxCommand::Pause,
+        ControlCommand::Resume => MuxCommand::Resume,
+        ControlCommand::Stop => MuxCommand::Stop,
+    }
+}
+
+/// Apply one multiplexer status update.
+///
+/// Returns `true` when the multiplexer reported completion.
+fn handle_mux_status(coordinator: &mut RecordingCoordinator, status: MuxStatus) -> bool {
+    match status {
+        MuxStatus::SourceEnded(sid)
+        | MuxStatus::SourceDisconnected(sid)
+        | MuxStatus::SourceForwarderPanicked(sid) => {
+            coordinator.mark_source_ended(sid);
+            false
+        }
+        MuxStatus::Completed => true,
     }
 }
 
@@ -111,13 +122,8 @@ fn drain_mux_status(
     multiplexer: &StreamMultiplexer<RecordingEvent>,
 ) {
     while let Ok(status) = multiplexer.try_recv_status() {
-        match status {
-            MuxStatus::SourceEnded(sid)
-            | MuxStatus::SourceDisconnected(sid)
-            | MuxStatus::SourceForwarderPanicked(sid) => {
-                coordinator.mark_source_ended(sid);
-            }
-            MuxStatus::Completed => break,
+        if handle_mux_status(coordinator, status) {
+            break;
         }
     }
 }

@@ -222,7 +222,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn record_frame_appends_exactly_one_frame() {
         let mut proc = CursorProcessor::new(0, 0);

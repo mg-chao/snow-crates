@@ -1,28 +1,28 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_next as ffmpeg;
 use snow_audio_recorder::{
-    AudioFormat, AudioPacket, AudioSampleFormat, AudioSession,
-    AudioStreamConfig, AudioTimestampAnchorExt, DeviceSelector, SourceConfig,
-    align_packet_frames, audio_anchor_from_origin_instant,
+    AudioFormat, AudioPacket, AudioSampleFormat, AudioSession, AudioStreamConfig,
+    AudioTimestampAnchorExt, DeviceSelector, SourceConfig, align_packet_frames,
+    audio_anchor_from_origin_instant,
 };
 use snow_capture::{CaptureMode, CaptureSession, StreamConfig};
 use uuid::Uuid;
 
-use crate::artifact::{RecordingArtifact, SessionManifest};
-use crate::ffmpeg_util::{copy_rgba_into_frame, ensure_ffmpeg_initialized, is_eagain};
-use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat, VideoEncodeConfig};
-use crate::error::{Result, ScreenRecorderError};
 use crate::adapter::video::resolve_capture_target;
+use crate::artifact::{RecordingArtifact, SessionManifest};
+use crate::config::{RecordingConfig, RecordingTarget, RecordingVideoFormat, VideoEncodeConfig};
 use crate::coordinator::RecordingCoordinator;
+use crate::error::{Result, ScreenRecorderError};
 use crate::event::ControlCommand;
 use crate::event_loop;
+use crate::ffmpeg_util::{copy_rgba_into_frame, ensure_ffmpeg_initialized, is_eagain};
 use crate::mouse::write_mouse_records;
 use crate::processor::{AudioProcessor, CursorProcessor, VideoProcessor};
 use crate::temp::TempLayout;
@@ -121,9 +121,9 @@ impl RecordingSession {
 
     /// Lock the capture_origin mutex, mapping poison errors to `InvalidConfig`.
     fn lock_capture_origin(&self) -> Result<std::sync::MutexGuard<'_, (i32, i32)>> {
-        self.capture_origin
-            .lock()
-            .map_err(|_| ScreenRecorderError::InvalidConfig("capture_origin lock poisoned".to_string()))
+        self.capture_origin.lock().map_err(|_| {
+            ScreenRecorderError::InvalidConfig("capture_origin lock poisoned".to_string())
+        })
     }
 
     fn transition_state(
@@ -323,7 +323,10 @@ fn start_audio_stream_if_enabled(
     };
 
     let mut stream_config = AudioStreamConfig::default();
-    stream_config.system = source_config(config.audio.system_audio_enabled, DeviceSelector::DefaultRender);
+    stream_config.system = source_config(
+        config.audio.system_audio_enabled,
+        DeviceSelector::DefaultRender,
+    );
     stream_config.microphone = source_config(
         config.audio.microphone_enabled,
         config
@@ -362,33 +365,40 @@ fn resolve_capture_origin(target: &RecordingTarget) -> Result<(i32, i32)> {
                 Ok((0, 0))
             }
         }
-        RecordingTarget::PrimaryMonitor => {
-            let layout = snow_capture::MonitorLayout::snapshot()?;
-            let monitor_geo = layout
-                .monitors
-                .iter()
-                .find(|m| m.monitor.is_primary())
-                .ok_or_else(|| {
-                    ScreenRecorderError::Capture(snow_capture::error::CaptureError::InvalidTarget(
-                        "primary monitor not found".to_string(),
-                    ))
-                })?;
-            Ok((monitor_geo.x, monitor_geo.y))
-        }
-        RecordingTarget::Monitor(selector) => {
-            let layout = snow_capture::MonitorLayout::snapshot()?;
-            let monitor_geo = layout
-                .monitors
-                .iter()
-                .find(|m| m.monitor.stable_id() == selector.stable_id)
-                .ok_or_else(|| {
-                    ScreenRecorderError::Capture(snow_capture::error::CaptureError::InvalidTarget(
-                        format!("monitor with stable_id '{}' not found", selector.stable_id),
-                    ))
-                })?;
-            Ok((monitor_geo.x, monitor_geo.y))
-        }
+        RecordingTarget::PrimaryMonitor => resolve_monitor_origin(
+            |layout| {
+                layout
+                    .monitors
+                    .iter()
+                    .find(|m| m.monitor.is_primary())
+                    .map(|m| (m.x, m.y))
+            },
+            || "primary monitor not found".to_string(),
+        ),
+        RecordingTarget::Monitor(selector) => resolve_monitor_origin(
+            |layout| {
+                layout
+                    .monitors
+                    .iter()
+                    .find(|m| m.monitor.stable_id() == selector.stable_id)
+                    .map(|m| (m.x, m.y))
+            },
+            || format!("monitor with stable_id '{}' not found", selector.stable_id),
+        ),
     }
+}
+
+fn resolve_monitor_origin<F, E>(find_origin: F, not_found_message: E) -> Result<(i32, i32)>
+where
+    F: FnOnce(&snow_capture::MonitorLayout) -> Option<(i32, i32)>,
+    E: FnOnce() -> String,
+{
+    let layout = snow_capture::MonitorLayout::snapshot()?;
+    find_origin(&layout).ok_or_else(|| {
+        ScreenRecorderError::Capture(snow_capture::error::CaptureError::InvalidTarget(
+            not_found_message(),
+        ))
+    })
 }
 
 pub(crate) struct PcmTrackWriter {
@@ -681,7 +691,11 @@ impl LiveVideoEncoder {
         self.encode_frame_at_pts(rgba, pts)
     }
 
-    pub(crate) fn finalize(mut self, final_timestamp_ms: u64, tail_rgba: Option<&[u8]>) -> Result<()> {
+    pub(crate) fn finalize(
+        mut self,
+        final_timestamp_ms: u64,
+        tail_rgba: Option<&[u8]>,
+    ) -> Result<()> {
         if let (Some(last_pts), Some(rgba)) = (self.last_pts, tail_rgba) {
             let final_pts = self.timestamp_to_pts(final_timestamp_ms);
             if final_pts > last_pts {
@@ -764,8 +778,6 @@ impl LiveVideoEncoder {
     }
 }
 
-
-
 fn choose_video_pixel_format(codec: ffmpeg::codec::Video) -> ffmpeg::format::Pixel {
     let preferred = [
         ffmpeg::format::Pixel::YUV420P,
@@ -819,9 +831,8 @@ fn new_recording_worker(
     let cursor = CursorProcessor::new(capture_origin_x, capture_origin_y);
     let timeline = PauseTimeline::new(started_at);
 
-    let mut coordinator = RecordingCoordinator::new(
-        timeline, video, audio, cursor, frame_interval_ms,
-    );
+    let mut coordinator =
+        RecordingCoordinator::new(timeline, video, audio, cursor, frame_interval_ms);
 
     // --- Build multiplexer ---
     // Resolve standalone cursor handle (only when cursor feature is disabled).
@@ -859,22 +870,24 @@ fn new_recording_worker(
     Ok(outcome)
 }
 
-pub(crate) fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPacket) -> Result<Vec<u8>> {
+pub(crate) fn audio_packet_to_i16_le_bytes(
+    packet: &snow_audio_recorder::AudioPacket,
+) -> Result<Vec<u8>> {
     match packet.format.sample_format {
         AudioSampleFormat::I16 => {
-            if packet.data.len() % 2 != 0 {
-                return Err(ScreenRecorderError::Decode(
-                    "audio packet i16 payload is not 2-byte aligned".to_string(),
-                ));
-            }
+            ensure_audio_payload_alignment(
+                packet.data.len(),
+                2,
+                "audio packet i16 payload is not 2-byte aligned",
+            )?;
             Ok(packet.data.clone())
         }
         AudioSampleFormat::F32 => {
-            if packet.data.len() % 4 != 0 {
-                return Err(ScreenRecorderError::Decode(
-                    "audio packet f32 payload is not 4-byte aligned".to_string(),
-                ));
-            }
+            ensure_audio_payload_alignment(
+                packet.data.len(),
+                4,
+                "audio packet f32 payload is not 4-byte aligned",
+            )?;
 
             let mut out = Vec::with_capacity(packet.data.len() / 2);
             for chunk in packet.data.chunks_exact(4) {
@@ -885,6 +898,17 @@ pub(crate) fn audio_packet_to_i16_le_bytes(packet: &snow_audio_recorder::AudioPa
             Ok(out)
         }
     }
+}
+
+fn ensure_audio_payload_alignment(
+    bytes_len: usize,
+    alignment: usize,
+    error_message: &'static str,
+) -> Result<()> {
+    if bytes_len % alignment != 0 {
+        return Err(ScreenRecorderError::Decode(error_message.to_string()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -46,7 +46,6 @@ pub(crate) struct RecordingCoordinator {
     ended_sources: HashSet<SourceId>,
 }
 
-
 impl RecordingCoordinator {
     /// Create a new `RecordingCoordinator`.
     ///
@@ -146,9 +145,8 @@ impl RecordingCoordinator {
         self.observe_video_time(self.timeline.active_elapsed_ms(at));
     }
 
-    fn end_source(&mut self, source: SourceId) -> Result<()> {
+    fn end_source(&mut self, source: SourceId) {
         self.mark_source_ended(source);
-        Ok(())
     }
 
     fn handle_source_error<E: Classify>(&mut self, source: SourceId, err: &E) {
@@ -282,7 +280,10 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            CaptureEvent::StreamEnded => self.end_source(VIDEO_SOURCE),
+            CaptureEvent::StreamEnded => {
+                self.end_source(VIDEO_SOURCE);
+                Ok(())
+            }
 
             CaptureEvent::Error(err) => {
                 self.handle_source_error(VIDEO_SOURCE, &err);
@@ -302,9 +303,7 @@ impl RecordingCoordinator {
                 new_width,
                 new_height,
                 ..
-            } => {
-                self.video.handle_resolution_change(new_width, new_height)
-            }
+            } => self.video.handle_resolution_change(new_width, new_height),
         }
     }
 
@@ -328,7 +327,10 @@ impl RecordingCoordinator {
                 Ok(())
             }
 
-            AudioEvent::StreamEnded => self.end_source(AUDIO_SOURCE),
+            AudioEvent::StreamEnded => {
+                self.end_source(AUDIO_SOURCE);
+                Ok(())
+            }
 
             AudioEvent::Error(err) => {
                 self.handle_source_error(AUDIO_SOURCE, &err);
@@ -345,13 +347,19 @@ impl RecordingCoordinator {
 
     fn handle_cursor(&mut self, event: CursorEvent) -> Result<()> {
         match event {
-            CursorEvent::Sample { sample, stream_timestamp } => {
+            CursorEvent::Sample {
+                sample,
+                stream_timestamp,
+            } => {
                 let ts_ms = self.timeline.active_elapsed_ms(stream_timestamp.instant);
                 self.cursor.record_frame(ts_ms, &sample);
                 Ok(())
             }
             CursorEvent::Paused { .. } | CursorEvent::Resumed { .. } => Ok(()),
-            CursorEvent::StreamEnded | CursorEvent::Error(_) => self.end_source(CURSOR_SOURCE),
+            CursorEvent::StreamEnded | CursorEvent::Error(_) => {
+                self.end_source(CURSOR_SOURCE);
+                Ok(())
+            }
         }
     }
 }
@@ -495,9 +503,7 @@ mod tests {
     #[test]
     fn audio_stream_ended_sets_audio_ended() {
         let mut coord = test_coordinator();
-        let action = coord
-            .handle_event(audio(AudioEvent::StreamEnded))
-            .unwrap();
+        let action = coord.handle_event(audio(AudioEvent::StreamEnded)).unwrap();
         assert!(coord.audio_ended());
         assert!(matches!(action, EventAction::Continue));
     }
@@ -519,9 +525,7 @@ mod tests {
         coord
             .handle_event(video(CaptureEvent::StreamEnded))
             .unwrap();
-        coord
-            .handle_event(audio(AudioEvent::StreamEnded))
-            .unwrap();
+        coord.handle_event(audio(AudioEvent::StreamEnded)).unwrap();
         let action = coord
             .handle_event(cursor(CursorEvent::StreamEnded))
             .unwrap();
@@ -595,9 +599,7 @@ mod tests {
         let resume_at = started_at + Duration::from_millis(800);
 
         coord
-            .handle_event(video(CaptureEvent::Paused {
-                at: pause_at,
-            }))
+            .handle_event(video(CaptureEvent::Paused { at: pause_at }))
             .unwrap();
         coord
             .handle_event(video(CaptureEvent::Resumed {
@@ -616,9 +618,7 @@ mod tests {
         coord.observe_video_time(100);
 
         coord
-            .handle_event(video(CaptureEvent::FrameDropped {
-                sequence: 1,
-            }))
+            .handle_event(video(CaptureEvent::FrameDropped { sequence: 1 }))
             .unwrap();
 
         assert_eq!(coord.last_observed_ts_ms(), Some(133));
@@ -689,7 +689,6 @@ mod tests {
         let at = started_at + Duration::from_millis(500);
         let _ = coord.finalize(at);
     }
-
 
     use proptest::prelude::*;
     use snow_cursor_capture::CursorFrameSample;
@@ -932,14 +931,13 @@ mod tests {
         }
     }
 
-
     /// Strategy that generates a `CaptureError` whose `Classify::class()` is `Fatal`.
     fn arb_fatal_capture_error() -> impl Strategy<Value = snow_capture::error::CaptureError> {
         prop_oneof![
             Just(snow_capture::error::CaptureError::BufferOverflow),
             Just(snow_capture::error::CaptureError::platform(
-            std::io::Error::new(std::io::ErrorKind::Other, "platform error"),
-        )),
+                std::io::Error::new(std::io::ErrorKind::Other, "platform error"),
+            )),
         ]
     }
 
@@ -957,8 +955,8 @@ mod tests {
     }
 
     /// Strategy that generates a `CaptureError` whose `Classify::class()` is `InvalidConfig`.
-    fn arb_invalid_config_capture_error(
-    ) -> impl Strategy<Value = snow_capture::error::CaptureError> {
+    fn arb_invalid_config_capture_error() -> impl Strategy<Value = snow_capture::error::CaptureError>
+    {
         prop_oneof![
             ".*".prop_map(|s| snow_capture::error::CaptureError::InvalidTarget(s)),
             Just(snow_capture::error::CaptureError::NoPrimaryMonitor),
@@ -974,14 +972,14 @@ mod tests {
             Just(snow_audio_recorder::error::AudioError::AccessDenied),
             Just(snow_audio_recorder::error::AudioError::BufferOverflow),
             Just(snow_audio_recorder::error::AudioError::platform(
-            std::io::Error::new(std::io::ErrorKind::Other, "platform error"),
-        )),
+                std::io::Error::new(std::io::ErrorKind::Other, "platform error"),
+            )),
         ]
     }
 
     /// Strategy that generates an `AudioError` whose `Classify::class()` is `Transient`.
-    fn arb_transient_audio_error(
-    ) -> impl Strategy<Value = snow_audio_recorder::error::AudioError> {
+    fn arb_transient_audio_error() -> impl Strategy<Value = snow_audio_recorder::error::AudioError>
+    {
         prop_oneof![
             Just(snow_audio_recorder::error::AudioError::DeviceLost),
             Just(snow_audio_recorder::error::AudioError::Canceled),
@@ -990,8 +988,8 @@ mod tests {
     }
 
     /// Strategy that generates an `AudioError` whose `Classify::class()` is `InvalidConfig`.
-    fn arb_invalid_config_audio_error(
-    ) -> impl Strategy<Value = snow_audio_recorder::error::AudioError> {
+    fn arb_invalid_config_audio_error()
+    -> impl Strategy<Value = snow_audio_recorder::error::AudioError> {
         prop_oneof![
             ".*".prop_map(|s| snow_audio_recorder::error::AudioError::InvalidConfig(s)),
             ".*".prop_map(|s| snow_audio_recorder::error::AudioError::DeviceUnavailable(s)),

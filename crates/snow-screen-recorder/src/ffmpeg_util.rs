@@ -11,9 +11,7 @@ pub(crate) fn ensure_ffmpeg_initialized() -> Result<()> {
     static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| ffmpeg::init().map_err(|err| err.to_string()))
         .clone()
-        .map_err(|err| {
-            ScreenRecorderError::Encode(format!("failed to initialize ffmpeg: {err}"))
-        })
+        .map_err(|err| ScreenRecorderError::Encode(format!("failed to initialize ffmpeg: {err}")))
 }
 
 /// Check whether an FFmpeg error is EAGAIN.

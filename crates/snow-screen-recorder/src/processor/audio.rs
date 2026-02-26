@@ -43,58 +43,41 @@ impl AudioProcessor {
         bytes: &[u8],
         timeline: &PauseTimeline,
     ) -> Result<u64> {
-        match source {
-            AudioSourceKind::System => {
-                let Some(writer) = self.system_writer.as_mut() else {
-                    return Ok(0);
-                };
-                let appended = writer.write_packet(packet, bytes, timeline)?;
-                if appended > 0 {
-                    self.recorded_system = true;
-                }
-                Ok(appended)
-            }
-            AudioSourceKind::Microphone => {
-                let Some(writer) = self.mic_writer.as_mut() else {
-                    return Ok(0);
-                };
-                let appended = writer.write_packet(packet, bytes, timeline)?;
-                if appended > 0 {
-                    self.recorded_mic = true;
-                }
-                Ok(appended)
-            }
+        let (writer_slot, recorded_flag) = self.writer_slot_mut(source);
+        let Some(writer) = writer_slot.as_mut() else {
+            return Ok(0);
+        };
+
+        let appended = writer.write_packet(packet, bytes, timeline)?;
+        if appended > 0 {
+            *recorded_flag = true;
         }
+        Ok(appended)
     }
 
     /// Write silence frames for a dropped packet to the correct track.
     ///
     /// Returns `Ok(())` without error when the corresponding writer is
     /// `None` (source disabled). Sets recording flags when frames > 0.
-    pub(crate) fn write_silence(
-        &mut self,
-        source: AudioSourceKind,
-        frames: u64,
-    ) -> Result<()> {
-        match source {
-            AudioSourceKind::System => {
-                if let Some(writer) = self.system_writer.as_mut() {
-                    writer.append_silence_frames(frames)?;
-                    if frames > 0 {
-                        self.recorded_system = true;
-                    }
-                }
-            }
-            AudioSourceKind::Microphone => {
-                if let Some(writer) = self.mic_writer.as_mut() {
-                    writer.append_silence_frames(frames)?;
-                    if frames > 0 {
-                        self.recorded_mic = true;
-                    }
-                }
+    pub(crate) fn write_silence(&mut self, source: AudioSourceKind, frames: u64) -> Result<()> {
+        let (writer_slot, recorded_flag) = self.writer_slot_mut(source);
+        if let Some(writer) = writer_slot.as_mut() {
+            writer.append_silence_frames(frames)?;
+            if frames > 0 {
+                *recorded_flag = true;
             }
         }
         Ok(())
+    }
+
+    fn writer_slot_mut(
+        &mut self,
+        source: AudioSourceKind,
+    ) -> (&mut Option<PcmTrackWriter>, &mut bool) {
+        match source {
+            AudioSourceKind::System => (&mut self.system_writer, &mut self.recorded_system),
+            AudioSourceKind::Microphone => (&mut self.mic_writer, &mut self.recorded_mic),
+        }
     }
 
     /// Whether any system audio has been successfully written.
@@ -253,7 +236,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn system_write_sets_recorded_system_flag() {
         let dir = TempDir::new().unwrap();
@@ -263,7 +245,8 @@ mod tests {
 
         assert!(!proc.recorded_system());
         let (packet, bytes) = make_packet(AudioSourceKind::System, 480);
-        proc.write_packet(AudioSourceKind::System, &packet, &bytes, &timeline).unwrap();
+        proc.write_packet(AudioSourceKind::System, &packet, &bytes, &timeline)
+            .unwrap();
         assert!(proc.recorded_system());
         assert!(!proc.recorded_mic());
     }
@@ -277,7 +260,8 @@ mod tests {
 
         assert!(!proc.recorded_mic());
         let (packet, bytes) = make_packet(AudioSourceKind::Microphone, 480);
-        proc.write_packet(AudioSourceKind::Microphone, &packet, &bytes, &timeline).unwrap();
+        proc.write_packet(AudioSourceKind::Microphone, &packet, &bytes, &timeline)
+            .unwrap();
         assert!(proc.recorded_mic());
         assert!(!proc.recorded_system());
     }
@@ -300,7 +284,8 @@ mod tests {
         let mut proc = AudioProcessor::new(None, Some(mic_writer));
 
         assert!(!proc.recorded_mic());
-        proc.write_silence(AudioSourceKind::Microphone, 100).unwrap();
+        proc.write_silence(AudioSourceKind::Microphone, 100)
+            .unwrap();
         assert!(proc.recorded_mic());
     }
 
@@ -318,7 +303,8 @@ mod tests {
     fn write_silence_to_none_writer_is_noop() {
         let mut proc = AudioProcessor::new(None, None);
         proc.write_silence(AudioSourceKind::System, 100).unwrap();
-        proc.write_silence(AudioSourceKind::Microphone, 100).unwrap();
+        proc.write_silence(AudioSourceKind::Microphone, 100)
+            .unwrap();
         assert!(!proc.recorded_system());
         assert!(!proc.recorded_mic());
     }

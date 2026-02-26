@@ -84,9 +84,12 @@ impl VideoProcessor {
                 &self.video_config,
             )?);
         }
-        if let Some(encoder) = self.encoder.as_mut() {
-            encoder.encode_frame(&rgba, ts_ms)?;
-        }
+        let encoder = self.encoder.as_mut().ok_or_else(|| {
+            ScreenRecorderError::Encode(
+                "video encoder was not initialized before frame encoding".to_string(),
+            )
+        })?;
+        encoder.encode_frame(&rgba, ts_ms)?;
         self.last_encoded_rgba = Some(rgba);
         Ok(())
     }

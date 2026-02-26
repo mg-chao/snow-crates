@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use snow_audio_recorder::AudioStreamHandle;
 use snow_capture::CaptureEvent;
 use snow_core::event::{SourceId, TaggedEvent};
@@ -40,9 +40,7 @@ const CURSOR_CHANNEL_CAPACITY: usize = 4;
 pub(crate) fn build_multiplexer(
     video_handle: snow_capture::StreamHandle,
     audio_handle: Option<AudioStreamHandle>,
-    #[cfg(not(feature = "cursor"))] cursor_handle: Option<
-        snow_cursor_capture::CursorStreamHandle,
-    >,
+    #[cfg(not(feature = "cursor"))] cursor_handle: Option<snow_cursor_capture::CursorStreamHandle>,
 ) -> (StreamMultiplexer<RecordingEvent>, Vec<SourceId>) {
     let mut active_sources = Vec::new();
 
