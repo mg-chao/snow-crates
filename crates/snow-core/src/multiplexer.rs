@@ -427,14 +427,14 @@ fn main_loop<O: Send + 'static>(
                     Ok(SourceMsg::StreamEnded) => {
                         let _ = status_tx.send(MuxStatus::SourceEnded(prio_id));
                         terminated_count += 1;
-                        remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
+                        remove_source_at(&mut alive, &mut alive_cmd_txs, prio_idx);
                         break;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         check_forwarder_panic(&mut joins, prio_id, &status_tx);
                         terminated_count += 1;
-                        remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
+                        remove_source_at(&mut alive, &mut alive_cmd_txs, prio_idx);
                         break;
                     }
                 }
@@ -442,7 +442,7 @@ fn main_loop<O: Send + 'static>(
         }
 
         // Check completion after priority drain.
-        if terminated_count >= total_sources || alive.is_empty() {
+        if should_complete(total_sources, terminated_count, alive.len()) {
             let _ = status_tx.send(MuxStatus::Completed);
             break;
         }
@@ -481,12 +481,11 @@ fn main_loop<O: Send + 'static>(
 
         // Remove terminated sources (reverse order to preserve indices).
         for &idx in to_remove.iter().rev() {
-            let (sid, _) = alive.remove(idx);
-            alive_cmd_txs.retain(|(id, _)| *id != sid);
+            remove_source_at(&mut alive, &mut alive_cmd_txs, idx);
         }
 
         // Check completion.
-        if terminated_count >= total_sources || alive.is_empty() {
+        if should_complete(total_sources, terminated_count, alive.len()) {
             let _ = status_tx.send(MuxStatus::Completed);
             break;
         }
@@ -498,13 +497,30 @@ fn main_loop<O: Send + 'static>(
 // ---------------------------------------------------------------------------
 
 /// Remove a source from both the alive receivers and command sender lists.
-fn remove_source<O>(
+///
+/// Uses index-based removal so duplicate `SourceId` registrations are handled
+/// independently.
+fn remove_source_at<O>(
     alive: &mut Vec<(SourceId, Receiver<SourceMsg<O>>)>,
     alive_cmd_txs: &mut Vec<(SourceId, Sender<MuxCommand>)>,
-    sid: SourceId,
+    idx: usize,
 ) {
-    alive.retain(|(id, _)| *id != sid);
-    alive_cmd_txs.retain(|(id, _)| *id != sid);
+    if idx >= alive.len() {
+        return;
+    }
+
+    let (sid, _) = alive.remove(idx);
+    if idx < alive_cmd_txs.len() {
+        let _ = alive_cmd_txs.remove(idx);
+    } else {
+        // Keep the state consistent if vectors were ever out of sync.
+        alive_cmd_txs.retain(|(id, _)| *id != sid);
+    }
+}
+
+/// Returns true when all sources have terminated or no sources remain alive.
+fn should_complete(total_sources: usize, terminated_count: usize, alive_len: usize) -> bool {
+    terminated_count >= total_sources || alive_len == 0
 }
 
 /// Drain remaining events during shutdown, prioritizing the audio source.
