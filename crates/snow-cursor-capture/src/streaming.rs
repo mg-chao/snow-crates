@@ -3,8 +3,8 @@
 //! Runs a polling loop on a dedicated thread and delivers [`CursorEvent`]
 //! through a bounded crossbeam channel.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -62,9 +62,7 @@ impl CursorStreamHandle {
                 poll_loop(sampler, &config, &tx, &worker_stop, &worker_pause);
             })
             .map_err(|e| {
-                CursorCaptureError::platform(format!(
-                    "failed to spawn cursor stream thread: {e}"
-                ))
+                CursorCaptureError::platform(format!("failed to spawn cursor stream thread: {e}"))
             })?;
 
         Ok(Self {
@@ -177,7 +175,6 @@ fn poll_loop(
     stop: &AtomicBool,
     pause: &AtomicBool,
 ) {
-    let mut was_paused = false;
     let mut pause_started: Option<Instant> = None;
 
     loop {
@@ -187,42 +184,35 @@ fn poll_loop(
         }
 
         if pause.load(Ordering::Acquire) {
-            if !was_paused {
-                was_paused = true;
+            if pause_started.is_none() {
                 let now = Instant::now();
                 pause_started = Some(now);
                 let _ = tx.send(CursorEvent::Paused { at: now });
             }
-            std::thread::sleep(config.poll_interval);
-            continue;
-        }
-
-        if was_paused {
-            was_paused = false;
-            let now = Instant::now();
-            let gap = pause_started
-                .map(|start| now.duration_since(start))
-                .unwrap_or_default();
-            pause_started = None;
-            let _ = tx.send(CursorEvent::Resumed { at: now, gap });
-        }
-
-        match sampler.sample() {
-            Ok(sample) => {
-                let stream_timestamp = StreamTimestamp {
-                    instant: Instant::now(),
-                    raw_os_ticks: None,
-                    tick_format: TickFormat::RawQpc,
-                };
-                // Best-effort send: if the channel is full, drop the sample
-                // to avoid blocking the poll loop.
-                let _ = tx.try_send(CursorEvent::Sample {
-                    sample,
-                    stream_timestamp,
-                });
+        } else {
+            if let Some(start) = pause_started.take() {
+                let now = Instant::now();
+                let gap = now.duration_since(start);
+                let _ = tx.send(CursorEvent::Resumed { at: now, gap });
             }
-            Err(e) => {
-                let _ = tx.send(CursorEvent::Error(e));
+
+            match sampler.sample() {
+                Ok(sample) => {
+                    let stream_timestamp = StreamTimestamp {
+                        instant: Instant::now(),
+                        raw_os_ticks: None,
+                        tick_format: TickFormat::RawQpc,
+                    };
+                    // Best-effort send: if the channel is full, drop the sample
+                    // to avoid blocking the poll loop.
+                    let _ = tx.try_send(CursorEvent::Sample {
+                        sample,
+                        stream_timestamp,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(CursorEvent::Error(e));
+                }
             }
         }
 

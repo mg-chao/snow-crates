@@ -201,14 +201,19 @@ fn extract_monochrome_shape(hotspot_x: u32, hotspot_y: u32, mask: HBITMAP) -> Op
 /// Computes the overlapping rows and columns between a color bitmap and its
 /// AND-mask. Returns `None` when the overlap is empty.
 fn mask_overlap(width: u32, height: u32, mask_width: u32, mask_height: u32) -> Option<(u32, u32)> {
-    let and_height = if mask_height >= height.saturating_mul(2) {
-        height
-    } else {
-        mask_height.min(height)
-    };
-    let rows = and_height.min(height);
+    let rows = mask_height.min(height);
     let cols = mask_width.min(width);
-    if rows == 0 || cols == 0 { None } else { Some((rows, cols)) }
+    if rows == 0 || cols == 0 {
+        None
+    } else {
+        Some((rows, cols))
+    }
+}
+
+fn checked_rgba_len(width: u32, height: u32) -> Option<usize> {
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)
 }
 
 fn pixel_is_set(pixel: &[u8]) -> bool {
@@ -237,17 +242,29 @@ fn apply_mask_alpha(
         return false;
     };
 
+    let Some(mask_len) = checked_rgba_len(mask_width, rows) else {
+        return false;
+    };
+    if mask_rgba.len() < mask_len {
+        return false;
+    }
+
+    let Some(rgba_len) = checked_rgba_len(width, rows) else {
+        return false;
+    };
+    if rgba.len() < rgba_len {
+        return false;
+    }
+
     for y in 0..rows {
         for x in 0..cols {
             let idx = ((y * mask_width + x) * 4) as usize;
-            if idx + 3 >= mask_rgba.len() {
-                return false;
-            }
             let dst = ((y * width + x) * 4 + 3) as usize;
-            if dst >= rgba.len() {
-                return false;
-            }
-            rgba[dst] = if pixel_is_set(&mask_rgba[idx..idx + 4]) { 255 } else { 0 };
+            rgba[dst] = if pixel_is_set(&mask_rgba[idx..idx + 4]) {
+                255
+            } else {
+                0
+            };
         }
     }
 
@@ -292,12 +309,16 @@ fn mask_has_set_bits(
         return false;
     };
 
+    let Some(mask_len) = checked_rgba_len(mask_width, rows) else {
+        return false;
+    };
+    if mask_rgba.len() < mask_len {
+        return false;
+    }
+
     for y in 0..rows {
         for x in 0..cols {
             let idx = ((y * mask_width + x) * 4) as usize;
-            if idx + 3 >= mask_rgba.len() {
-                return false;
-            }
             if pixel_is_set(&mask_rgba[idx..idx + 4]) {
                 return true;
             }
