@@ -27,6 +27,9 @@ pub enum ScreenRecorderError {
 
     #[error("export error: {0}")]
     Export(String),
+
+    #[error("export canceled")]
+    ExportCanceled,
 }
 
 pub type Result<T> = std::result::Result<T, ScreenRecorderError>;

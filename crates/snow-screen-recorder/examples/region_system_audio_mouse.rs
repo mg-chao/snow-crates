@@ -2,9 +2,8 @@ use std::thread;
 use std::time::Duration;
 
 use snow_screen_recorder::{
-    EditConfig, EditingSession, ExportConfig, ExportFormat, MouseEditConfig, RecordingAudioConfig,
-    RecordingConfig, RecordingRegion, RecordingSession, RecordingTarget, VideoEncodeConfig,
-    VideoEncodingSpeed,
+    EditingSession, ExportFormat, MouseEditConfig, RecordingAudioConfig, RecordingConfig,
+    RecordingRegion, RecordingSession, RecordingTarget, VideoEncodeConfig, VideoEncodingSpeed,
 };
 
 const REGION_X: i32 = 0;
@@ -66,28 +65,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stop_duration_start.elapsed().as_millis()
     );
 
-    let mut editing = EditingSession::open(artifact)?;
-    let mut edit_config = EditConfig::default();
-    edit_config.microphone_audio.enabled = true;
-    edit_config.system_audio.enabled = true;
-    edit_config.mouse = MouseEditConfig {
+    let editing = EditingSession::open(artifact)?;
+    let mut request = editing.export_request();
+    request.microphone_audio.enabled = true;
+    request.system_audio.enabled = true;
+    request.mouse = MouseEditConfig {
         visible: true,
         trail_enabled: true,
         click_enabled: true,
         ..MouseEditConfig::default()
     };
-    edit_config.export = ExportConfig {
-        format: ExportFormat::Mp4,
-        output_path: export_path.clone(),
-        video: VideoEncodeConfig {
-            quality: 100,
-            speed: VideoEncodingSpeed::UltraFast,
-        },
+    request.format = ExportFormat::Mp4;
+    request.output_path = export_path.clone();
+    request.video = VideoEncodeConfig {
+        quality: 100,
+        speed: VideoEncodingSpeed::UltraFast,
     };
-    editing.set_config(edit_config)?;
 
     let start_ts = std::time::Instant::now();
-    let result = editing.export()?;
+    let result = editing.export(request)?;
     println!(
         "Export completed in {} seconds.",
         start_ts.elapsed().as_secs_f64()

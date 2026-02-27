@@ -1,15 +1,22 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use crossbeam_channel::Sender;
 use ffmpeg_next as ffmpeg;
 use snow_audio_recorder::align_i16_interleaved_to_duration;
 
 use crate::artifact::{RecordingArtifact, SessionManifest};
-use crate::config::{EditConfig, ExportFormat, MouseEditConfig, VideoEncodeConfig};
+use crate::config::{
+    ExportFormat, ExportPerformanceConfig, ExportPreset, ExportRequest, HardwarePolicy,
+    MouseEditConfig, VideoEncodeConfig, VideoEncodingSpeed,
+};
 use crate::error::{Result, ScreenRecorderError};
-use crate::export::ExportResult;
+use crate::export::{ExportProgress, ExportResult, ExportStage, ExportTask};
 use crate::ffmpeg_util::{copy_rgba_into_frame, ensure_ffmpeg_initialized, is_eagain};
 use crate::model::StoredFrame;
 use crate::mouse::{CursorShapeCompositionMode, CursorShapeRecord, MouseStore, read_mouse_records};
@@ -18,7 +25,6 @@ use crate::video_quality::{quality_to_h264_crf, smart_quality_bitrate_bps};
 pub struct EditingSession {
     artifact: RecordingArtifact,
     manifest: SessionManifest,
-    config: EditConfig,
 }
 
 impl EditingSession {
@@ -26,47 +32,61 @@ impl EditingSession {
         let manifest = artifact.load_manifest()?;
         validate_manifest_paths(&manifest)?;
 
-        let mut config = EditConfig::default();
-        config.playback_speed = 1.0;
-        config.system_audio.enabled = manifest.recorded_system_audio;
-        config.microphone_audio.enabled = manifest.recorded_microphone_audio;
-        config.export.format = ExportFormat::Mp4;
-        config.export.video = manifest.recording_video.clone();
-        config.export.output_path = manifest
-            .output_dir
-            .join(format!("{}.mp4", manifest.session_id));
-
-        Ok(Self {
-            artifact,
-            manifest,
-            config,
-        })
+        Ok(Self { artifact, manifest })
     }
 
-    pub fn set_config(&mut self, mut config: EditConfig) -> Result<()> {
-        config
-            .validate()
-            .map_err(ScreenRecorderError::InvalidConfig)?;
-
-        if config.system_audio.enabled && !self.manifest.recorded_system_audio {
-            config.system_audio.enabled = false;
+    pub fn export_request(&self) -> ExportRequest {
+        ExportRequest {
+            playback_speed: 1.0,
+            system_audio: crate::config::AudioEditConfig {
+                enabled: self.manifest.recorded_system_audio,
+                ..crate::config::AudioEditConfig::default()
+            },
+            microphone_audio: crate::config::AudioEditConfig {
+                enabled: self.manifest.recorded_microphone_audio,
+                ..crate::config::AudioEditConfig::default()
+            },
+            mouse: crate::config::MouseEditConfig::default(),
+            format: ExportFormat::Mp4,
+            output_path: self
+                .manifest
+                .output_dir
+                .join(format!("{}.mp4", self.manifest.session_id)),
+            video: self.manifest.recording_video.clone(),
+            performance: crate::config::ExportPerformanceConfig::default(),
         }
-        if config.microphone_audio.enabled && !self.manifest.recorded_microphone_audio {
-            config.microphone_audio.enabled = false;
-        }
-
-        self.config = config;
-        Ok(())
     }
 
-    pub fn export(self) -> Result<ExportResult> {
-        self.config
+    pub fn export(self, request: ExportRequest) -> Result<ExportResult> {
+        self.export_with_request(request, None, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn export_async(self, request: ExportRequest) -> Result<ExportTask> {
+        let (progress_tx, progress_rx) = crossbeam_channel::unbounded::<ExportProgress>();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_for_worker = Arc::clone(&cancel_flag);
+        let handle = thread::Builder::new()
+            .name("snow-screen-recorder-export".to_string())
+            .spawn(move || self.export_with_request(request, Some(progress_tx), cancel_for_worker))
+            .map_err(|err| ScreenRecorderError::Io(std::io::Error::other(err)))?;
+
+        Ok(ExportTask::new(cancel_flag, progress_rx, handle))
+    }
+
+    fn export_with_request(
+        self,
+        request: ExportRequest,
+        progress_tx: Option<Sender<ExportProgress>>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Result<ExportResult> {
+        request
             .validate()
             .map_err(ScreenRecorderError::InvalidConfig)?;
+        let request = normalize_export_request(request, &self.manifest);
 
         let temp_dir = self.artifact.temp_dir.clone();
         let keep_temp_files = self.manifest.keep_temp_files;
-        let result = self.export_inner();
+        let result = self.export_inner(request, &progress_tx, &cancel_flag);
         if result.is_ok() && !keep_temp_files {
             fs::remove_dir_all(&temp_dir).map_err(|err| {
                 ScreenRecorderError::Export(format!(
@@ -78,26 +98,41 @@ impl EditingSession {
         result
     }
 
-    fn export_inner(self) -> Result<ExportResult> {
-        if let Some(parent) = self.config.export.output_path.parent()
+    fn export_inner(
+        self,
+        request: ExportRequest,
+        progress_tx: &Option<Sender<ExportProgress>>,
+        cancel_flag: &Arc<AtomicBool>,
+    ) -> Result<ExportResult> {
+        check_canceled(cancel_flag)?;
+        emit_progress(progress_tx, ExportStage::Analyze, 1.0, 0.0, None);
+
+        if let Some(parent) = request.output_path.parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(parent)?;
         }
 
-        let source_frames = decode_video_frames(&self.manifest.video_temp_path, self.manifest.fps)?;
+        emit_progress(progress_tx, ExportStage::VideoDecode, 2.0, 0.0, None);
+        let source_frames = decode_video_frames(
+            &self.manifest.video_temp_path,
+            self.manifest.fps,
+            Some(cancel_flag),
+        )?;
         if source_frames.is_empty() {
             return Err(ScreenRecorderError::Export(
                 "no frames available for export".to_string(),
             ));
         }
+        emit_progress(progress_tx, ExportStage::VideoDecode, 20.0, 0.0, None);
+        check_canceled(cancel_flag)?;
 
         let mouse_store = read_mouse_records(&self.manifest.mouse_path)?;
         let mouse_tracks = build_mouse_tracks(&mouse_store);
 
-        let export_fps = choose_export_fps(self.manifest.fps, self.config.export.format);
-        let mut frames = retime_frames(&source_frames, self.config.playback_speed, export_fps)?;
-        if frames.is_empty() {
+        let export_fps = choose_export_fps(self.manifest.fps, request.format);
+        let retime = build_retime_plan(&source_frames, request.playback_speed, export_fps)?;
+        if retime.frame_count == 0 {
             return Err(ScreenRecorderError::Export(
                 "retiming produced no frames".to_string(),
             ));
@@ -106,46 +141,122 @@ impl EditingSession {
         let (output_w, output_h) = output_dimensions(
             source_frames[0].width,
             source_frames[0].height,
-            self.config.export.format != ExportFormat::Gif,
+            request.format != ExportFormat::Gif,
         );
-        for frame in &mut frames {
-            apply_mouse_overlays(frame, &mouse_tracks, &self.config.mouse);
-            if frame.width != output_w || frame.height != output_h {
-                frame.rgba =
-                    resize_rgba_nearest(&frame.rgba, frame.width, frame.height, output_w, output_h);
-                frame.width = output_w;
-                frame.height = output_h;
-            }
-        }
+        let duration_ms = retime.output_duration_ms.max(1);
 
-        let duration_ms = frames
-            .iter()
-            .map(|f| u64::from(f.duration_ms.max(1)))
-            .sum::<u64>()
-            .max(1);
-
-        let mixed_audio = if self.config.export.format == ExportFormat::Gif {
+        emit_progress(progress_tx, ExportStage::AudioMix, 25.0, 0.0, None);
+        let mixed_audio = if request.format == ExportFormat::Gif {
             None
         } else {
-            build_mixed_audio(&self.manifest, &self.config, duration_ms)?
+            build_mixed_audio(&self.manifest, &request, duration_ms)?
         };
+        emit_progress(progress_tx, ExportStage::AudioMix, 35.0, 0.0, None);
+        check_canceled(cancel_flag)?;
 
-        export_video(
-            &self.config.export.output_path,
-            &frames,
+        let output_path = request.output_path.clone();
+        let source_len = source_frames[0].rgba.len();
+        let output_len = output_w as usize * output_h as usize * 4;
+        let needs_overlay = !mouse_tracks.samples.is_empty()
+            && (request.mouse.visible
+                || request.mouse.click_enabled
+                || request.mouse.trail_enabled);
+        let needs_resize =
+            source_frames[0].width != output_w || source_frames[0].height != output_h;
+
+        let mut src_idx = 0usize;
+        let mut working_frame = StoredFrame {
+            timestamp_ms: 0,
+            duration_ms: retime.frame_duration_ms,
+            width: source_frames[0].width,
+            height: source_frames[0].height,
+            rgba: vec![0u8; source_len],
+        };
+        let mut resized_rgba = vec![0u8; output_len];
+
+        if let Err(err) = export_video_generated(
+            &output_path,
+            output_w,
+            output_h,
+            retime.frame_count,
             export_fps,
-            self.config.export.format,
+            request.format,
             mixed_audio.as_ref(),
             self.manifest.audio_bitrate_kbps.max(8),
-            &self.config.export.video,
-        )?;
+            &request.video,
+            &request.performance,
+            cancel_flag,
+            progress_tx,
+            |index, output_rgba| {
+                check_canceled(cancel_flag)?;
+
+                let src_t = retime.source_timestamp_ms(index);
+                while src_idx + 1 < retime.starts_ms.len() && src_t >= retime.starts_ms[src_idx + 1]
+                {
+                    src_idx += 1;
+                }
+
+                let source = &source_frames[src_idx];
+                if !needs_overlay && !needs_resize {
+                    output_rgba.copy_from_slice(&source.rgba);
+                    return Ok(());
+                }
+
+                if working_frame.rgba.len() != source.rgba.len() {
+                    working_frame.rgba.resize(source.rgba.len(), 0);
+                }
+                working_frame.timestamp_ms = retime.output_timestamp_ms(index);
+                working_frame.duration_ms = retime.frame_duration_ms;
+                working_frame.width = source.width;
+                working_frame.height = source.height;
+                working_frame.rgba.copy_from_slice(&source.rgba);
+
+                if needs_overlay {
+                    apply_mouse_overlays(&mut working_frame, &mouse_tracks, &request.mouse);
+                }
+
+                if needs_resize {
+                    resize_rgba_nearest_into(
+                        &working_frame.rgba,
+                        working_frame.width,
+                        working_frame.height,
+                        output_w,
+                        output_h,
+                        &mut resized_rgba,
+                    );
+                    output_rgba.copy_from_slice(&resized_rgba);
+                } else {
+                    output_rgba.copy_from_slice(&working_frame.rgba);
+                }
+                Ok(())
+            },
+        ) {
+            if matches!(err, ScreenRecorderError::ExportCanceled) {
+                let _ = fs::remove_file(&output_path);
+            }
+            return Err(err);
+        }
+        emit_progress(progress_tx, ExportStage::Finalize, 100.0, 0.0, Some(0));
 
         Ok(ExportResult {
-            output_path: self.config.export.output_path,
+            output_path,
             duration_ms,
-            format: self.config.export.format,
+            format: request.format,
         })
     }
+}
+
+fn normalize_export_request(
+    mut request: ExportRequest,
+    manifest: &SessionManifest,
+) -> ExportRequest {
+    if request.system_audio.enabled && !manifest.recorded_system_audio {
+        request.system_audio.enabled = false;
+    }
+    if request.microphone_audio.enabled && !manifest.recorded_microphone_audio {
+        request.microphone_audio.enabled = false;
+    }
+    request
 }
 
 fn choose_export_fps(record_fps: u32, format: ExportFormat) -> u32 {
@@ -173,7 +284,94 @@ fn output_dimensions(src_w: u32, src_h: u32, force_even: bool) -> (u32, u32) {
     (w, h)
 }
 
-fn decode_video_frames(path: &Path, fallback_fps: u32) -> Result<Vec<StoredFrame>> {
+fn check_canceled(cancel_flag: &Arc<AtomicBool>) -> Result<()> {
+    if cancel_flag.load(Ordering::Acquire) {
+        return Err(ScreenRecorderError::ExportCanceled);
+    }
+    Ok(())
+}
+
+fn emit_progress(
+    progress_tx: &Option<Sender<ExportProgress>>,
+    stage: ExportStage,
+    percent: f32,
+    video_fps: f32,
+    eta_ms: Option<u64>,
+) {
+    if let Some(tx) = progress_tx {
+        let _ = tx.send(ExportProgress {
+            stage,
+            percent: percent.clamp(0.0, 100.0),
+            video_fps: video_fps.max(0.0),
+            eta_ms,
+        });
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RetimePlan {
+    starts_ms: Vec<u64>,
+    speed: f32,
+    interval_ms: f64,
+    frame_duration_ms: u32,
+    frame_count: usize,
+    output_duration_ms: u64,
+}
+
+impl RetimePlan {
+    fn source_timestamp_ms(&self, frame_index: usize) -> u64 {
+        let out_t = self.output_timestamp_ms(frame_index);
+        (out_t as f64 * self.speed as f64).round() as u64
+    }
+
+    fn output_timestamp_ms(&self, frame_index: usize) -> u64 {
+        (frame_index as f64 * self.interval_ms).round() as u64
+    }
+}
+
+fn build_retime_plan(
+    source_frames: &[StoredFrame],
+    playback_speed: f32,
+    export_fps: u32,
+) -> Result<RetimePlan> {
+    if source_frames.is_empty() {
+        return Err(ScreenRecorderError::Export(
+            "cannot retime an empty source frame sequence".to_string(),
+        ));
+    }
+
+    let mut starts = Vec::with_capacity(source_frames.len());
+    let mut accumulated = 0u64;
+    for frame in source_frames {
+        starts.push(accumulated);
+        accumulated = accumulated.saturating_add(u64::from(frame.duration_ms.max(1)));
+    }
+    if accumulated == 0 {
+        return Err(ScreenRecorderError::Export(
+            "source frame duration is zero".to_string(),
+        ));
+    }
+
+    let speed = playback_speed.clamp(0.25, 4.0);
+    let interval_ms = (1000.0 / export_fps.max(1) as f64).max(1.0);
+    let output_duration_ms = ((accumulated as f64) / speed as f64).ceil().max(1.0) as u64;
+    let frame_count = ((output_duration_ms as f64) / interval_ms).ceil().max(1.0) as usize;
+
+    Ok(RetimePlan {
+        starts_ms: starts,
+        speed,
+        interval_ms,
+        frame_duration_ms: interval_ms.round().max(1.0) as u32,
+        frame_count,
+        output_duration_ms,
+    })
+}
+
+fn decode_video_frames(
+    path: &Path,
+    fallback_fps: u32,
+    cancel_flag: Option<&Arc<AtomicBool>>,
+) -> Result<Vec<StoredFrame>> {
     ensure_ffmpeg_initialized()?;
 
     let mut input = ffmpeg::format::input(path).map_err(|err| {
@@ -217,6 +415,9 @@ fn decode_video_frames(path: &Path, fallback_fps: u32) -> Result<Vec<StoredFrame
 
     let mut decoded = ffmpeg::frame::Video::empty();
     for (stream, packet) in input.packets() {
+        if let Some(cancel) = cancel_flag {
+            check_canceled(cancel)?;
+        }
         if stream.index() != stream_index {
             continue;
         }
@@ -257,6 +458,9 @@ fn decode_video_frames(path: &Path, fallback_fps: u32) -> Result<Vec<StoredFrame
         ))
     })?;
     loop {
+        if let Some(cancel) = cancel_flag {
+            check_canceled(cancel)?;
+        }
         match decoder.receive_frame(&mut decoded) {
             Ok(()) => {
                 push_decoded_video_frame(
@@ -427,56 +631,24 @@ fn stamp_frame_durations(frames: &mut [StoredFrame], nominal_duration_ms: u32) {
     }
 }
 
-fn retime_frames(
-    source_frames: &[StoredFrame],
-    playback_speed: f32,
-    export_fps: u32,
-) -> Result<Vec<StoredFrame>> {
-    let speed = playback_speed.clamp(0.25, 4.0);
-    let interval_ms = (1000.0 / export_fps.max(1) as f64).max(1.0);
-
-    let mut starts = Vec::with_capacity(source_frames.len());
-    let mut accumulated = 0u64;
-    for frame in source_frames {
-        starts.push(accumulated);
-        accumulated = accumulated.saturating_add(u64::from(frame.duration_ms.max(1)));
-    }
-    if accumulated == 0 {
-        return Ok(Vec::new());
-    }
-    let output_duration_ms = ((accumulated as f64) / speed as f64).ceil().max(1.0);
-
-    let mut out = Vec::new();
-    let mut src_idx = 0usize;
-    let mut out_t = 0.0f64;
-    while out_t < output_duration_ms {
-        let src_t = (out_t * speed as f64).round() as u64;
-        while src_idx + 1 < starts.len() && src_t >= starts[src_idx + 1] {
-            src_idx += 1;
-        }
-
-        let mut frame = source_frames[src_idx].clone();
-        frame.timestamp_ms = out_t.round() as u64;
-        frame.duration_ms = interval_ms.round().max(1.0) as u32;
-        out.push(frame);
-        out_t += interval_ms;
-    }
-
-    if out.is_empty() {
-        let mut frame = source_frames[0].clone();
-        frame.duration_ms = output_duration_ms.round().max(1.0) as u32;
-        out.push(frame);
-    }
-
-    Ok(out)
-}
-
-fn resize_rgba_nearest(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+fn resize_rgba_nearest_into(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    out: &mut Vec<u8>,
+) {
     if src_w == dst_w && src_h == dst_h {
-        return src.to_vec();
+        out.clear();
+        out.extend_from_slice(src);
+        return;
     }
 
-    let mut out = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    let dst_len = dst_w as usize * dst_h as usize * 4;
+    if out.len() != dst_len {
+        out.resize(dst_len, 0);
+    }
     for y in 0..dst_h {
         let sy = ((y as u64 * src_h as u64) / dst_h as u64) as u32;
         for x in 0..dst_w {
@@ -486,7 +658,6 @@ fn resize_rgba_nearest(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u3
             out[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
         }
     }
-    out
 }
 
 #[derive(Clone, Debug)]
@@ -1067,27 +1238,27 @@ struct MixedAudio {
 
 fn build_mixed_audio(
     manifest: &SessionManifest,
-    config: &EditConfig,
+    request: &ExportRequest,
     target_duration_ms: u64,
 ) -> Result<Option<MixedAudio>> {
     let mut tracks = Vec::<(Vec<i16>, f32)>::new();
     let channels = manifest.audio_channels.max(1);
 
-    if config.system_audio.enabled
+    if request.system_audio.enabled
         && let Some(path) = manifest.audio_system_path.as_ref()
     {
         let samples = read_pcm_i16(path, channels)?;
         if !samples.is_empty() {
-            tracks.push((samples, config.system_audio.volume.clamp(0.0, 2.0)));
+            tracks.push((samples, request.system_audio.volume.clamp(0.0, 2.0)));
         }
     }
 
-    if config.microphone_audio.enabled
+    if request.microphone_audio.enabled
         && let Some(path) = manifest.audio_mic_path.as_ref()
     {
         let samples = read_pcm_i16(path, channels)?;
         if !samples.is_empty() {
-            tracks.push((samples, config.microphone_audio.volume.clamp(0.0, 2.0)));
+            tracks.push((samples, request.microphone_audio.volume.clamp(0.0, 2.0)));
         }
     }
 
@@ -1100,7 +1271,7 @@ fn build_mixed_audio(
         return Ok(None);
     }
 
-    let retimed = retime_audio_i16_interleaved(&mixed, channels, config.playback_speed);
+    let retimed = retime_audio_i16_interleaved(&mixed, channels, request.playback_speed);
     let aligned = align_i16_interleaved_to_duration(
         retimed,
         manifest.audio_sample_rate_hz.max(1),
@@ -1312,17 +1483,26 @@ fn choose_audio_sample_format(codec: ffmpeg::codec::Audio) -> ffmpeg::format::Sa
     ffmpeg::format::Sample::I16(ffmpeg::format::sample::Type::Packed)
 }
 
-fn export_video(
+fn export_video_generated<F>(
     output_path: &Path,
-    frames: &[StoredFrame],
+    width: u32,
+    height: u32,
+    frame_count: usize,
     export_fps: u32,
     format: ExportFormat,
     mixed_audio: Option<&MixedAudio>,
     audio_bitrate_kbps: u16,
     video_config: &VideoEncodeConfig,
-) -> Result<()> {
+    perf_config: &ExportPerformanceConfig,
+    cancel_flag: &Arc<AtomicBool>,
+    progress_tx: &Option<Sender<ExportProgress>>,
+    mut rgba_provider: F,
+) -> Result<()>
+where
+    F: FnMut(usize, &mut [u8]) -> Result<()>,
+{
     ensure_ffmpeg_initialized()?;
-    let (width, height) = validate_export_frames(frames, format != ExportFormat::Gif)?;
+    validate_export_dimensions(width, height, format != ExportFormat::Gif)?;
 
     let mut output = ffmpeg::format::output(output_path).map_err(|err| {
         ScreenRecorderError::Export(format!("failed to create ffmpeg output context: {err}"))
@@ -1336,23 +1516,13 @@ fn export_video(
     let video_time_base = ffmpeg::Rational(1, fps);
     let video_frame_rate = ffmpeg::Rational(fps, 1);
 
-    let container_video_codec = output
-        .format()
-        .codec(output_path, ffmpeg::media::Type::Video);
-    let preferred_video_codec = choose_video_codec_id(format);
-    let video_codec = ffmpeg::encoder::find(preferred_video_codec)
-        .or_else(|| ffmpeg::encoder::find(container_video_codec))
-        .ok_or_else(|| {
-            ScreenRecorderError::Export(format!(
-                "no video encoder available for {format:?} (preferred={preferred_video_codec:?}, container={container_video_codec:?})"
-            ))
-        })?;
+    let mut video_codec = select_video_codec(&output, output_path, format, perf_config.hardware)?;
     let codec_video_info = video_codec.video().map_err(|err| {
         ScreenRecorderError::Export(format!(
             "selected video codec is not usable as video: {err}"
         ))
     })?;
-    let pixel_format = choose_video_pixel_format(format, codec_video_info);
+    let mut pixel_format = choose_video_pixel_format(format, codec_video_info);
     let mut video_encoder = ffmpeg::codec::context::Context::new_with_codec(video_codec)
         .encoder()
         .video()
@@ -1364,38 +1534,81 @@ fn export_video(
     video_encoder.set_format(pixel_format);
     video_encoder.set_time_base(video_time_base);
     video_encoder.set_frame_rate(Some(video_frame_rate));
+
+    let effective_video = effective_video_config(video_config, perf_config.preset);
     if format != ExportFormat::Gif {
         video_encoder.set_bit_rate(smart_quality_bitrate_bps(
             width,
             height,
             export_fps,
-            video_config,
+            &effective_video,
             false,
         ));
     }
     if global_header {
         video_encoder.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
     }
-    let use_h264_options =
-        video_codec.id() == ffmpeg::codec::Id::H264 || video_codec.name().contains("264");
-    let mut video_encoder = if use_h264_options {
-        let mut options = ffmpeg::Dictionary::new();
-        options.set("preset", video_config.speed.as_x264_preset());
-        options.set(
-            "crf",
-            &quality_to_h264_crf(video_config.quality).to_string(),
-        );
-        video_encoder
-            .open_as_with(video_codec, options)
-            .map_err(|err| {
-                ScreenRecorderError::Export(format!(
-                    "failed to open video encoder with h264 options: {err}"
-                ))
-            })?
-    } else {
-        video_encoder.open_as(video_codec).map_err(|err| {
-            ScreenRecorderError::Export(format!("failed to open video encoder: {err}"))
-        })?
+
+    let mut video_encoder = match open_video_encoder(
+        video_encoder,
+        &video_codec,
+        &effective_video,
+        perf_config.preset,
+    ) {
+        Ok(encoder) => encoder,
+        Err(primary_error) => {
+            // If hardware auto-select picked an encoder that fails to open,
+            // transparently fall back to software H.264.
+            if matches!(perf_config.hardware, HardwarePolicy::Auto)
+                && is_hardware_h264_encoder(&video_codec)
+            {
+                video_codec =
+                    select_video_codec(&output, output_path, format, HardwarePolicy::SoftwareOnly)?;
+                let fallback_video_info = video_codec.video().map_err(|err| {
+                    ScreenRecorderError::Export(format!(
+                        "fallback software codec is not usable as video: {err}"
+                    ))
+                })?;
+                pixel_format = choose_video_pixel_format(format, fallback_video_info);
+
+                let mut fallback_encoder =
+                    ffmpeg::codec::context::Context::new_with_codec(video_codec)
+                        .encoder()
+                        .video()
+                        .map_err(|err| {
+                            ScreenRecorderError::Export(format!(
+                                "failed to create fallback video encoder context: {err}"
+                            ))
+                        })?;
+                fallback_encoder.set_width(width);
+                fallback_encoder.set_height(height);
+                fallback_encoder.set_format(pixel_format);
+                fallback_encoder.set_time_base(video_time_base);
+                fallback_encoder.set_frame_rate(Some(video_frame_rate));
+                if format != ExportFormat::Gif {
+                    fallback_encoder.set_bit_rate(smart_quality_bitrate_bps(
+                        width,
+                        height,
+                        export_fps,
+                        &effective_video,
+                        false,
+                    ));
+                }
+                if global_header {
+                    fallback_encoder.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
+                }
+
+                open_video_encoder(
+                    fallback_encoder,
+                    &video_codec,
+                    &effective_video,
+                    perf_config.preset,
+                )
+                .map_err(|_| primary_error)?
+            } else {
+                return Err(primary_error);
+            }
+        }
     };
 
     let video_stream_index = {
@@ -1521,9 +1734,13 @@ fn export_video(
 
     let mut rgba_frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::RGBA, width, height);
     let mut encode_frame = ffmpeg::frame::Video::new(pixel_format, width, height);
+    let mut generated_rgba = vec![0u8; width as usize * height as usize * 4];
+    let start = Instant::now();
 
-    for (index, frame) in frames.iter().enumerate() {
-        copy_rgba_into_frame(&mut rgba_frame, width, &frame.rgba);
+    for index in 0..frame_count {
+        check_canceled(cancel_flag)?;
+        rgba_provider(index, &mut generated_rgba)?;
+        copy_rgba_into_frame(&mut rgba_frame, width, &generated_rgba);
         scaler.run(&rgba_frame, &mut encode_frame).map_err(|err| {
             ScreenRecorderError::Export(format!("failed to convert frame for video export: {err}"))
         })?;
@@ -1539,6 +1756,19 @@ fn export_video(
             video_stream_time_base,
             false,
         )?;
+
+        if index % 10 == 0 || index + 1 == frame_count {
+            let elapsed = start.elapsed().as_secs_f32().max(0.001);
+            let fps = (index + 1) as f32 / elapsed;
+            let remaining_frames = frame_count.saturating_sub(index + 1) as f32;
+            let eta_ms = if fps > 0.0 {
+                Some(((remaining_frames / fps) * 1000.0) as u64)
+            } else {
+                None
+            };
+            let percent = 35.0 + (((index + 1) as f32 / frame_count.max(1) as f32) * 55.0);
+            emit_progress(progress_tx, ExportStage::VideoEncode, percent, fps, eta_ms);
+        }
     }
 
     video_encoder.send_eof().map_err(|err| {
@@ -1555,6 +1785,7 @@ fn export_video(
     if let (Some(audio), Some((audio_encoder, stream_index, stream_time_base))) =
         (mixed_audio, audio_state.as_mut())
     {
+        emit_progress(progress_tx, ExportStage::AudioEncode, 90.0, 0.0, None);
         encode_audio_samples(
             &mut output,
             audio_encoder,
@@ -1564,21 +1795,14 @@ fn export_video(
         )?;
     }
 
+    emit_progress(progress_tx, ExportStage::Mux, 95.0, 0.0, None);
     output.write_trailer().map_err(|err| {
         ScreenRecorderError::Export(format!("failed to write output trailer: {err}"))
     })?;
     Ok(())
 }
 
-fn validate_export_frames(frames: &[StoredFrame], require_even: bool) -> Result<(u32, u32)> {
-    if frames.is_empty() {
-        return Err(ScreenRecorderError::Export(
-            "video export requires at least one frame".to_string(),
-        ));
-    }
-
-    let width = frames[0].width;
-    let height = frames[0].height;
+fn validate_export_dimensions(width: u32, height: u32, require_even: bool) -> Result<()> {
     if width == 0 || height == 0 {
         return Err(ScreenRecorderError::Export(
             "video export requires non-zero frame dimensions".to_string(),
@@ -1591,22 +1815,101 @@ fn validate_export_frames(frames: &[StoredFrame], require_even: bool) -> Result<
         ));
     }
 
-    let expected_len = width as usize * height as usize * 4;
-    for frame in frames {
-        if frame.width != width || frame.height != height {
-            return Err(ScreenRecorderError::Export(format!(
-                "dynamic resolution is unsupported (expected {}x{}, got {}x{})",
-                width, height, frame.width, frame.height
-            )));
-        }
-        if frame.rgba.len() != expected_len {
-            return Err(ScreenRecorderError::Export(
-                "RGBA input size mismatch".to_string(),
-            ));
+    Ok(())
+}
+
+fn select_video_codec(
+    output: &ffmpeg::format::context::Output,
+    output_path: &Path,
+    format: ExportFormat,
+    hardware: HardwarePolicy,
+) -> Result<ffmpeg::Codec> {
+    if matches!(format, ExportFormat::Mp4) {
+        if !matches!(hardware, HardwarePolicy::SoftwareOnly) {
+            for name in ["h264_nvenc", "h264_qsv", "h264_amf"] {
+                if let Some(codec) = ffmpeg::encoder::find_by_name(name) {
+                    return Ok(codec);
+                }
+            }
+            if matches!(hardware, HardwarePolicy::RequireHardware) {
+                return Err(ScreenRecorderError::Export(
+                    "no hardware H.264 encoder is available".to_string(),
+                ));
+            }
         }
     }
 
-    Ok((width, height))
+    let container_video_codec = output
+        .format()
+        .codec(output_path, ffmpeg::media::Type::Video);
+    let preferred_video_codec = choose_video_codec_id(format);
+    ffmpeg::encoder::find(preferred_video_codec)
+        .or_else(|| ffmpeg::encoder::find(container_video_codec))
+        .ok_or_else(|| {
+            ScreenRecorderError::Export(format!(
+                "no video encoder available for {format:?} (preferred={preferred_video_codec:?}, container={container_video_codec:?})"
+            ))
+        })
+}
+
+fn effective_video_config(
+    video_config: &VideoEncodeConfig,
+    preset: ExportPreset,
+) -> VideoEncodeConfig {
+    let mut effective = video_config.clone();
+    match preset {
+        ExportPreset::Fast => {
+            effective.quality = effective.quality.saturating_sub(10);
+            effective.speed = VideoEncodingSpeed::UltraFast;
+        }
+        ExportPreset::Balanced => {}
+        ExportPreset::Quality => {
+            effective.quality = effective.quality.saturating_add(5).min(100);
+            effective.speed = VideoEncodingSpeed::Slow;
+        }
+    }
+    effective
+}
+
+fn should_use_x264_options(codec: &ffmpeg::Codec) -> bool {
+    codec.name().eq_ignore_ascii_case("libx264")
+}
+
+fn is_hardware_h264_encoder(codec: &ffmpeg::Codec) -> bool {
+    let name = codec.name().to_ascii_lowercase();
+    name.contains("nvenc") || name.contains("qsv") || name.contains("amf")
+}
+
+fn open_video_encoder(
+    video_encoder: ffmpeg::codec::encoder::video::Video,
+    codec: &ffmpeg::Codec,
+    video_config: &VideoEncodeConfig,
+    export_preset: ExportPreset,
+) -> Result<ffmpeg::encoder::video::Encoder> {
+    if should_use_x264_options(codec) {
+        let mut options = ffmpeg::Dictionary::new();
+        options.set("preset", x264_preset_for(video_config.speed, export_preset));
+        options.set(
+            "crf",
+            &quality_to_h264_crf(video_config.quality).to_string(),
+        );
+        return video_encoder.open_as_with(*codec, options).map_err(|err| {
+            ScreenRecorderError::Export(format!(
+                "failed to open video encoder with h264 options: {err}"
+            ))
+        });
+    }
+    video_encoder
+        .open_as(*codec)
+        .map_err(|err| ScreenRecorderError::Export(format!("failed to open video encoder: {err}")))
+}
+
+fn x264_preset_for(speed: VideoEncodingSpeed, export_preset: ExportPreset) -> &'static str {
+    match export_preset {
+        ExportPreset::Fast => VideoEncodingSpeed::UltraFast.as_x264_preset(),
+        ExportPreset::Balanced => speed.as_x264_preset(),
+        ExportPreset::Quality => VideoEncodingSpeed::Slow.as_x264_preset(),
+    }
 }
 
 fn drain_video_packets(
@@ -1845,38 +2148,31 @@ mod tests {
                 audio_bitrate_kbps: 192,
                 pause_intervals: Vec::new(),
             },
-            config: EditConfig::default(),
         }
     }
 
     #[test]
-    fn set_config_disables_unrecorded_audio_tracks() {
-        let mut editing = test_editing_session(false, false);
-        let mut config = EditConfig::default();
-        config.system_audio.enabled = true;
-        config.microphone_audio.enabled = true;
+    fn normalize_request_disables_unrecorded_audio_tracks() {
+        let editing = test_editing_session(false, false);
+        let mut request = editing.export_request();
+        request.system_audio.enabled = true;
+        request.microphone_audio.enabled = true;
 
-        editing
-            .set_config(config)
-            .expect("set_config should gracefully disable unavailable audio tracks");
-
-        assert!(!editing.config.system_audio.enabled);
-        assert!(!editing.config.microphone_audio.enabled);
+        let normalized = normalize_export_request(request, &editing.manifest);
+        assert!(!normalized.system_audio.enabled);
+        assert!(!normalized.microphone_audio.enabled);
     }
 
     #[test]
-    fn set_config_keeps_recorded_audio_tracks_enabled() {
-        let mut editing = test_editing_session(true, true);
-        let mut config = EditConfig::default();
-        config.system_audio.enabled = true;
-        config.microphone_audio.enabled = true;
+    fn normalize_request_keeps_recorded_audio_tracks_enabled() {
+        let editing = test_editing_session(true, true);
+        let mut request = editing.export_request();
+        request.system_audio.enabled = true;
+        request.microphone_audio.enabled = true;
 
-        editing
-            .set_config(config)
-            .expect("set_config should keep recorded audio tracks enabled");
-
-        assert!(editing.config.system_audio.enabled);
-        assert!(editing.config.microphone_audio.enabled);
+        let normalized = normalize_export_request(request, &editing.manifest);
+        assert!(normalized.system_audio.enabled);
+        assert!(normalized.microphone_audio.enabled);
     }
 
     #[test]

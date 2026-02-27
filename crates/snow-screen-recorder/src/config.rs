@@ -276,45 +276,79 @@ pub enum ExportFormat {
     Gif,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ExportConfig {
-    pub format: ExportFormat,
-    pub output_path: PathBuf,
-    pub video: VideoEncodeConfig,
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExportPreset {
+    Fast,
+    #[default]
+    Balanced,
+    Quality,
 }
 
-impl Default for ExportConfig {
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HardwarePolicy {
+    #[default]
+    Auto,
+    SoftwareOnly,
+    RequireHardware,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportPerformanceConfig {
+    pub preset: ExportPreset,
+    pub hardware: HardwarePolicy,
+    pub worker_queue_depth: usize,
+}
+
+impl Default for ExportPerformanceConfig {
     fn default() -> Self {
         Self {
-            format: ExportFormat::Mp4,
-            output_path: PathBuf::from("output.mp4"),
-            video: VideoEncodeConfig::default(),
+            preset: ExportPreset::Balanced,
+            hardware: HardwarePolicy::Auto,
+            worker_queue_depth: 8,
         }
     }
 }
 
+impl ExportPerformanceConfig {
+    pub fn validate(&self, prefix: &str) -> Result<(), String> {
+        if self.worker_queue_depth == 0 {
+            return Err(format!("{prefix}.worker_queue_depth must be > 0"));
+        }
+        if self.worker_queue_depth > 1024 {
+            return Err(format!("{prefix}.worker_queue_depth must be <= 1024"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EditConfig {
+pub struct ExportRequest {
     pub playback_speed: f32,
     pub system_audio: AudioEditConfig,
     pub microphone_audio: AudioEditConfig,
     pub mouse: MouseEditConfig,
-    pub export: ExportConfig,
+    pub format: ExportFormat,
+    pub output_path: PathBuf,
+    pub video: VideoEncodeConfig,
+    pub performance: ExportPerformanceConfig,
 }
 
-impl Default for EditConfig {
+impl Default for ExportRequest {
     fn default() -> Self {
         Self {
             playback_speed: 1.0,
             system_audio: AudioEditConfig::default(),
             microphone_audio: AudioEditConfig::default(),
             mouse: MouseEditConfig::default(),
-            export: ExportConfig::default(),
+            format: ExportFormat::Mp4,
+            output_path: PathBuf::from("output.mp4"),
+            video: VideoEncodeConfig::default(),
+            performance: ExportPerformanceConfig::default(),
         }
     }
 }
 
-impl EditConfig {
+impl ExportRequest {
     pub fn validate(&self) -> Result<(), String> {
         if !(0.25..=4.0).contains(&self.playback_speed) {
             return Err("playback_speed must be in 0.25..=4.0".to_string());
@@ -340,12 +374,12 @@ impl EditConfig {
             return Err("mouse.trail_thickness must be >= 0".to_string());
         }
 
-        if self.export.output_path.as_os_str().is_empty() {
-            return Err("export.output_path must not be empty".to_string());
+        if self.output_path.as_os_str().is_empty() {
+            return Err("output_path must not be empty".to_string());
         }
 
-        self.export.video.validate("export.video")?;
-
+        self.video.validate("video")?;
+        self.performance.validate("performance")?;
         Ok(())
     }
 }
@@ -355,33 +389,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edit_config_validation_checks_ranges() {
-        let mut cfg = EditConfig::default();
-        cfg.playback_speed = 0.1;
-        assert!(cfg.validate().is_err());
+    fn export_request_validation_checks_ranges() {
+        let mut req = ExportRequest::default();
+        req.playback_speed = 0.1;
+        assert!(req.validate().is_err());
 
-        cfg = EditConfig::default();
-        cfg.system_audio.volume = 2.5;
-        assert!(cfg.validate().is_err());
+        req = ExportRequest::default();
+        req.system_audio.volume = 2.5;
+        assert!(req.validate().is_err());
 
-        cfg = EditConfig::default();
-        cfg.microphone_audio.volume = 2.5;
-        assert!(cfg.validate().is_err());
+        req = ExportRequest::default();
+        req.microphone_audio.volume = 2.5;
+        assert!(req.validate().is_err());
 
-        cfg = EditConfig::default();
-        cfg.mouse.trail_window_ms = 0;
-        assert!(cfg.validate().is_err());
+        req = ExportRequest::default();
+        req.mouse.trail_window_ms = 0;
+        assert!(req.validate().is_err());
 
-        cfg = EditConfig::default();
-        cfg.mouse.trail_smooth_step_px = 0.0;
-        assert!(cfg.validate().is_err());
+        req = ExportRequest::default();
+        req.mouse.trail_smooth_step_px = 0.0;
+        assert!(req.validate().is_err());
 
-        cfg = EditConfig::default();
-        cfg.mouse.trail_thickness = -1;
-        assert!(cfg.validate().is_err());
+        req = ExportRequest::default();
+        req.mouse.trail_thickness = -1;
+        assert!(req.validate().is_err());
 
-        cfg = EditConfig::default();
-        cfg.export.video.quality = 101;
-        assert!(cfg.validate().is_err());
+        req = ExportRequest::default();
+        req.video.quality = 101;
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn export_request_validation_checks_worker_queue_depth() {
+        let mut request = ExportRequest::default();
+        request.performance.worker_queue_depth = 0;
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn export_request_validation_checks_output_path() {
+        let mut request = ExportRequest::default();
+        request.output_path = PathBuf::new();
+        assert!(request.validate().is_err());
     }
 }
