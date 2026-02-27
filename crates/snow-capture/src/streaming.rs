@@ -134,7 +134,39 @@ pub struct StreamHandle {
     buffer_depth: usize,
 }
 
+fn closed_receiver() -> mpsc::Receiver<CaptureEvent> {
+    let (dummy_tx, dummy_rx) = mpsc::sync_channel(1);
+    drop(dummy_tx);
+    dummy_rx
+}
+
 impl StreamHandle {
+    fn request_stop_and_join(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn take_receiver(&mut self) -> mpsc::Receiver<CaptureEvent> {
+        std::mem::replace(&mut self.receiver, closed_receiver())
+    }
+
+    fn note_consumed_event(&self, event: &CaptureEvent) {
+        if matches!(event, CaptureEvent::Frame(_)) {
+            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    fn recv_with_bookkeeping<E>(
+        &self,
+        result: Result<CaptureEvent, E>,
+    ) -> Result<CaptureEvent, E> {
+        let event = result?;
+        self.note_consumed_event(&event);
+        Ok(event)
+    }
+
     /// Start the streaming capture loop on a background thread.
     pub(crate) fn start(
         mut session: CaptureSession,
@@ -193,43 +225,27 @@ impl StreamHandle {
     ///
     /// **Note:** `buffer_fill` will no longer be updated after this call.
     pub fn into_receiver(mut self) -> mpsc::Receiver<CaptureEvent> {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
-        let this = std::mem::ManuallyDrop::new(self);
-        unsafe { std::ptr::read(&this.receiver) }
+        self.request_stop_and_join();
+        self.take_receiver()
     }
 
     /// Receive the next capture event, blocking until one is available
     /// or the channel disconnects. Automatically updates `buffer_fill`
     /// when a `Frame` event is consumed.
     pub fn recv(&self) -> Result<CaptureEvent, mpsc::RecvError> {
-        let event = self.receiver.recv()?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
-        Ok(event)
+        self.recv_with_bookkeeping(self.receiver.recv())
     }
 
     /// Try to receive a capture event without blocking. Automatically
     /// updates `buffer_fill` when a `Frame` event is consumed.
     pub fn try_recv(&self) -> Result<CaptureEvent, mpsc::TryRecvError> {
-        let event = self.receiver.try_recv()?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
-        Ok(event)
+        self.recv_with_bookkeeping(self.receiver.try_recv())
     }
 
     /// Receive a capture event with a timeout. Automatically updates
     /// `buffer_fill` when a `Frame` event is consumed.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, mpsc::RecvTimeoutError> {
-        let event = self.receiver.recv_timeout(timeout)?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
-        Ok(event)
+        self.recv_with_bookkeeping(self.receiver.recv_timeout(timeout))
     }
 
     /// exit on its next loop iteration.
@@ -256,9 +272,7 @@ impl StreamHandle {
 
     /// Check whether the stream thread is still running.
     pub fn is_running(&self) -> bool {
-        self.join_handle
-            .as_ref()
-            .map_or(false, |h| !h.is_finished())
+        self.join_handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// Get a reference to the live stream statistics.
@@ -280,26 +294,20 @@ impl StreamHandle {
     /// events. Returns an iterator over the final events so the
     /// recorder can flush its encoder without losing the tail frames.
     pub fn stop_and_drain(mut self) -> Vec<CaptureEvent> {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+        self.request_stop_and_join();
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
             events.push(event);
         }
         // Prevent Drop from joining again.
-        let _ = std::mem::ManuallyDrop::new(self);
+        std::mem::forget(self);
         events
     }
 }
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
+        self.request_stop_and_join();
     }
 }
 
@@ -579,18 +587,17 @@ impl AsyncStreamHandle {
         target: CaptureTarget,
         config: StreamConfig,
     ) -> CaptureResult<Self> {
-        let handle = StreamHandle::start(session, target, config)?;
-        let sync_rx = unsafe {
-            // Take the receiver out of the handle so we can bridge it.
-            // We'll reconstruct the handle without the receiver.
-            std::ptr::read(&handle.receiver)
-        };
-        // Prevent double-free of receiver in the original handle.
-        let handle = std::mem::ManuallyDrop::new(handle);
+        let mut handle = StreamHandle::start(session, target, config)?;
+        // Take the receiver out of the handle so we can bridge it.
+        // We'll reconstruct the handle without the receiver.
+        let sync_rx = handle.take_receiver();
         let stop_flag = handle.stop_flag.clone();
         let pause_flag = handle.pause_flag.clone();
         let stats = handle.stats.clone();
-        let join_handle_inner = unsafe { std::ptr::read(&handle.join_handle) };
+        let join_handle_inner = handle.join_handle.take();
+        // Avoid running `Drop` on the transient handle, which would
+        // stop the stream we are transferring into `inner`.
+        std::mem::forget(handle);
 
         let (async_tx, async_rx) = tokio::sync::mpsc::channel::<CaptureEvent>(32);
 
@@ -625,10 +632,8 @@ impl AsyncStreamHandle {
 
         // Reconstruct a StreamHandle that owns the thread but not the
         // sync receiver (which the bridge now owns).
-        let (dummy_tx, dummy_rx) = mpsc::sync_channel(1);
-        drop(dummy_tx);
         let inner = StreamHandle {
-            receiver: dummy_rx,
+            receiver: closed_receiver(),
             stop_flag,
             pause_flag,
             stats,

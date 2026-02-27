@@ -64,7 +64,6 @@ pub fn audio_anchor_from_first_packet(packet: &AudioPacket) -> TimestampAnchor {
     })
 }
 
-
 /// Build a [`TimestampAnchor`] from a known stream origin instant.
 ///
 /// This is the easiest way to align with `snow-capture`: pass the
@@ -214,7 +213,8 @@ mod tests {
         let anchor = audio_anchor_from_origin_instant(origin);
 
         let mut pkt = packet(480); // 10ms.
-        pkt.metadata.set_timing(origin.checked_add(Duration::from_millis(30)), None);
+        pkt.metadata
+            .set_timing(origin.checked_add(Duration::from_millis(30)), None);
 
         let ts = anchor.audio_stream_relative(&pkt);
         assert_eq!(ts.end, Duration::from_millis(30));

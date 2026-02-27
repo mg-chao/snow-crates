@@ -207,10 +207,6 @@ impl RecordingConfig {
             return Err("audio sample rate must be > 0".to_string());
         }
 
-        if !self.audio.microphone_enabled && !self.audio.system_audio_enabled {
-            return Ok(());
-        }
-
         Ok(())
     }
 }

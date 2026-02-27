@@ -269,9 +269,7 @@ impl CaptureSession {
     }
 
     pub fn capture_frame(&mut self, target: &CaptureTarget) -> CaptureResult<Frame> {
-        let mut frame = self.do_capture(target, None)?;
-        self.attach_cursor_metadata(&mut frame);
-        Ok(frame)
+        self.capture_frame_with_reuse(target, None)
     }
 
     pub fn capture_frame_reuse(
@@ -279,7 +277,15 @@ impl CaptureSession {
         target: &CaptureTarget,
         frame: Frame,
     ) -> CaptureResult<Frame> {
-        let mut frame = self.do_capture(target, Some(frame))?;
+        self.capture_frame_with_reuse(target, Some(frame))
+    }
+
+    fn capture_frame_with_reuse(
+        &mut self,
+        target: &CaptureTarget,
+        reuse: Option<Frame>,
+    ) -> CaptureResult<Frame> {
+        let mut frame = self.do_capture(target, reuse)?;
         self.attach_cursor_metadata(&mut frame);
         Ok(frame)
     }
@@ -387,30 +393,50 @@ impl CaptureSession {
         }
     }
 
+    fn get_or_create_capturer_in_map<K, F>(
+        map: &mut FxHashMap<K, Box<dyn MonitorCapturer>>,
+        key: K,
+        mode: CaptureMode,
+        create_capturer: F,
+    ) -> CaptureResult<&mut Box<dyn MonitorCapturer>>
+    where
+        K: Eq + std::hash::Hash,
+        F: FnOnce() -> CaptureResult<Box<dyn MonitorCapturer>>,
+    {
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut capturer = create_capturer()?;
+                capturer.set_capture_mode(mode);
+                Ok(entry.insert(capturer))
+            }
+        }
+    }
+
     fn get_or_create_capturer(
         &mut self,
         monitor: &MonitorId,
     ) -> CaptureResult<&mut Box<dyn MonitorCapturer>> {
-        let key = monitor.key();
-        if !self.capturers.contains_key(&key) {
-            let mut capturer = self.backend.create_monitor_capturer(monitor)?;
-            capturer.set_capture_mode(self.config.mode);
-            self.capturers.insert(key, capturer);
-        }
-        Ok(self.capturers.get_mut(&key).unwrap())
+        let backend = Arc::clone(&self.backend);
+        Self::get_or_create_capturer_in_map(
+            &mut self.capturers,
+            monitor.key(),
+            self.config.mode,
+            || backend.create_monitor_capturer(monitor),
+        )
     }
 
-    fn ensure_window_capturer(&mut self, window: &WindowId) -> CaptureResult<()> {
-        let key = window.key();
-
-        if self.window_capturers.contains_key(&key) {
-            return Ok(());
-        }
-
-        let mut capturer = self.backend.create_window_capturer(window)?;
-        capturer.set_capture_mode(self.config.mode);
-        self.window_capturers.insert(key, capturer);
-        Ok(())
+    fn get_or_create_window_capturer(
+        &mut self,
+        window: &WindowId,
+    ) -> CaptureResult<&mut Box<dyn MonitorCapturer>> {
+        let backend = Arc::clone(&self.backend);
+        Self::get_or_create_capturer_in_map(
+            &mut self.window_capturers,
+            window.key(),
+            self.config.mode,
+            || backend.create_window_capturer(window),
+        )
     }
 
     /// Shared capture-with-retry loop used by both monitor and window paths.
@@ -448,6 +474,12 @@ impl CaptureSession {
 
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
+        let stamp_frame = |frame: &mut Frame, capture_duration: std::time::Duration| {
+            frame.metadata.sequence = seq;
+            if frame.metadata.capture_duration.is_none() {
+                frame.metadata.capture_duration = Some(capture_duration);
+            }
+        };
 
         let cap_start = std::time::Instant::now();
         let first_result =
@@ -455,10 +487,7 @@ impl CaptureSession {
         let cap_dur = cap_start.elapsed();
         match first_result {
             Ok(mut frame) => {
-                frame.metadata.sequence = seq;
-                if frame.metadata.capture_duration.is_none() {
-                    frame.metadata.capture_duration = Some(cap_dur);
-                }
+                stamp_frame(&mut frame, cap_dur);
                 return Ok((frame, seq));
             }
             Err(error) if error.requires_worker_reset() && max_retries > 0 => {
@@ -473,10 +502,7 @@ impl CaptureSession {
             let retry_dur = retry_start.elapsed();
             match result {
                 Ok(mut frame) => {
-                    frame.metadata.sequence = seq;
-                    if frame.metadata.capture_duration.is_none() {
-                        frame.metadata.capture_duration = Some(retry_dur);
-                    }
+                    stamp_frame(&mut frame, retry_dur);
                     return Ok((frame, seq));
                 }
                 Err(error) if error.requires_worker_reset() && attempt + 1 < max_retries => {
@@ -490,15 +516,13 @@ impl CaptureSession {
     }
 
     fn do_capture(&mut self, target: &CaptureTarget, reuse: Option<Frame>) -> CaptureResult<Frame> {
-        match target {
-            CaptureTarget::Region(region) => return self.do_capture_region(region, reuse),
-            CaptureTarget::Window(window) => {
-                self.region_output_history_valid = false;
-                return self.do_capture_window(window, reuse);
-            }
-            _ => {}
+        if let CaptureTarget::Region(region) = target {
+            return self.do_capture_region(region, reuse);
         }
         self.region_output_history_valid = false;
+        if let CaptureTarget::Window(window) = target {
+            return self.do_capture_window(window, reuse);
+        }
 
         let monitor = self.resolve_target(target)?;
         let key = monitor.key();
@@ -522,8 +546,6 @@ impl CaptureSession {
         window: &WindowId,
         reuse: Option<Frame>,
     ) -> CaptureResult<Frame> {
-        self.ensure_window_capturer(window)?;
-
         let key = window.key();
         let last_history_seq = self.window_output_history.get(&key).copied();
         let window = *window;
@@ -531,12 +553,7 @@ impl CaptureSession {
         let (frame, seq) = self.capture_with_retry(
             reuse,
             last_history_seq,
-            |s| {
-                if !s.window_capturers.contains_key(&key) {
-                    s.ensure_window_capturer(&window)?;
-                }
-                Ok(s.window_capturers.get_mut(&key).unwrap())
-            },
+            |s| s.get_or_create_window_capturer(&window),
             |s| {
                 s.window_capturers.remove(&key);
                 s.window_output_history.remove(&key);

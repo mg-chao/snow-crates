@@ -331,10 +331,8 @@ fn for_each_dirty_region(
 
     if start_idx < count {
         for idx in start_idx..count {
-            if let Ok(raw) = regions.GetAt(idx) {
-                if !visit(raw) {
-                    return Some(mode);
-                }
+            if let Ok(raw) = regions.GetAt(idx) && !visit(raw) {
+                return Some(mode);
             }
         }
     }
@@ -1706,9 +1704,7 @@ impl WindowsGraphicsCaptureCapturer {
         capture_time: Instant,
         present_time_ticks: i64,
     ) -> Option<CaptureSampleMetadata> {
-        let Some(slot_idx) = self.region.pending_slot else {
-            return None;
-        };
+        let slot_idx = self.region.pending_slot?;
         if !self.region.slots[slot_idx].populated {
             return None;
         }
@@ -1955,13 +1951,12 @@ impl WindowsGraphicsCaptureCapturer {
             destination_has_history,
             source_is_duplicate,
             self.region.pending_slot.is_some(),
-        ) {
-            if let Some(sample) = self.try_short_circuit_region_duplicate(capture_time, time_ticks)
-            {
-                let _ = capture_frame.Close();
-                self.has_frame_history = true;
-                return Ok(sample);
-            }
+        ) && let Some(sample) =
+            self.try_short_circuit_region_duplicate(capture_time, time_ticks)
+        {
+            let _ = capture_frame.Close();
+            self.has_frame_history = true;
+            return Ok(sample);
         }
 
         let mut region_dirty_rects = std::mem::take(&mut self.region_dirty_rects_scratch);

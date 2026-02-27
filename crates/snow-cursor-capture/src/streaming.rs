@@ -3,8 +3,8 @@
 //! Runs a polling loop on a dedicated thread and delivers [`CursorEvent`]
 //! through a bounded crossbeam channel.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -44,11 +44,32 @@ pub struct CursorStreamHandle {
 }
 
 impl CursorStreamHandle {
+    #[inline]
+    fn set_stop(&self) {
+        self.stop_flag.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    fn set_pause(&self, paused: bool) {
+        self.pause_flag.store(paused, Ordering::Release);
+    }
+
+    #[inline]
+    fn paused(&self) -> bool {
+        self.pause_flag.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn running(&self) -> bool {
+        self.join_handle.as_ref().is_some_and(|j| !j.is_finished())
+    }
+
     /// Start a cursor capture polling loop on a background thread.
     ///
     /// Returns an error if the platform cursor sampler cannot be created.
     pub fn start(config: CursorStreamConfig) -> Result<Self, CursorCaptureError> {
         let sampler = CursorSampler::new()?;
+        let poll_interval = config.poll_interval;
         let (tx, rx) = cb::bounded(config.channel_capacity);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let pause_flag = Arc::new(AtomicBool::new(false));
@@ -59,12 +80,10 @@ impl CursorStreamHandle {
         let join_handle = std::thread::Builder::new()
             .name("snow-cursor-stream".into())
             .spawn(move || {
-                poll_loop(sampler, &config, &tx, &worker_stop, &worker_pause);
+                poll_loop(sampler, poll_interval, &tx, &worker_stop, &worker_pause);
             })
             .map_err(|e| {
-                CursorCaptureError::platform(format!(
-                    "failed to spawn cursor stream thread: {e}"
-                ))
+                CursorCaptureError::platform(format!("failed to spawn cursor stream thread: {e}"))
             })?;
 
         Ok(Self {
@@ -92,33 +111,33 @@ impl CursorStreamHandle {
 
     /// Signal the stream to stop.
     pub fn stop(&self) {
-        self.stop_flag.store(true, Ordering::Release);
+        self.set_stop();
     }
 
     /// Signal the stream to pause.
     pub fn pause(&self) {
-        self.pause_flag.store(true, Ordering::Release);
+        self.set_pause(true);
     }
 
     /// Signal the stream to resume.
     pub fn resume(&self) {
-        self.pause_flag.store(false, Ordering::Release);
+        self.set_pause(false);
     }
 
     /// Whether the stream is currently paused.
     pub fn is_paused(&self) -> bool {
-        self.pause_flag.load(Ordering::Acquire)
+        self.paused()
     }
 
     /// Whether the stream thread is still running.
     pub fn is_running(&self) -> bool {
-        self.join_handle.as_ref().is_some_and(|j| !j.is_finished())
+        self.running()
     }
 }
 
 impl Drop for CursorStreamHandle {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
+        self.set_stop();
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
         }
@@ -133,35 +152,35 @@ impl snow_core::streaming::StreamHandle<CursorEvent> for CursorStreamHandle {
     type RecvTimeoutError = cb::RecvTimeoutError;
 
     fn recv(&self) -> Result<CursorEvent, Self::RecvError> {
-        self.recv()
+        self.rx.recv()
     }
 
     fn try_recv(&self) -> Result<CursorEvent, Self::TryRecvError> {
-        self.try_recv()
+        self.rx.try_recv()
     }
 
     fn recv_timeout(&self, timeout: Duration) -> Result<CursorEvent, Self::RecvTimeoutError> {
-        self.recv_timeout(timeout)
+        self.rx.recv_timeout(timeout)
     }
 
     fn stop(&self) {
-        self.stop()
+        self.set_stop()
     }
 
     fn pause(&self) {
-        self.pause()
+        self.set_pause(true)
     }
 
     fn resume(&self) {
-        self.resume()
+        self.set_pause(false)
     }
 
     fn is_paused(&self) -> bool {
-        self.is_paused()
+        self.paused()
     }
 
     fn is_running(&self) -> bool {
-        self.is_running()
+        self.running()
     }
 }
 
@@ -172,12 +191,11 @@ impl snow_core::streaming::StreamHandle<CursorEvent> for CursorStreamHandle {
 
 fn poll_loop(
     mut sampler: CursorSampler,
-    config: &CursorStreamConfig,
+    poll_interval: Duration,
     tx: &cb::Sender<CursorEvent>,
     stop: &AtomicBool,
     pause: &AtomicBool,
 ) {
-    let mut was_paused = false;
     let mut pause_started: Option<Instant> = None;
 
     loop {
@@ -187,23 +205,18 @@ fn poll_loop(
         }
 
         if pause.load(Ordering::Acquire) {
-            if !was_paused {
-                was_paused = true;
+            if pause_started.is_none() {
                 let now = Instant::now();
                 pause_started = Some(now);
                 let _ = tx.send(CursorEvent::Paused { at: now });
             }
-            std::thread::sleep(config.poll_interval);
+            std::thread::sleep(poll_interval);
             continue;
         }
 
-        if was_paused {
-            was_paused = false;
+        if let Some(start) = pause_started.take() {
             let now = Instant::now();
-            let gap = pause_started
-                .map(|start| now.duration_since(start))
-                .unwrap_or_default();
-            pause_started = None;
+            let gap = now.duration_since(start);
             let _ = tx.send(CursorEvent::Resumed { at: now, gap });
         }
 
@@ -226,6 +239,6 @@ fn poll_loop(
             }
         }
 
-        std::thread::sleep(config.poll_interval);
+        std::thread::sleep(poll_interval);
     }
 }

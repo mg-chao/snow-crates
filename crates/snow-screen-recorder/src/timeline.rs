@@ -103,11 +103,7 @@ mod tests {
     /// strictly ordered so that the timeline sees a valid alternating
     /// pause/resume sequence.
     fn arb_pause_resume_pairs() -> impl Strategy<Value = Vec<(u64, u64)>> {
-        prop::collection::vec(
-            (1u64..500, 1u64..500),
-            1..=8,
-        )
-        .prop_map(|gaps| {
+        prop::collection::vec((1u64..500, 1u64..500), 1..=8).prop_map(|gaps| {
             let mut cursor: u64 = 0;
             let mut pairs = Vec::new();
             for (gap_before, pause_dur) in gaps {
@@ -181,4 +177,3 @@ mod tests {
         }
     }
 }
-

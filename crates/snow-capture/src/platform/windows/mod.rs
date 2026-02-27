@@ -17,6 +17,8 @@ use crate::error::{CaptureError, CaptureErrorClass, CaptureResult};
 use crate::monitor::MonitorId;
 use crate::window::WindowId;
 
+const AUTO_KIND_ERROR: &str = "auto backend selection is handled separately";
+
 pub(crate) struct WindowsBackend {
     resolver: Arc<monitor::MonitorResolver>,
     kind: CaptureBackendKind,
@@ -43,9 +45,7 @@ impl WindowsBackend {
         monitor: &MonitorId,
     ) -> CaptureResult<Box<dyn MonitorCapturer>> {
         match kind {
-            CaptureBackendKind::Auto => Err(CaptureError::InvalidConfig(
-                "auto backend selection is handled separately".to_string(),
-            )),
+            CaptureBackendKind::Auto => Err(auto_kind_error()),
             CaptureBackendKind::DxgiDuplication => Ok(Box::new(
                 duplication::WindowsMonitorCapturer::new(monitor, self.resolver.clone())?,
             )),
@@ -65,9 +65,7 @@ impl WindowsBackend {
         window: &WindowId,
     ) -> CaptureResult<Box<dyn MonitorCapturer>> {
         match kind {
-            CaptureBackendKind::Auto => Err(CaptureError::InvalidConfig(
-                "auto backend selection is handled separately".to_string(),
-            )),
+            CaptureBackendKind::Auto => Err(auto_kind_error()),
             CaptureBackendKind::DxgiDuplication => Ok(Box::new(
                 duplication::WindowsDxgiWindowCapturer::new(window, self.resolver.clone())?,
             )),
@@ -122,17 +120,16 @@ impl WindowsBackend {
     }
 }
 
+fn auto_kind_error() -> CaptureError {
+    CaptureError::InvalidConfig(AUTO_KIND_ERROR.to_string())
+}
+
 fn format_backend_errors(errors: &[(CaptureBackendKind, CaptureError)]) -> String {
-    let mut combined = String::new();
-    for (index, (kind, error)) in errors.iter().enumerate() {
-        if index != 0 {
-            combined.push_str("; ");
-        }
-        combined.push_str(kind.as_str());
-        combined.push_str(": ");
-        combined.push_str(&error.to_string());
-    }
-    combined
+    errors
+        .iter()
+        .map(|(kind, error)| format!("{}: {error}", kind.as_str()))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl CaptureBackend for WindowsBackend {

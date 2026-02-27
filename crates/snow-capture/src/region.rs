@@ -99,29 +99,34 @@ impl MonitorLayout {
         region: &CaptureRegion,
     ) -> Vec<(MonitorGeometry, CaptureRegion)> {
         let mut result = Vec::new();
-        let r_right = region.right();
-        let r_bottom = region.bottom();
-
         for mon in &self.monitors {
-            let m_right = mon.x.saturating_add(mon.width as i32);
-            let m_bottom = mon.y.saturating_add(mon.height as i32);
-
-            let ix = region.x.max(mon.x);
-            let iy = region.y.max(mon.y);
-            let ix2 = r_right.min(m_right);
-            let iy2 = r_bottom.min(m_bottom);
-
-            if ix < ix2 && iy < iy2 {
-                let intersection = CaptureRegion {
-                    x: ix,
-                    y: iy,
-                    width: (ix2 - ix) as u32,
-                    height: (iy2 - iy) as u32,
-                };
+            if let Some(intersection) = monitor_intersection(region, mon) {
                 result.push((mon.clone(), intersection));
             }
         }
         result
+    }
+}
+
+fn monitor_intersection(region: &CaptureRegion, monitor: &MonitorGeometry) -> Option<CaptureRegion> {
+    let ix = region.x.max(monitor.x);
+    let iy = region.y.max(monitor.y);
+    let ix2 = region
+        .right()
+        .min(monitor.x.saturating_add(monitor.width as i32));
+    let iy2 = region
+        .bottom()
+        .min(monitor.y.saturating_add(monitor.height as i32));
+
+    if ix < ix2 && iy < iy2 {
+        Some(CaptureRegion {
+            x: ix,
+            y: iy,
+            width: (ix2 - ix) as u32,
+            height: (iy2 - iy) as u32,
+        })
+    } else {
+        None
     }
 }
 

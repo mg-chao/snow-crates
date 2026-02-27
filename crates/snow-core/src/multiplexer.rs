@@ -5,8 +5,8 @@
 //! into a single output channel with audio-priority pre-drain, command fan-out,
 //! timeout-based disconnect detection, and completion signaling.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -145,12 +145,7 @@ impl<O: Send + 'static> StreamMultiplexerBuilder<O> {
     /// - `source`: per-source configuration (id, channel capacity, send timeout).
     /// - `handle`: the leaf streaming handle that produces events of type `E`.
     /// - `mapper`: transforms a `TaggedEvent<E>` into zero or more output events.
-    pub fn register<E, H, F>(
-        &mut self,
-        source: SourceConfig,
-        handle: H,
-        mapper: F,
-    ) -> &mut Self
+    pub fn register<E, H, F>(&mut self, source: SourceConfig, handle: H, mapper: F) -> &mut Self
     where
         E: StreamEvent,
         H: StreamHandle<E> + 'static,
@@ -341,19 +336,21 @@ fn forwarding_thread<E, H, F, O>(
 
         let mapped = mapper(tagged);
 
-        if !mapped.is_empty() {
-            if tx.send_timeout(SourceMsg::Events(mapped), send_timeout).is_err() {
-                // Channel full or disconnected 鈥?drop events.
-                if is_terminal {
-                    let _ = tx.send_timeout(SourceMsg::StreamEnded, send_timeout);
-                    break;
-                }
-                continue;
+        if !mapped.is_empty()
+            && tx
+                .send_timeout(SourceMsg::Events(mapped), send_timeout)
+                .is_err()
+        {
+            // Channel full or disconnected 鈥?drop events.
+            if is_terminal {
+                send_stream_ended(&tx, send_timeout);
+                break;
             }
+            continue;
         }
 
         if is_terminal {
-            let _ = tx.send_timeout(SourceMsg::StreamEnded, send_timeout);
+            send_stream_ended(&tx, send_timeout);
             break;
         }
     }
@@ -377,16 +374,14 @@ fn main_loop<O: Send + 'static>(
     let total_sources = alive.len();
     let mut terminated_count: usize = 0;
     let mut stop_requested = false;
+    let mut priority_bootstrap = config.priority_source.is_some();
 
     let priority_source = config.priority_source;
 
     loop {
         // Check for commands (non-blocking) and fan out to all alive sources.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            // Fan out the command to all alive source forwarding threads.
-            for (_sid, cmd_tx) in &alive_cmd_txs {
-                let _ = cmd_tx.send(cmd);
-            }
+            fanout_command(&alive_cmd_txs, cmd);
             if cmd == MuxCommand::Stop {
                 stop_requested = true;
             }
@@ -403,68 +398,88 @@ fn main_loop<O: Send + 'static>(
             );
             // Check for panicked forwarders among remaining joins.
             check_panicked_forwarders(&mut joins, &status_tx, &mut terminated_count);
-            if terminated_count >= total_sources {
-                let _ = status_tx.send(MuxStatus::Completed);
-            }
+            let _ = complete_if_done(total_sources, terminated_count, alive.len(), &status_tx);
             break;
         }
 
+        let per_source_timeout = if alive.is_empty() {
+            config.select_timeout.max(Duration::from_millis(1))
+        } else {
+            (config.select_timeout / (alive.len() as u32)).max(Duration::from_millis(1))
+        };
+
         // Audio-priority pre-drain.
-        if let Some(prio_id) = priority_source {
-            if let Some(prio_idx) = alive.iter().position(|(id, _)| *id == prio_id) {
-                for _ in 0..config.priority_drain_batch {
-                    match alive[prio_idx].1.try_recv() {
-                        Ok(SourceMsg::Events(events)) => {
-                            for item in events {
-                                send_output(
-                                    &output_tx,
-                                    item,
-                                    config.output_send_timeout,
-                                    &drop_counter,
-                                );
+        if let Some(prio_id) = priority_source
+            && let Some(prio_idx) = alive.iter().position(|(id, _)| *id == prio_id)
+        {
+            let mut drained = 0usize;
+            while drained < config.priority_drain_batch {
+                let prio_msg = match alive[prio_idx].1.try_recv() {
+                    Ok(msg) => Some(msg),
+                    // On startup, wait once for the priority source so
+                    // non-priority events don't win an initial scheduling race.
+                    Err(TryRecvError::Empty) if priority_bootstrap && drained == 0 => {
+                        match alive[prio_idx].1.recv_timeout(per_source_timeout) {
+                            Ok(msg) => Some(msg),
+                            Err(RecvTimeoutError::Timeout) => None,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                check_forwarder_panic(&mut joins, prio_id, &status_tx);
+                                terminated_count += 1;
+                                remove_source_at(&mut alive, &mut alive_cmd_txs, prio_idx);
+                                break;
                             }
                         }
-                        Ok(SourceMsg::StreamEnded) => {
-                            let _ = status_tx.send(MuxStatus::SourceEnded(prio_id));
-                            terminated_count += 1;
-                            remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
-                            break;
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            check_forwarder_panic(&mut joins, prio_id, &status_tx);
-                            terminated_count += 1;
-                            remove_source(&mut alive, &mut alive_cmd_txs, prio_id);
-                            break;
-                        }
+                    }
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        check_forwarder_panic(&mut joins, prio_id, &status_tx);
+                        terminated_count += 1;
+                        remove_source_at(&mut alive, &mut alive_cmd_txs, prio_idx);
+                        break;
+                    }
+                };
+
+                let Some(prio_msg) = prio_msg else {
+                    break;
+                };
+
+                match prio_msg {
+                    SourceMsg::Events(events) => {
+                        forward_events(
+                            events,
+                            &output_tx,
+                            config.output_send_timeout,
+                            &drop_counter,
+                        );
+                        drained += 1;
+                    }
+                    SourceMsg::StreamEnded => {
+                        let _ = status_tx.send(MuxStatus::SourceEnded(prio_id));
+                        terminated_count += 1;
+                        remove_source_at(&mut alive, &mut alive_cmd_txs, prio_idx);
+                        break;
                     }
                 }
             }
         }
+        priority_bootstrap = false;
 
         // Check completion after priority drain.
-        if terminated_count >= total_sources || alive.is_empty() {
-            let _ = status_tx.send(MuxStatus::Completed);
+        if complete_if_done(total_sources, terminated_count, alive.len(), &status_tx) {
             break;
         }
-
-        // Blocking select: poll all alive sources with timeout.
-        let per_source_timeout = (config.select_timeout / (alive.len() as u32))
-            .max(Duration::from_millis(1));
 
         let mut to_remove: SmallVec<[usize; 4]> = SmallVec::new();
 
         for (idx, (sid, rx)) in alive.iter().enumerate() {
             match rx.recv_timeout(per_source_timeout) {
                 Ok(SourceMsg::Events(events)) => {
-                    for item in events {
-                        send_output(
-                            &output_tx,
-                            item,
-                            config.output_send_timeout,
-                            &drop_counter,
-                        );
-                    }
+                    forward_events(
+                        events,
+                        &output_tx,
+                        config.output_send_timeout,
+                        &drop_counter,
+                    );
                 }
                 Ok(SourceMsg::StreamEnded) => {
                     let _ = status_tx.send(MuxStatus::SourceEnded(*sid));
@@ -482,13 +497,11 @@ fn main_loop<O: Send + 'static>(
 
         // Remove terminated sources (reverse order to preserve indices).
         for &idx in to_remove.iter().rev() {
-            let (sid, _) = alive.remove(idx);
-            alive_cmd_txs.retain(|(id, _)| *id != sid);
+            remove_source_at(&mut alive, &mut alive_cmd_txs, idx);
         }
 
         // Check completion.
-        if terminated_count >= total_sources || alive.is_empty() {
-            let _ = status_tx.send(MuxStatus::Completed);
+        if complete_if_done(total_sources, terminated_count, alive.len(), &status_tx) {
             break;
         }
     }
@@ -499,13 +512,53 @@ fn main_loop<O: Send + 'static>(
 // ---------------------------------------------------------------------------
 
 /// Remove a source from both the alive receivers and command sender lists.
-fn remove_source<O>(
+///
+/// Uses index-based removal so duplicate `SourceId` registrations are handled
+/// independently.
+fn remove_source_at<O>(
     alive: &mut Vec<(SourceId, Receiver<SourceMsg<O>>)>,
     alive_cmd_txs: &mut Vec<(SourceId, Sender<MuxCommand>)>,
+    idx: usize,
+) {
+    if idx >= alive.len() {
+        return;
+    }
+
+    let (sid, _) = alive.remove(idx);
+    remove_one_cmd_tx(alive_cmd_txs, idx, sid);
+}
+
+/// Returns true when all sources have terminated or no sources remain alive.
+fn should_complete(total_sources: usize, terminated_count: usize, alive_len: usize) -> bool {
+    terminated_count >= total_sources || alive_len == 0
+}
+
+/// Emit `Completed` when all sources have terminated.
+fn complete_if_done(
+    total_sources: usize,
+    terminated_count: usize,
+    alive_len: usize,
+    status_tx: &Sender<MuxStatus>,
+) -> bool {
+    if should_complete(total_sources, terminated_count, alive_len) {
+        let _ = status_tx.send(MuxStatus::Completed);
+        return true;
+    }
+    false
+}
+
+/// Remove one command sender entry for the removed source.
+fn remove_one_cmd_tx(
+    alive_cmd_txs: &mut Vec<(SourceId, Sender<MuxCommand>)>,
+    idx: usize,
     sid: SourceId,
 ) {
-    alive.retain(|(id, _)| *id != sid);
-    alive_cmd_txs.retain(|(id, _)| *id != sid);
+    if idx < alive_cmd_txs.len() {
+        let _ = alive_cmd_txs.remove(idx);
+    } else if let Some(cmd_idx) = alive_cmd_txs.iter().position(|(id, _)| *id == sid) {
+        // Vectors can be temporarily out of sync; remove only one entry.
+        let _ = alive_cmd_txs.remove(cmd_idx);
+    }
 }
 
 /// Drain remaining events during shutdown, prioritizing the audio source.
@@ -518,22 +571,23 @@ fn shutdown_drain<O: Send + 'static>(
     terminated_count: &mut usize,
 ) {
     // Phase 1: Drain priority source first.
-    if let Some(prio_id) = config.priority_source {
-        if let Some(prio_idx) = alive.iter().position(|(id, _)| *id == prio_id) {
-            drain_source(
-                &alive[prio_idx],
-                output_tx,
-                status_tx,
-                drop_counter,
-                config.output_send_timeout,
-                terminated_count,
-            );
-        }
+    let priority_idx = config
+        .priority_source
+        .and_then(|prio_id| alive.iter().position(|(id, _)| *id == prio_id));
+    if let Some(prio_idx) = priority_idx {
+        drain_source(
+            &alive[prio_idx],
+            output_tx,
+            status_tx,
+            drop_counter,
+            config.output_send_timeout,
+            terminated_count,
+        );
     }
 
     // Phase 2: Drain remaining sources.
-    for source in alive.iter() {
-        if config.priority_source == Some(source.0) {
+    for (idx, source) in alive.iter().enumerate() {
+        if Some(idx) == priority_idx {
             continue;
         }
         drain_source(
@@ -560,9 +614,7 @@ fn drain_source<O>(
     loop {
         match rx.try_recv() {
             Ok(SourceMsg::Events(events)) => {
-                for item in events {
-                    send_output(output_tx, item, send_timeout, drop_counter);
-                }
+                forward_events(events, output_tx, send_timeout, drop_counter);
             }
             Ok(SourceMsg::StreamEnded) => {
                 let _ = status_tx.send(MuxStatus::SourceEnded(*sid));
@@ -605,7 +657,6 @@ fn check_forwarder_panic(
     }
 }
 
-
 /// Check all remaining join handles for panicked forwarders.
 fn check_panicked_forwarders(
     joins: &mut Vec<(SourceId, thread::JoinHandle<()>)>,
@@ -626,6 +677,30 @@ fn check_panicked_forwarders(
         }
     }
     *joins = unfinished;
+}
+
+/// Forward a batch of mapped source events to the merged output.
+fn forward_events<O>(
+    events: SmallVec<[O; 2]>,
+    output_tx: &Sender<O>,
+    send_timeout: Duration,
+    drop_counter: &Arc<AtomicU64>,
+) {
+    for item in events {
+        send_output(output_tx, item, send_timeout, drop_counter);
+    }
+}
+
+/// Fan out one command to all active source forwarding threads.
+fn fanout_command(alive_cmd_txs: &[(SourceId, Sender<MuxCommand>)], cmd: MuxCommand) {
+    for (_sid, cmd_tx) in alive_cmd_txs {
+        let _ = cmd_tx.send(cmd);
+    }
+}
+
+/// Best-effort notification that a source reached terminal state.
+fn send_stream_ended<O>(tx: &Sender<SourceMsg<O>>, send_timeout: Duration) {
+    let _ = tx.send_timeout(SourceMsg::StreamEnded, send_timeout);
 }
 
 /// Send an output item with timeout. Drops and increments counter on failure.
@@ -698,7 +773,9 @@ mod tests {
         type RecvTimeoutError = crate::error::RecvTimeoutError;
 
         fn recv(&self) -> Result<MockEvent, Self::RecvError> {
-            self.rx.recv().map_err(|_| crate::error::RecvError::Disconnected)
+            self.rx
+                .recv()
+                .map_err(|_| crate::error::RecvError::Disconnected)
         }
 
         fn try_recv(&self) -> Result<MockEvent, Self::TryRecvError> {
@@ -711,17 +788,19 @@ mod tests {
         fn recv_timeout(&self, timeout: Duration) -> Result<MockEvent, Self::RecvTimeoutError> {
             self.rx.recv_timeout(timeout).map_err(|e| match e {
                 cbc::RecvTimeoutError::Timeout => crate::error::RecvTimeoutError::Timeout,
-                cbc::RecvTimeoutError::Disconnected => {
-                    crate::error::RecvTimeoutError::Disconnected
-                }
+                cbc::RecvTimeoutError::Disconnected => crate::error::RecvTimeoutError::Disconnected,
             })
         }
 
         fn stop(&self) {}
         fn pause(&self) {}
         fn resume(&self) {}
-        fn is_paused(&self) -> bool { false }
-        fn is_running(&self) -> bool { true }
+        fn is_paused(&self) -> bool {
+            false
+        }
+        fn is_running(&self) -> bool {
+            true
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -879,7 +958,9 @@ mod tests {
         type RecvTimeoutError = crate::error::RecvTimeoutError;
 
         fn recv(&self) -> Result<MockEvent, Self::RecvError> {
-            self.rx.recv().map_err(|_| crate::error::RecvError::Disconnected)
+            self.rx
+                .recv()
+                .map_err(|_| crate::error::RecvError::Disconnected)
         }
 
         fn try_recv(&self) -> Result<MockEvent, Self::TryRecvError> {
@@ -892,9 +973,7 @@ mod tests {
         fn recv_timeout(&self, timeout: Duration) -> Result<MockEvent, Self::RecvTimeoutError> {
             self.rx.recv_timeout(timeout).map_err(|e| match e {
                 cbc::RecvTimeoutError::Timeout => crate::error::RecvTimeoutError::Timeout,
-                cbc::RecvTimeoutError::Disconnected => {
-                    crate::error::RecvTimeoutError::Disconnected
-                }
+                cbc::RecvTimeoutError::Disconnected => crate::error::RecvTimeoutError::Disconnected,
             })
         }
 
@@ -910,8 +989,12 @@ mod tests {
             self.commands.lock().unwrap().push(MuxCommand::Resume);
         }
 
-        fn is_paused(&self) -> bool { false }
-        fn is_running(&self) -> bool { true }
+        fn is_paused(&self) -> bool {
+            false
+        }
+        fn is_running(&self) -> bool {
+            true
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -919,10 +1002,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn arb_mux_command() -> impl Strategy<Value = MuxCommand> {
-        prop_oneof![
-            Just(MuxCommand::Pause),
-            Just(MuxCommand::Resume),
-        ]
+        prop_oneof![Just(MuxCommand::Pause), Just(MuxCommand::Resume),]
     }
 
     fn arb_command_sequence() -> impl Strategy<Value = Vec<MuxCommand>> {
@@ -1555,7 +1635,6 @@ mod tests {
         }
     }
 
-
     // -----------------------------------------------------------------------
     // Unit tests for multiplexer builder and runtime (Task 1.10)
     // -----------------------------------------------------------------------
@@ -1601,15 +1680,10 @@ mod tests {
             })
         }
 
-        fn recv_timeout(
-            &self,
-            timeout: Duration,
-        ) -> Result<MockEvent, Self::RecvTimeoutError> {
+        fn recv_timeout(&self, timeout: Duration) -> Result<MockEvent, Self::RecvTimeoutError> {
             let event = self.rx.recv_timeout(timeout).map_err(|e| match e {
                 cbc::RecvTimeoutError::Timeout => crate::error::RecvTimeoutError::Timeout,
-                cbc::RecvTimeoutError::Disconnected => {
-                    crate::error::RecvTimeoutError::Disconnected
-                }
+                cbc::RecvTimeoutError::Disconnected => crate::error::RecvTimeoutError::Disconnected,
             })?;
             if !event.terminal {
                 panic!("PanickingHandle: intentional panic for testing");
@@ -1784,10 +1858,7 @@ mod tests {
         // We can't use MockHandle::with_events because it keeps _tx alive.
         // Instead, create a struct directly with a dummy tx that we won't use.
         let (dummy_tx, _dummy_rx) = cbc::bounded::<MockEvent>(1);
-        let handle = MockHandle {
-            rx,
-            _tx: dummy_tx,
-        };
+        let handle = MockHandle { rx, _tx: dummy_tx };
         let sid = SourceId(0);
 
         builder.register(
@@ -1935,10 +2006,7 @@ mod tests {
         let (tx, rx) = cbc::bounded::<MockEvent>(1);
         drop(tx); // Disconnect immediately.
         let (dummy_tx, _dummy_rx) = cbc::bounded::<MockEvent>(1);
-        let handle = MockHandle {
-            rx,
-            _tx: dummy_tx,
-        };
+        let handle = MockHandle { rx, _tx: dummy_tx };
 
         builder.register(
             SourceConfig {

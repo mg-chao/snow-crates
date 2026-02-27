@@ -117,9 +117,9 @@ mod tests {
     /// Strategy to generate an arbitrary `StreamTimestamp`.
     fn arb_stream_timestamp() -> impl Strategy<Value = StreamTimestamp> {
         (
-            prop::bool::ANY,       // use_raw_ticks
-            any::<i64>(),          // raw_os_ticks value
-            prop::bool::ANY,       // tick_format selector
+            prop::bool::ANY, // use_raw_ticks
+            any::<i64>(),    // raw_os_ticks value
+            prop::bool::ANY, // tick_format selector
         )
             .prop_map(|(use_raw, ticks, is_hns100)| StreamTimestamp {
                 instant: Instant::now(),

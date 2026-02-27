@@ -151,7 +151,7 @@ impl EditingSession {
 fn choose_export_fps(record_fps: u32, format: ExportFormat) -> u32 {
     let fps = record_fps.max(1);
     if matches!(format, ExportFormat::Gif) {
-        fps.min(20).max(1)
+        fps.min(20)
     } else {
         fps
     }
@@ -1142,7 +1142,7 @@ fn read_pcm_i16(path: &Path, channels: u16) -> Result<Vec<i16>> {
 
 fn mix_audio_tracks_i16_interleaved(tracks: &[(Vec<i16>, f32)], channels: u16) -> Vec<i16> {
     let channels_usize = usize::from(channels.max(1));
-    if channels_usize == 0 || tracks.is_empty() {
+    if tracks.is_empty() {
         return Vec::new();
     }
 
@@ -1174,7 +1174,7 @@ fn mix_audio_tracks_i16_interleaved(tracks: &[(Vec<i16>, f32)], channels: u16) -
 
 fn retime_audio_i16_interleaved(samples: &[i16], channels: u16, playback_speed: f32) -> Vec<i16> {
     let channels_usize = usize::from(channels.max(1));
-    if channels_usize == 0 || samples.is_empty() {
+    if samples.is_empty() {
         return Vec::new();
     }
 
@@ -1205,8 +1205,6 @@ fn retime_audio_i16_interleaved(samples: &[i16], channels: u16, playback_speed: 
     }
     out
 }
-
-
 
 fn choose_video_codec_id(format: ExportFormat) -> ffmpeg::codec::Id {
     match format {

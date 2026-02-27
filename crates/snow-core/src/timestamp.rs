@@ -86,7 +86,8 @@ impl TimestampAnchor {
                     let delta = (current - origin).max(0);
                     let secs = delta / self.qpc_frequency;
                     let remainder = delta % self.qpc_frequency;
-                    let nanos = (remainder as i128 * 1_000_000_000 / self.qpc_frequency as i128) as u32;
+                    let nanos =
+                        (remainder as i128 * 1_000_000_000 / self.qpc_frequency as i128) as u32;
                     Duration::new(secs as u64, nanos)
                 }
                 TickFormat::Hns100 => {

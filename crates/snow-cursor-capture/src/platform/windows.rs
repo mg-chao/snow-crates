@@ -201,14 +201,34 @@ fn extract_monochrome_shape(hotspot_x: u32, hotspot_y: u32, mask: HBITMAP) -> Op
 /// Computes the overlapping rows and columns between a color bitmap and its
 /// AND-mask. Returns `None` when the overlap is empty.
 fn mask_overlap(width: u32, height: u32, mask_width: u32, mask_height: u32) -> Option<(u32, u32)> {
-    let and_height = if mask_height >= height.saturating_mul(2) {
-        height
-    } else {
-        mask_height.min(height)
-    };
-    let rows = and_height.min(height);
+    let rows = mask_height.min(height);
     let cols = mask_width.min(width);
-    if rows == 0 || cols == 0 { None } else { Some((rows, cols)) }
+    if rows == 0 || cols == 0 {
+        None
+    } else {
+        Some((rows, cols))
+    }
+}
+
+fn checked_rgba_len(width: u32, height: u32) -> Option<usize> {
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)
+}
+
+fn validated_mask_scan_region(
+    width: u32,
+    height: u32,
+    mask_width: u32,
+    mask_height: u32,
+    mask_rgba: &[u8],
+) -> Option<(u32, u32)> {
+    let (rows, cols) = mask_overlap(width, height, mask_width, mask_height)?;
+    let mask_len = checked_rgba_len(mask_width, rows)?;
+    if mask_rgba.len() < mask_len {
+        return None;
+    }
+    Some((rows, cols))
 }
 
 fn pixel_is_set(pixel: &[u8]) -> bool {
@@ -233,21 +253,28 @@ fn apply_mask_alpha(
     mask_height: u32,
     mask_rgba: &[u8],
 ) -> bool {
-    let Some((rows, cols)) = mask_overlap(width, height, mask_width, mask_height) else {
+    let Some((rows, cols)) =
+        validated_mask_scan_region(width, height, mask_width, mask_height, mask_rgba)
+    else {
         return false;
     };
+
+    let Some(rgba_len) = checked_rgba_len(width, rows) else {
+        return false;
+    };
+    if rgba.len() < rgba_len {
+        return false;
+    }
 
     for y in 0..rows {
         for x in 0..cols {
             let idx = ((y * mask_width + x) * 4) as usize;
-            if idx + 3 >= mask_rgba.len() {
-                return false;
-            }
             let dst = ((y * width + x) * 4 + 3) as usize;
-            if dst >= rgba.len() {
-                return false;
-            }
-            rgba[dst] = if pixel_is_set(&mask_rgba[idx..idx + 4]) { 255 } else { 0 };
+            rgba[dst] = if pixel_is_set(&mask_rgba[idx..idx + 4]) {
+                255
+            } else {
+                0
+            };
         }
     }
 
@@ -288,16 +315,15 @@ fn mask_has_set_bits(
     mask_height: u32,
     mask_rgba: &[u8],
 ) -> bool {
-    let Some((rows, cols)) = mask_overlap(width, height, mask_width, mask_height) else {
+    let Some((rows, cols)) =
+        validated_mask_scan_region(width, height, mask_width, mask_height, mask_rgba)
+    else {
         return false;
     };
 
     for y in 0..rows {
         for x in 0..cols {
             let idx = ((y * mask_width + x) * 4) as usize;
-            if idx + 3 >= mask_rgba.len() {
-                return false;
-            }
             if pixel_is_set(&mask_rgba[idx..idx + 4]) {
                 return true;
             }
@@ -359,14 +385,16 @@ fn read_bitmap_rgba(bitmap: HBITMAP) -> Option<(u32, u32, Vec<u8>)> {
     let pixels = (width as usize).checked_mul(height as usize)?;
     let mut bgra = vec![0u8; pixels.checked_mul(4)?];
 
-    let mut bmi = BITMAPINFO::default();
-    bmi.bmiHeader = BITMAPINFOHEADER {
-        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: width as i32,
-        biHeight: -(height as i32),
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: BI_RGB.0,
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

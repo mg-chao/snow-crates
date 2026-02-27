@@ -17,6 +17,13 @@ pub(crate) struct NotificationState {
     topology_changed: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NotificationChanges {
+    pub render_default_changed: bool,
+    pub capture_default_changed: bool,
+    pub topology_changed: bool,
+}
+
 impl NotificationState {
     pub fn take_render_default_changed(&self) -> bool {
         self.render_default_changed.swap(false, Ordering::AcqRel)
@@ -28,6 +35,14 @@ impl NotificationState {
 
     pub fn take_topology_changed(&self) -> bool {
         self.topology_changed.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn take_changes(&self) -> NotificationChanges {
+        NotificationChanges {
+            render_default_changed: self.take_render_default_changed(),
+            capture_default_changed: self.take_capture_default_changed(),
+            topology_changed: self.take_topology_changed(),
+        }
     }
 }
 
@@ -80,36 +95,17 @@ struct NotificationClient {
     control_event: Arc<EventHandle>,
 }
 
-#[allow(non_snake_case)]
-impl IMMNotificationClient_Impl for NotificationClient_Impl {
-    fn OnDeviceStateChanged(
-        &self,
-        _pwstrdeviceid: &PCWSTR,
-        _dwnewstate: DEVICE_STATE,
-    ) -> windows::core::Result<()> {
-        self.state.topology_changed.store(true, Ordering::Release);
+impl NotificationClient {
+    fn signal_control(&self) {
         let _ = self.control_event.set();
-        Ok(())
     }
 
-    fn OnDeviceAdded(&self, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+    fn mark_topology_changed(&self) {
         self.state.topology_changed.store(true, Ordering::Release);
-        let _ = self.control_event.set();
-        Ok(())
+        self.signal_control();
     }
 
-    fn OnDeviceRemoved(&self, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
-        self.state.topology_changed.store(true, Ordering::Release);
-        let _ = self.control_event.set();
-        Ok(())
-    }
-
-    fn OnDefaultDeviceChanged(
-        &self,
-        flow: EDataFlow,
-        _role: ERole,
-        _pwstrdefaultdeviceid: &PCWSTR,
-    ) -> windows::core::Result<()> {
+    fn mark_default_changed(&self, flow: EDataFlow) {
         if flow == eRender {
             self.state
                 .render_default_changed
@@ -127,7 +123,38 @@ impl IMMNotificationClient_Impl for NotificationClient_Impl {
                 .store(true, Ordering::Release);
         }
 
-        let _ = self.control_event.set();
+        self.signal_control();
+    }
+}
+
+#[allow(non_snake_case)]
+impl IMMNotificationClient_Impl for NotificationClient_Impl {
+    fn OnDeviceStateChanged(
+        &self,
+        _pwstrdeviceid: &PCWSTR,
+        _dwnewstate: DEVICE_STATE,
+    ) -> windows::core::Result<()> {
+        self.mark_topology_changed();
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+        self.mark_topology_changed();
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+        self.mark_topology_changed();
+        Ok(())
+    }
+
+    fn OnDefaultDeviceChanged(
+        &self,
+        flow: EDataFlow,
+        _role: ERole,
+        _pwstrdefaultdeviceid: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        self.mark_default_changed(flow);
         Ok(())
     }
 
@@ -136,8 +163,7 @@ impl IMMNotificationClient_Impl for NotificationClient_Impl {
         _pwstrdeviceid: &PCWSTR,
         _key: &windows::Win32::Foundation::PROPERTYKEY,
     ) -> windows::core::Result<()> {
-        self.state.topology_changed.store(true, Ordering::Release);
-        let _ = self.control_event.set();
+        self.mark_topology_changed();
         Ok(())
     }
 }
