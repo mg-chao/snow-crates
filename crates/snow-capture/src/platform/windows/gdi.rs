@@ -1,4 +1,4 @@
-﻿use std::ffi::c_void;
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -1136,7 +1136,6 @@ impl GdiResources {
     fn refresh_screen_dc(&mut self) -> CaptureResult<()> {
         self.release_window_dc();
 
-        // Release the old DC first.
         if !self.screen_dc.0.is_null() {
             unsafe {
                 let _ = ReleaseDC(None, self.screen_dc);
@@ -1891,10 +1890,8 @@ impl GdiResources {
     /// Capture the monitor region and return an RGBA frame.
     ///
     /// The strategy is to BitBlt into the DIB section, then perform an
-    /// in-place BGRA鈫扲GBA swizzle directly in that buffer, and finally
     /// bulk-copy the result into the `Frame`.  When `src == dst` the
     /// SIMD kernels read and write the same cache lines, cutting memory
-    /// bandwidth roughly in half compared to a separate src鈫抎st copy.
     fn read_surface_to_rgba(
         &mut self,
         width: i32,
@@ -1972,8 +1969,6 @@ impl GdiResources {
             }
         }
 
-        // Single-pass: read from DIB section, swizzle BGRA鈫扲GBA, and
-        // write directly into the Frame to avoid an extra memcpy.
         unsafe {
             match mode {
                 CaptureMode::ScreenRecording => convert::convert_bgra_to_rgba_nt_unchecked(
@@ -2331,9 +2326,21 @@ impl GdiResources {
         match path {
             WindowCapturePath::WindowDcBitBlt => {
                 let window_dc = self.acquire_window_dc(hwnd)?;
-                unsafe { BitBlt(self.mem_dc, 0, 0, width, height, Some(window_dc), 0, 0, SRCCOPY) }
-                    .context("BitBlt failed during GDI window capture")
-                    .map_err(CaptureError::platform)?;
+                unsafe {
+                    BitBlt(
+                        self.mem_dc,
+                        0,
+                        0,
+                        width,
+                        height,
+                        Some(window_dc),
+                        0,
+                        0,
+                        SRCCOPY,
+                    )
+                }
+                .context("BitBlt failed during GDI window capture")
+                .map_err(CaptureError::platform)?;
                 Ok(())
             }
             WindowCapturePath::PrintWindow(flags) => {
@@ -2467,9 +2474,6 @@ impl WindowsMonitorCapturer {
     fn refresh_geometry(&mut self) -> CaptureResult<()> {
         let current_gen = self.resolver.display_generation();
 
-        // When backed by the event-driven DisplayInfoCache, skip the
-        // refresh entirely if the generation hasn't changed 鈥?no
-        // WM_DISPLAYCHANGE has fired since our last check.
         if let (Some(current), Some(last)) = (current_gen, self.last_display_generation)
             && current == last
         {
@@ -2478,9 +2482,6 @@ impl WindowsMonitorCapturer {
 
         self.last_display_generation = current_gen;
 
-        // Display config changed 鈥?refresh the screen DC so we don't
-        // capture from a stale device context after resolution /
-        // composition changes.
         self.resources.refresh_screen_dc()?;
 
         match geometry_from_handle(self.geometry.handle) {
@@ -2514,11 +2515,7 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
             self.capture_mode,
             destination_has_history,
         )?;
-        frame.metadata.capture_time = Some(capture_time);
-        // GDI doesn't provide native presentation timestamps, so we
-        // synthesize a QPC value at capture time for consistent timing
-        // across backends.
-        frame.metadata.present_time_qpc = crate::frame::query_qpc_now();
+        frame.metadata.set_timing(Some(capture_time), crate::frame::query_qpc_now());
         Ok(frame)
     }
 
@@ -2751,8 +2748,7 @@ impl MonitorCapturer for WindowsWindowCapturer {
             CaptureMode::ScreenRecording => Some(used_path),
             CaptureMode::Screenshot => None,
         };
-        frame.metadata.capture_time = Some(capture_time);
-        frame.metadata.present_time_qpc = crate::frame::query_qpc_now();
+        frame.metadata.set_timing(Some(capture_time), crate::frame::query_qpc_now());
         Ok(frame)
     }
 
@@ -2907,7 +2903,6 @@ mod tests {
             recommend_parallel_span_scan_mode(0, 0, 2560, 1440),
             ParallelSpanScanMode::CompareThenDiff
         );
-        // Roughly 50% dirty rows with narrow spans should stay on compare+diff.
         assert_eq!(
             recommend_parallel_span_scan_mode(720, 69_120, 2560, 1440),
             ParallelSpanScanMode::CompareThenDiff
@@ -2916,12 +2911,10 @@ mod tests {
 
     #[test]
     fn parallel_span_mode_recommendation_prefers_single_for_dense_damage() {
-        // High dirty-row coverage should force single-scan mode.
         assert_eq!(
             recommend_parallel_span_scan_mode(1300, 900_000, 2560, 1440),
             ParallelSpanScanMode::SingleScanDiff
         );
-        // Dense dirty rows + dirty pixels should also switch.
         assert_eq!(
             recommend_parallel_span_scan_mode(1000, 1_200_000, 2560, 1440),
             ParallelSpanScanMode::SingleScanDiff
@@ -2983,7 +2976,6 @@ mod tests {
         }
         let mut rhs = lhs.clone();
 
-        // Change only one channel of pixel 3 and pixel 9.
         rhs[3 * BGRA_BYTES_PER_PIXEL + 1] ^= 0x1F;
         rhs[9 * BGRA_BYTES_PER_PIXEL + 2] ^= 0x2A;
 
@@ -4230,8 +4222,6 @@ mod tests {
             "gdi parallel span benchmark: legacy={legacy_ms:.3} ms span={span_ms:.3} ms improvement={improvement_pct:.2}%"
         );
 
-        // Guardrail: keep the hybrid path from regressing relative to the
-        // previous parallel full-row incremental strategy.
         assert!(
             span_ms <= legacy_ms * 1.03,
             "parallel span path regressed: legacy={legacy_ms:.3}ms span={span_ms:.3}ms ({improvement_pct:.2}% improvement)"
@@ -4408,8 +4398,6 @@ mod tests {
         }
         let history = current.clone();
 
-        // Emulate sparse motion blocks, which is where span-bounded incremental
-        // conversion should dominate.
         let span_width_pixels = 96usize;
         let span_width_bytes = span_width_pixels * BGRA_BYTES_PER_PIXEL;
         for row in (0..height).step_by(3) {
@@ -4524,9 +4512,6 @@ mod tests {
             "gdi span single-scan benchmark: legacy={legacy_ms:.3} ms single={single_ms:.3} ms improvement={improvement_pct:.2}%"
         );
 
-        // Guardrail: allow minor timing noise, but fail if the optimized
-        // single-scan path regresses materially versus the legacy two-pass
-        // compare+span flow.
         assert!(
             single_ms <= legacy_ms * 1.02,
             "single-scan path regressed: legacy={legacy_ms:.3}ms single={single_ms:.3}ms ({improvement_pct:.2}% improvement)"

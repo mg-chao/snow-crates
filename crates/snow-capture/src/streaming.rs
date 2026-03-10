@@ -1,4 +1,4 @@
-﻿//! Continuous capture streaming with frame pacing, backpressure, and
+//! Continuous capture streaming with frame pacing, backpressure, and
 //! adaptive rate control.
 //!
 //! The streaming module runs a capture loop on a dedicated thread,
@@ -134,7 +134,39 @@ pub struct StreamHandle {
     buffer_depth: usize,
 }
 
+fn closed_receiver() -> mpsc::Receiver<CaptureEvent> {
+    let (dummy_tx, dummy_rx) = mpsc::sync_channel(1);
+    drop(dummy_tx);
+    dummy_rx
+}
+
 impl StreamHandle {
+    fn request_stop_and_join(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn take_receiver(&mut self) -> mpsc::Receiver<CaptureEvent> {
+        std::mem::replace(&mut self.receiver, closed_receiver())
+    }
+
+    fn note_consumed_event(&self, event: &CaptureEvent) {
+        if matches!(event, CaptureEvent::Frame(_)) {
+            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    fn recv_with_bookkeeping<E>(
+        &self,
+        result: Result<CaptureEvent, E>,
+    ) -> Result<CaptureEvent, E> {
+        let event = result?;
+        self.note_consumed_event(&event);
+        Ok(event)
+    }
+
     /// Start the streaming capture loop on a background thread.
     pub(crate) fn start(
         mut session: CaptureSession,
@@ -183,7 +215,6 @@ impl StreamHandle {
     /// Get the raw receiver end of the capture event channel.
     ///
     /// **Note:** Prefer `recv()`, `try_recv()`, or `recv_timeout()` on
-    /// `StreamHandle` directly 鈥?those methods keep `buffer_fill` accurate.
     /// Reading from the raw receiver bypasses fill tracking.
     pub fn receiver(&self) -> &mpsc::Receiver<CaptureEvent> {
         &self.receiver
@@ -194,46 +225,29 @@ impl StreamHandle {
     ///
     /// **Note:** `buffer_fill` will no longer be updated after this call.
     pub fn into_receiver(mut self) -> mpsc::Receiver<CaptureEvent> {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
-        let this = std::mem::ManuallyDrop::new(self);
-        unsafe { std::ptr::read(&this.receiver) }
+        self.request_stop_and_join();
+        self.take_receiver()
     }
 
     /// Receive the next capture event, blocking until one is available
     /// or the channel disconnects. Automatically updates `buffer_fill`
     /// when a `Frame` event is consumed.
     pub fn recv(&self) -> Result<CaptureEvent, mpsc::RecvError> {
-        let event = self.receiver.recv()?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
-        Ok(event)
+        self.recv_with_bookkeeping(self.receiver.recv())
     }
 
     /// Try to receive a capture event without blocking. Automatically
     /// updates `buffer_fill` when a `Frame` event is consumed.
     pub fn try_recv(&self) -> Result<CaptureEvent, mpsc::TryRecvError> {
-        let event = self.receiver.try_recv()?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
-        Ok(event)
+        self.recv_with_bookkeeping(self.receiver.try_recv())
     }
 
     /// Receive a capture event with a timeout. Automatically updates
     /// `buffer_fill` when a `Frame` event is consumed.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, mpsc::RecvTimeoutError> {
-        let event = self.receiver.recv_timeout(timeout)?;
-        if matches!(&event, CaptureEvent::Frame(_)) {
-            self.stats.buffer_fill.fetch_sub(1, Ordering::Release);
-        }
-        Ok(event)
+        self.recv_with_bookkeeping(self.receiver.recv_timeout(timeout))
     }
 
-    /// Signal the stream thread to stop. Non-blocking 鈥?the thread will
     /// exit on its next loop iteration.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Release);
@@ -258,9 +272,7 @@ impl StreamHandle {
 
     /// Check whether the stream thread is still running.
     pub fn is_running(&self) -> bool {
-        self.join_handle
-            .as_ref()
-            .map_or(false, |h| !h.is_finished())
+        self.join_handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// Get a reference to the live stream statistics.
@@ -282,26 +294,67 @@ impl StreamHandle {
     /// events. Returns an iterator over the final events so the
     /// recorder can flush its encoder without losing the tail frames.
     pub fn stop_and_drain(mut self) -> Vec<CaptureEvent> {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
-        }
-        // Drain everything left in the channel.
+        self.request_stop_and_join();
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
             events.push(event);
         }
         // Prevent Drop from joining again.
-        let _ = std::mem::ManuallyDrop::new(self);
+        std::mem::forget(self);
         events
     }
 }
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+        self.request_stop_and_join();
+    }
+}
+
+impl snow_core::streaming::StreamHandle<CaptureEvent> for StreamHandle {
+    type RecvError = std::sync::mpsc::RecvError;
+    type TryRecvError = std::sync::mpsc::TryRecvError;
+    type RecvTimeoutError = std::sync::mpsc::RecvTimeoutError;
+
+    fn recv(&self) -> Result<CaptureEvent, Self::RecvError> {
+        self.recv()
+    }
+
+    fn try_recv(&self) -> Result<CaptureEvent, Self::TryRecvError> {
+        self.try_recv()
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<CaptureEvent, Self::RecvTimeoutError> {
+        self.recv_timeout(timeout)
+    }
+
+    fn stop(&self) {
+        self.stop()
+    }
+
+    fn pause(&self) {
+        self.pause()
+    }
+
+    fn resume(&self) {
+        self.resume()
+    }
+
+    fn is_paused(&self) -> bool {
+        self.is_paused()
+    }
+
+    fn is_running(&self) -> bool {
+        self.is_running()
+    }
+}
+
+impl snow_core::streaming::StreamStats for StreamHandle {
+    fn snapshot(&self) -> snow_core::streaming::StreamStatsSnapshot {
+        snow_core::streaming::StreamStatsSnapshot {
+            total_events: self.stats.frames_captured.load(Ordering::Relaxed),
+            dropped_events: self.stats.frames_dropped.load(Ordering::Relaxed),
+            buffer_fill_ratio: self.buffer_fill_percent(),
         }
     }
 }
@@ -332,32 +385,19 @@ fn stream_loop(
     let mut last_width: u32 = 0;
     let mut last_height: u32 = 0;
 
-    // Smooth adaptive pacing state (EWMA-based).
     let mut current_interval = base_interval;
-    // Exponential smoothing factor for adaptive pacing.
-    // Higher values react faster to backpressure changes.
     const ADAPTIVE_ALPHA: f64 = 0.15;
-    // When the drop ratio over the recent window exceeds this,
-    // the interval is nudged longer.
     const DROP_RATIO_THRESHOLD: f64 = 0.10;
-    // Size of the sliding window for drop ratio calculation.
     const ADAPTIVE_WINDOW: u32 = 30;
     let mut window_drops: u32 = 0;
     let mut window_total: u32 = 0;
 
-    // Capture latency EWMA state.
     let mut latency_avg_ns: f64 = 0.0;
     const LATENCY_ALPHA: f64 = 0.1;
 
-    // Buffer fill tracking 鈥?stats.buffer_fill is the shared atomic
-    // counter. The producer (this loop) increments on successful send,
-    // and the consumer decrements via StreamHandle::recv* methods.
-
-    // FPS measurement.
     let mut fps_counter: u64 = 0;
     let mut fps_epoch = Instant::now();
 
-    // Pause/resume lifecycle tracking.
     let mut was_paused = false;
     let mut pause_started: Option<Instant> = None;
 
@@ -366,22 +406,18 @@ fn stream_loop(
             break;
         }
 
-        // Pause handling with lifecycle events.
         if pause.load(Ordering::Acquire) {
             if !was_paused {
-                // Entering pause 鈥?send Paused event.
                 let now = Instant::now();
                 pause_started = Some(now);
                 let _ = tx.try_send(CaptureEvent::Paused { at: now });
                 was_paused = true;
             }
             std::thread::sleep(Duration::from_millis(50));
-            // Reset FPS counter across pause boundaries.
             fps_counter = 0;
             fps_epoch = Instant::now();
             continue;
         } else if was_paused {
-            // Exiting pause 鈥?send Resumed event.
             let now = Instant::now();
             let gap = pause_started
                 .map(|s| now.saturating_duration_since(s))
@@ -404,10 +440,8 @@ fn stream_loop(
             Ok(mut frame) => {
                 consecutive_errors = 0;
 
-                // Record capture latency on the frame.
                 frame.metadata.capture_duration = Some(capture_elapsed);
 
-                // Update EWMA capture latency.
                 let sample_ns = capture_elapsed.as_nanos() as f64;
                 latency_avg_ns = LATENCY_ALPHA * sample_ns + (1.0 - LATENCY_ALPHA) * latency_avg_ns;
                 stats
@@ -416,7 +450,6 @@ fn stream_loop(
 
                 let seq = frame.metadata.sequence;
 
-                // Detect resolution changes.
                 let (w, h) = frame.dimensions();
                 if last_width != 0 && last_height != 0 && (w != last_width || h != last_height) {
                     let event = CaptureEvent::ResolutionChanged {
@@ -427,7 +460,6 @@ fn stream_loop(
                     };
                     let _ = tx.try_send(event);
 
-                    // Auto-pause on resolution change if configured.
                     if config.pause_on_resolution_change {
                         pause.store(true, Ordering::Release);
                     }
@@ -437,73 +469,50 @@ fn stream_loop(
 
                 stats.frames_captured.fetch_add(1, Ordering::Relaxed);
 
-                match tx.try_send(CaptureEvent::Frame(frame)) {
+                let was_dropped = match tx.try_send(CaptureEvent::Frame(frame)) {
                     Ok(()) => {
                         stats.buffer_fill.fetch_add(1, Ordering::Release);
-
-                        // Adaptive pacing: smooth EWMA-based approach.
-                        window_total += 1;
-                        if config.adaptive_fps && window_total >= ADAPTIVE_WINDOW {
-                            let drop_ratio = window_drops as f64 / window_total as f64;
-                            if let (Some(cur), Some(base), Some(max)) =
-                                (current_interval, base_interval, min_interval)
-                            {
-                                let cur_ns = cur.as_nanos() as f64;
-                                let target_ns = if drop_ratio > DROP_RATIO_THRESHOLD {
-                                    // Nudge slower toward min_fps.
-                                    (cur_ns * 1.5).min(max.as_nanos() as f64)
-                                } else {
-                                    // Nudge faster toward target_fps.
-                                    (cur_ns * 0.8).max(base.as_nanos() as f64)
-                                };
-                                let smoothed =
-                                    ADAPTIVE_ALPHA * target_ns + (1.0 - ADAPTIVE_ALPHA) * cur_ns;
-                                current_interval = Some(Duration::from_nanos(smoothed as u64));
-                            }
-                            window_drops = 0;
-                            window_total = 0;
-                        }
+                        false
                     }
                     Err(mpsc::TrySendError::Full(CaptureEvent::Frame(dropped))) => {
                         stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
-                        // Frame never entered the channel, so buffer_fill
-                        // is unchanged.
-                        // Notify receiver about the drop.
                         let _ = tx.try_send(CaptureEvent::FrameDropped { sequence: seq });
                         reuse_frame = Some(dropped);
-
-                        window_drops += 1;
-                        window_total += 1;
-                        if config.adaptive_fps && window_total >= ADAPTIVE_WINDOW {
-                            let drop_ratio = window_drops as f64 / window_total as f64;
-                            if let (Some(cur), Some(base), Some(max)) =
-                                (current_interval, base_interval, min_interval)
-                            {
-                                let cur_ns = cur.as_nanos() as f64;
-                                let target_ns = if drop_ratio > DROP_RATIO_THRESHOLD {
-                                    (cur_ns * 1.5).min(max.as_nanos() as f64)
-                                } else {
-                                    (cur_ns * 0.8).max(base.as_nanos() as f64)
-                                };
-                                let smoothed =
-                                    ADAPTIVE_ALPHA * target_ns + (1.0 - ADAPTIVE_ALPHA) * cur_ns;
-                                current_interval = Some(Duration::from_nanos(smoothed as u64));
-                            }
-                            window_drops = 0;
-                            window_total = 0;
-                        }
+                        true
                     }
-                    Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Full(_)) => false,
                     Err(mpsc::TrySendError::Disconnected(_)) => {
                         break;
                     }
+                };
+
+                if was_dropped {
+                    window_drops += 1;
+                }
+                window_total += 1;
+                if config.adaptive_fps && window_total >= ADAPTIVE_WINDOW {
+                    let drop_ratio = window_drops as f64 / window_total as f64;
+                    if let (Some(cur), Some(base), Some(max)) =
+                        (current_interval, base_interval, min_interval)
+                    {
+                        let cur_ns = cur.as_nanos() as f64;
+                        let target_ns = if drop_ratio > DROP_RATIO_THRESHOLD {
+                            (cur_ns * 1.5).min(max.as_nanos() as f64)
+                        } else {
+                            (cur_ns * 0.8).max(base.as_nanos() as f64)
+                        };
+                        let smoothed =
+                            ADAPTIVE_ALPHA * target_ns + (1.0 - ADAPTIVE_ALPHA) * cur_ns;
+                        current_interval = Some(Duration::from_nanos(smoothed as u64));
+                    }
+                    window_drops = 0;
+                    window_total = 0;
                 }
             }
             Err(ref e) if e.is_retryable() => {
                 consecutive_errors += 1;
                 stats.errors_recovered.fetch_add(1, Ordering::Relaxed);
                 if consecutive_errors >= config.max_consecutive_errors {
-                    // Send fatal error event before exiting.
                     let _ = tx.try_send(CaptureEvent::Error(e.clone()));
                     break;
                 }
@@ -511,13 +520,11 @@ fn stream_loop(
                 continue;
             }
             Err(e) => {
-                // Fatal error 鈥?notify receiver and exit.
                 let _ = tx.try_send(CaptureEvent::Error(e.clone()));
                 break;
             }
         }
 
-        // Update FPS counter.
         fps_counter += 1;
         let fps_elapsed = fps_epoch.elapsed();
         if fps_elapsed >= Duration::from_secs(1) {
@@ -527,7 +534,6 @@ fn stream_loop(
             fps_epoch = Instant::now();
         }
 
-        // Frame pacing.
         if let Some(interval) = current_interval {
             let elapsed = frame_start.elapsed();
             if elapsed < interval {
@@ -556,10 +562,6 @@ fn spin_sleep(duration: Duration) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Async (tokio) stream wrapper
-// ---------------------------------------------------------------------------
-
 /// Async wrapper around `StreamHandle` for tokio-based recording pipelines.
 ///
 /// Requires the `tokio-stream` feature.
@@ -585,18 +587,17 @@ impl AsyncStreamHandle {
         target: CaptureTarget,
         config: StreamConfig,
     ) -> CaptureResult<Self> {
-        let handle = StreamHandle::start(session, target, config)?;
-        let sync_rx = unsafe {
-            // Take the receiver out of the handle so we can bridge it.
-            // We'll reconstruct the handle without the receiver.
-            std::ptr::read(&handle.receiver)
-        };
-        // Prevent double-free of receiver in the original handle.
-        let handle = std::mem::ManuallyDrop::new(handle);
+        let mut handle = StreamHandle::start(session, target, config)?;
+        // Take the receiver out of the handle so we can bridge it.
+        // We'll reconstruct the handle without the receiver.
+        let sync_rx = handle.take_receiver();
         let stop_flag = handle.stop_flag.clone();
         let pause_flag = handle.pause_flag.clone();
         let stats = handle.stats.clone();
-        let join_handle_inner = unsafe { std::ptr::read(&handle.join_handle) };
+        let join_handle_inner = handle.join_handle.take();
+        // Avoid running `Drop` on the transient handle, which would
+        // stop the stream we are transferring into `inner`.
+        std::mem::forget(handle);
 
         let (async_tx, async_rx) = tokio::sync::mpsc::channel::<CaptureEvent>(32);
 
@@ -631,10 +632,8 @@ impl AsyncStreamHandle {
 
         // Reconstruct a StreamHandle that owns the thread but not the
         // sync receiver (which the bridge now owns).
-        let (dummy_tx, dummy_rx) = mpsc::sync_channel(1);
-        drop(dummy_tx);
         let inner = StreamHandle {
-            receiver: dummy_rx,
+            receiver: closed_receiver(),
             stop_flag,
             pause_flag,
             stats,

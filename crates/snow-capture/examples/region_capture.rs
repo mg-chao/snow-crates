@@ -55,7 +55,6 @@ fn capture_region_to_png(
 }
 
 fn main() -> Result<()> {
-    // Region from (-500, 0) to (500, 1000) in virtual desktop coordinates.
     let region =
         CaptureRegion::new(-500, 0, 1000, 1000).context("failed to create capture region")?;
 

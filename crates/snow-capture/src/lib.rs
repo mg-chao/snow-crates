@@ -35,8 +35,10 @@ pub enum CaptureTarget {
 pub use backend::CaptureMode;
 pub use capture_session::{CaptureSession, CaptureSessionBuilder, CaptureSessionConfig};
 pub use frame::{
-    CaptureEvent, ColorSpace, CursorData, DirtyRect, FrameMetadata, FrameTimestampAnchor,
+    CaptureEvent, ColorSpace, DirtyRect, FrameMetadata,
 };
+#[cfg(feature = "cursor")]
+pub use frame::{CursorCompositionMode, CursorData, CursorFrameSample, CursorShape};
 pub use monitor::MonitorId;
 pub use region::{CaptureRegion, MonitorLayout};
 pub use streaming::{StreamConfig, StreamHandle, StreamStats, StreamStatsSnapshot};

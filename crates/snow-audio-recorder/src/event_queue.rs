@@ -37,6 +37,10 @@ impl QueueState {
             .or_else(|| self.data_events.pop_front())
     }
 
+    fn pop_next_with_data_len(&mut self) -> Option<(AudioEvent, usize)> {
+        self.pop_next().map(|event| (event, self.data_len()))
+    }
+
     fn data_len(&self) -> usize {
         self.data_events.len()
     }
@@ -107,8 +111,8 @@ impl EventQueue {
     pub fn recv(&self) -> Result<(AudioEvent, usize), RecvError> {
         let mut guard = self.state.lock().unwrap();
         loop {
-            if let Some(event) = guard.pop_next() {
-                return Ok((event, guard.data_len()));
+            if let Some(outcome) = guard.pop_next_with_data_len() {
+                return Ok(outcome);
             }
             if guard.closed {
                 return Err(RecvError);
@@ -119,8 +123,8 @@ impl EventQueue {
 
     pub fn try_recv(&self) -> Result<(AudioEvent, usize), TryRecvError> {
         let mut guard = self.state.lock().unwrap();
-        if let Some(event) = guard.pop_next() {
-            return Ok((event, guard.data_len()));
+        if let Some(outcome) = guard.pop_next_with_data_len() {
+            return Ok(outcome);
         }
         if guard.closed {
             return Err(TryRecvError::Closed);
@@ -130,8 +134,8 @@ impl EventQueue {
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<(AudioEvent, usize), RecvTimeoutError> {
         let mut guard = self.state.lock().unwrap();
-        if let Some(event) = guard.pop_next() {
-            return Ok((event, guard.data_len()));
+        if let Some(outcome) = guard.pop_next_with_data_len() {
+            return Ok(outcome);
         }
 
         if guard.closed {
@@ -143,8 +147,8 @@ impl EventQueue {
             .wait_timeout_while(guard, timeout, |state| !state.closed && state.is_empty())
             .unwrap();
 
-        if let Some(event) = guard.pop_next() {
-            return Ok((event, guard.data_len()));
+        if let Some(outcome) = guard.pop_next_with_data_len() {
+            return Ok(outcome);
         }
 
         if guard.closed {
@@ -168,12 +172,8 @@ impl EventQueue {
         let mut guard = self.state.lock().unwrap();
         let mut drained = Vec::with_capacity(guard.total_len());
         // Drain control events first so they appear before any remaining data events.
-        while let Some(event) = guard.control_events.pop_front() {
-            drained.push(event);
-        }
-        while let Some(event) = guard.data_events.pop_front() {
-            drained.push(event);
-        }
+        drained.extend(guard.control_events.drain(..));
+        drained.extend(guard.data_events.drain(..));
         drained
     }
 }
@@ -309,11 +309,9 @@ mod tests {
     fn buffer_pressure_survives_full_data_lane() {
         let queue = EventQueue::new(2);
 
-        // Fill the data lane completely.
         queue.push(AudioEvent::Packet(packet(1)));
         queue.push(AudioEvent::Packet(packet(2)));
 
-        // Push a BufferPressure event — it should go into the control lane.
         let outcome = queue.push(AudioEvent::BufferPressure {
             fill_ratio: 1.0,
             buffer_depth: 2,
@@ -323,7 +321,6 @@ mod tests {
             "BufferPressure should not evict anything"
         );
 
-        // Control events are delivered first.
         let first = queue.recv().unwrap().0;
         assert!(
             matches!(first, AudioEvent::BufferPressure { .. }),

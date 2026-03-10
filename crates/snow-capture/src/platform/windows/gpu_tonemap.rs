@@ -1,4 +1,4 @@
-﻿use anyhow::Context;
+use anyhow::Context;
 use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC,
@@ -13,9 +13,6 @@ use windows::core::Interface;
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
 
-// Try to use pre-compiled shader bytecode from build.rs (fxc.exe at build time).
-// Falls back to runtime D3DCompile if the build-time compilation was skipped.
-
 /// HLSL source kept as fallback for runtime compilation when fxc.exe
 /// was not available at build time.
 #[cfg(not(has_precompiled_shader))]
@@ -29,11 +26,9 @@ const PRECOMPILED_CSO: &[u8] = include_bytes!(env!("TONEMAP_CSO_PATH"));
 #[cfg(has_precompiled_shader_1d)]
 const PRECOMPILED_1D_CSO: &[u8] = include_bytes!(env!("TONEMAP_1D_CSO_PATH"));
 
-/// Pre-compiled F16鈫抯RGB shader bytecode.
 #[cfg(has_precompiled_shader_f16)]
 const PRECOMPILED_F16_CSO: &[u8] = include_bytes!(env!("F16_CONVERT_CSO_PATH"));
 
-/// Pre-compiled F16鈫抯RGB 1D shader bytecode.
 #[cfg(has_precompiled_shader_f16_1d)]
 const PRECOMPILED_F16_1D_CSO: &[u8] = include_bytes!(env!("F16_CONVERT_1D_CSO_PATH"));
 
@@ -74,7 +69,6 @@ fn cached_bytecode_1d() -> &'static CaptureResult<Vec<u8>> {
     })
 }
 
-/// Returns cached F16鈫抯RGB shader bytecode.
 fn cached_bytecode_f16() -> &'static CaptureResult<Vec<u8>> {
     static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
     BYTECODE.get_or_init(|| {
@@ -89,7 +83,6 @@ fn cached_bytecode_f16() -> &'static CaptureResult<Vec<u8>> {
     })
 }
 
-/// Returns cached F16鈫抯RGB 1D shader bytecode.
 fn cached_bytecode_f16_1d() -> &'static CaptureResult<Vec<u8>> {
     static BYTECODE: OnceLock<CaptureResult<Vec<u8>>> = OnceLock::new();
     BYTECODE.get_or_init(|| {
@@ -171,18 +164,17 @@ struct GpuParams {
 }
 
 /// Threshold below which we use the 1D dispatch path.
-/// For textures smaller than 512px on either axis, the 16脳16 thread
+/// For textures smaller than 512px on either axis, the 16x16 thread
 /// groups waste significant threads on boundary tiles.
 const SMALL_TEXTURE_THRESHOLD: u32 = 512;
 
 /// Shared GPU compute-shader pass infrastructure.
 ///
 /// Encapsulates the D3D11 resources and caching logic common to both
-/// HDR tonemapping and F16鈫抯RGB conversion: shader objects, output
 /// texture/UAV management, SRV caching, and the dispatch call.
 struct GpuComputePass {
     cs: ID3D11ComputeShader,
-    /// 1D compute shader for small textures (256脳1 thread groups).
+    /// 1D compute shader for small textures (256x1 thread groups).
     cs_1d: Option<ID3D11ComputeShader>,
     cbuf: ID3D11Buffer,
     output_tex: Option<ID3D11Texture2D>,
@@ -302,10 +294,8 @@ impl GpuComputePass {
         source: &ID3D11Texture2D,
     ) -> CaptureResult<ID3D11ShaderResourceView> {
         let source_ptr = source.as_raw() as usize;
-        if source_ptr == self.cached_srv_source {
-            if let Some(ref srv) = self.cached_srv {
-                return Ok(srv.clone());
-            }
+        if source_ptr == self.cached_srv_source && let Some(ref srv) = self.cached_srv {
+            return Ok(srv.clone());
         }
 
         let mut srv: Option<ID3D11ShaderResourceView> = None;
@@ -366,15 +356,14 @@ impl GpuComputePass {
             context.CSSetUnorderedAccessViews(0, 1, Some(&Some(uav.clone()) as *const _), None);
 
             if use_1d {
-                let groups_x = (width + 255) / 256;
+                let groups_x = width.div_ceil(256);
                 context.Dispatch(groups_x, height, 1);
             } else {
-                let groups_x = (width + 15) / 16;
-                let groups_y = (height + 15) / 16;
+                let groups_x = width.div_ceil(16);
+                let groups_y = height.div_ceil(16);
                 context.Dispatch(groups_x, groups_y, 1);
             }
 
-            // Unbind resources
             let no_srv: Option<ID3D11ShaderResourceView> = None;
             context.CSSetShaderResources(0, Some(&[no_srv]));
             context.CSSetUnorderedAccessViews(0, 1, Some(&None as *const _), None);
@@ -389,7 +378,6 @@ impl GpuComputePass {
 pub(crate) struct GpuTonemapper {
     pass: GpuComputePass,
     /// Combined cache of tonemap params and dimensions written to the
-    /// constant buffer 鈥?skip the update when neither has changed.
     cached_cbuf_state: Option<(HdrToSdrParams, u32, u32)>,
 }
 
@@ -422,10 +410,9 @@ impl GpuTonemapper {
         let height = source_desc.Height;
         self.pass.ensure_output(device, width, height)?;
 
-        // Update the constant buffer when params or dimensions have changed.
         let needs_cbuf_update = self
             .cached_cbuf_state
-            .map_or(true, |(p, w, h)| p != params || w != width || h != height);
+            .is_none_or(|(p, w, h)| p != params || w != width || h != height);
         if needs_cbuf_update {
             let gpu_params = GpuParams {
                 hdr_paper_white_nits: params.hdr_paper_white_nits,
@@ -447,7 +434,6 @@ impl GpuTonemapper {
     }
 }
 
-/// GPU-accelerated F16 linear 鈫?sRGB conversion (no HDR tonemapping).
 ///
 /// Used when the source is RGBA16Float but no HDR-to-SDR tonemap is needed.
 /// Converts linear light values directly to sRGB gamma on the GPU, so the
@@ -480,7 +466,6 @@ impl GpuF16Converter {
         let height = source_desc.Height;
         self.pass.ensure_output(device, width, height)?;
 
-        // F16 converter only needs dimensions 鈥?HDR fields are zeroed.
         let gpu_params = GpuParams {
             hdr_paper_white_nits: 0.0,
             hdr_maximum_nits: 0.0,

@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use snow_capture::backend::CaptureBackendKind;
 use snow_capture::frame::CaptureEvent;
 use snow_capture::streaming::StreamConfig;
-use snow_capture::{CaptureMode, CaptureSession, CaptureTarget, FrameTimestampAnchor};
+use snow_capture::{CaptureMode, CaptureSession, CaptureTarget};
+use snow_core::timestamp::TimestampAnchor;
 
 fn main() -> Result<()> {
     let target = CaptureTarget::PrimaryMonitor;
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
     let run_duration = Duration::from_secs(5);
     let mut frame_count: u64 = 0;
     let mut duplicate_count: u64 = 0;
-    let mut anchor: Option<FrameTimestampAnchor> = None;
+    let mut anchor: Option<TimestampAnchor> = None;
 
     println!("Streaming for {run_duration:?} at 60 fps (adaptive)...");
 
@@ -46,20 +47,30 @@ fn main() -> Result<()> {
                 }
 
                 let ts_anchor = anchor.get_or_insert_with(|| {
-                    let a = FrameTimestampAnchor::from_first_frame(&frame.metadata);
-                    if let Some(qpc) = a.origin_qpc_ticks() {
+                    let st = frame.metadata.stream_timestamp.clone()
+                        .expect("stream_timestamp should be set");
+                    let a = TimestampAnchor::new(st);
+                    if let Some(qpc) = a.origin().raw_os_ticks {
                         println!("  anchor: qpc_origin={qpc}, freq={}", a.qpc_frequency());
                     }
                     a
                 });
 
                 if frame_count % 60 == 0 {
-                    let stream_ts = ts_anchor.stream_relative(&frame.metadata);
+                    let stream_ts = frame.metadata.stream_timestamp.as_ref()
+                        .map(|st| ts_anchor.stream_relative(st))
+                        .unwrap_or_default();
                     let snap = stats.snapshot();
                     let dirty = frame.metadata.dirty_rects.len();
+                    #[cfg(feature = "cursor")]
                     let has_cursor = frame.metadata.cursor.is_some();
+                    #[cfg(not(feature = "cursor"))]
+                    let has_cursor = false;
+                    #[cfg(feature = "cursor")]
                     let cursor_visible =
                         frame.metadata.cursor.as_ref().map_or(false, |c| c.visible);
+                    #[cfg(not(feature = "cursor"))]
+                    let cursor_visible = false;
                     let cap_lat = frame
                         .metadata
                         .capture_duration

@@ -1,8 +1,0 @@
-[package]
-name = "snow-recorder"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-snow-capture = { path = "../snow-capture" }
-snow-audio-recorder = { path = "../snow-audio-recorder" }

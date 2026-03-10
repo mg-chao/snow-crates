@@ -7,29 +7,22 @@ use windows::Win32::Media::Audio::{
 use crate::error::AudioError;
 
 pub(crate) fn map_hresult(hr: windows::core::HRESULT, context: &str) -> AudioError {
-    if hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_RESOURCES_INVALIDATED {
-        return AudioError::DeviceLost;
-    }
-
-    if hr == E_ACCESSDENIED {
-        return AudioError::AccessDenied;
-    }
-
-    if hr == AUDCLNT_E_UNSUPPORTED_FORMAT {
-        return AudioError::UnsupportedFormat(context.to_string());
-    }
-
-    if hr == AUDCLNT_E_ENDPOINT_CREATE_FAILED {
-        return AudioError::DeviceUnavailable(format!("{context}: endpoint creation failed"));
-    }
-
-    if hr == AUDCLNT_E_SERVICE_NOT_RUNNING {
-        return AudioError::DeviceUnavailable(format!(
+    match hr {
+        _ if hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_RESOURCES_INVALIDATED => {
+            AudioError::DeviceLost
+        }
+        _ if hr == E_ACCESSDENIED => AudioError::AccessDenied,
+        _ if hr == AUDCLNT_E_UNSUPPORTED_FORMAT => {
+            AudioError::UnsupportedFormat(context.to_string())
+        }
+        _ if hr == AUDCLNT_E_ENDPOINT_CREATE_FAILED => {
+            AudioError::DeviceUnavailable(format!("{context}: endpoint creation failed"))
+        }
+        _ if hr == AUDCLNT_E_SERVICE_NOT_RUNNING => AudioError::DeviceUnavailable(format!(
             "{context}: Windows Audio service is not running"
-        ));
+        )),
+        _ => AudioError::platform(anyhow::anyhow!("{context}: HRESULT 0x{:08x}", hr.0 as u32)),
     }
-
-    AudioError::platform(anyhow::anyhow!("{context}: HRESULT 0x{:08x}", hr.0 as u32))
 }
 
 #[cfg(test)]

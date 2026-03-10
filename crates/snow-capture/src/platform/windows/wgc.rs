@@ -1,4 +1,4 @@
-﻿use std::cell::RefCell;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::core::{IInspectable, Interface};
 
-use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata, CursorCaptureConfig};
+use crate::backend::{CaptureBlitRegion, CaptureMode, CaptureSampleMetadata};
 use crate::convert::HdrToSdrParams;
 use crate::error::{CaptureError, CaptureResult};
 use crate::frame::{DirtyRect, Frame};
@@ -331,10 +331,8 @@ fn for_each_dirty_region(
 
     if start_idx < count {
         for idx in start_idx..count {
-            if let Ok(raw) = regions.GetAt(idx) {
-                if !visit(raw) {
-                    return Some(mode);
-                }
+            if let Ok(raw) = regions.GetAt(idx) && !visit(raw) {
+                return Some(mode);
             }
         }
     }
@@ -867,7 +865,6 @@ struct WindowsGraphicsCaptureCapturer {
     gpu_tonemapper: Option<GpuTonemapper>,
     /// GPU F16->sRGB converter for when source is F16 but no HDR tonemap needed.
     gpu_f16_converter: Option<GpuF16Converter>,
-    cursor_config: CursorCaptureConfig,
     has_frame_history: bool,
     source_dirty_rects_scratch: Vec<DirtyRect>,
     region_dirty_rects_scratch: Vec<DirtyRect>,
@@ -918,10 +915,9 @@ impl WindowsGraphicsCaptureCapturer {
             .CreateCaptureSession(&item)
             .context("Direct3D11CaptureFramePool::CreateCaptureSession failed")
             .map_err(CaptureError::platform)?;
-        let cursor_config = CursorCaptureConfig::default();
         // Best-effort session tuning:
-        // - Disable cursor composition unless explicitly requested.
-        let _ = session.SetIsCursorCaptureEnabled(cursor_config.capture_cursor);
+        // - Disable cursor composition; cursor overlays are handled in recorder.
+        let _ = session.SetIsCursorCaptureEnabled(false);
         // Keep the platform default dirty-region mode at startup. For
         // screenshot single-shot captures this avoids paying an extra
         // mode-transition setup cost on the first frame.
@@ -990,8 +986,6 @@ impl WindowsGraphicsCaptureCapturer {
         } else {
             None
         };
-        // Create the F16 converter for non-HDR F16 sources.
-        // Non-fatal if it fails -- we fall back to CPU conversion.
         let gpu_f16_converter = if pixel_format == DirectXPixelFormat::R16G16B16A16Float {
             GpuF16Converter::new(&device).ok()
         } else {
@@ -1027,7 +1021,6 @@ impl WindowsGraphicsCaptureCapturer {
             hdr_to_sdr,
             gpu_tonemapper,
             gpu_f16_converter,
-            cursor_config,
             has_frame_history: false,
             source_dirty_rects_scratch: Vec::new(),
             region_dirty_rects_scratch: Vec::new(),
@@ -1169,7 +1162,6 @@ impl WindowsGraphicsCaptureCapturer {
         allow_stale_return: bool,
     ) -> CaptureResult<Option<(Direct3D11CaptureFrame, i64)>> {
         if allow_stale_return {
-            // Mirror the full-frame low-latency path for region capture.
             if self.region.pending_slot.is_some() {
                 if let Some(fresh) = self.try_take_latest_frame()? {
                     self.relax_stale_timeout();
@@ -1712,9 +1704,7 @@ impl WindowsGraphicsCaptureCapturer {
         capture_time: Instant,
         present_time_ticks: i64,
     ) -> Option<CaptureSampleMetadata> {
-        let Some(slot_idx) = self.region.pending_slot else {
-            return None;
-        };
+        let slot_idx = self.region.pending_slot?;
         if !self.region.slots[slot_idx].populated {
             return None;
         }
@@ -1767,12 +1757,10 @@ impl WindowsGraphicsCaptureCapturer {
             slot.dirty_rects.clear();
         }
 
-        out.metadata.capture_time = Some(capture_time);
-        out.metadata.present_time_qpc = if present_time_ticks != 0 {
-            Some(present_time_ticks)
-        } else {
-            None
-        };
+        out.metadata.set_timing(
+            Some(capture_time),
+            if present_time_ticks != 0 { Some(present_time_ticks) } else { None },
+        );
         out.metadata.is_duplicate = true;
         out.metadata.dirty_rects.clear();
 
@@ -1807,12 +1795,10 @@ impl WindowsGraphicsCaptureCapturer {
             present_time_ticks != 0 && present_time_ticks == self.last_emitted_present_time;
         let is_duplicate = source_duplicate || emitted_duplicate;
 
-        out.metadata.capture_time = Some(capture_time);
-        out.metadata.present_time_qpc = if present_time_ticks != 0 {
-            Some(present_time_ticks)
-        } else {
-            None
-        };
+        out.metadata.set_timing(
+            Some(capture_time),
+            if present_time_ticks != 0 { Some(present_time_ticks) } else { None },
+        );
         out.metadata.is_duplicate = is_duplicate;
 
         let out_matches_source =
@@ -1965,13 +1951,12 @@ impl WindowsGraphicsCaptureCapturer {
             destination_has_history,
             source_is_duplicate,
             self.region.pending_slot.is_some(),
-        ) {
-            if let Some(sample) = self.try_short_circuit_region_duplicate(capture_time, time_ticks)
-            {
-                let _ = capture_frame.Close();
-                self.has_frame_history = true;
-                return Ok(sample);
-            }
+        ) && let Some(sample) =
+            self.try_short_circuit_region_duplicate(capture_time, time_ticks)
+        {
+            let _ = capture_frame.Close();
+            self.has_frame_history = true;
+            return Ok(sample);
         }
 
         let mut region_dirty_rects = std::mem::take(&mut self.region_dirty_rects_scratch);
@@ -2273,7 +2258,7 @@ impl WindowsGraphicsCaptureCapturer {
 
         let mut out = reuse.unwrap_or_else(Frame::empty);
         let destination_has_history =
-            out.metadata.capture_time.is_some() && !out.as_rgba_bytes().is_empty();
+            out.metadata.stream_timestamp.is_some() && !out.as_rgba_bytes().is_empty();
         let single_shot_screenshot =
             self.capture_mode == CaptureMode::Screenshot && !destination_has_history;
         out.reset_metadata();
@@ -2291,17 +2276,17 @@ impl WindowsGraphicsCaptureCapturer {
                 .read_slot_into_output(slot_idx, &mut out, destination_has_history)
                 .is_ok()
             {
-                out.metadata.capture_time = Some(capture_time);
+                out.metadata.set_timing(Some(capture_time), None);
                 out.metadata.is_duplicate = true;
                 self.has_frame_history = true;
                 return Ok(out);
             }
             self.reset_staging_pipeline();
-            out.metadata.capture_time = Some(capture_time);
+            out.metadata.set_timing(Some(capture_time), None);
             out.metadata.is_duplicate = true;
             return Ok(out);
         } else {
-            out.metadata.capture_time = Some(capture_time);
+            out.metadata.set_timing(Some(capture_time), None);
             out.metadata.is_duplicate = true;
             return Ok(out);
         };
@@ -2424,12 +2409,10 @@ impl WindowsGraphicsCaptureCapturer {
                         "failed to map WGC staging texture",
                     )?;
                 }
-                out.metadata.capture_time = Some(capture_time);
-                out.metadata.present_time_qpc = if time_ticks != 0 {
-                    Some(time_ticks)
-                } else {
-                    None
-                };
+                out.metadata.set_timing(
+                    Some(capture_time),
+                    if time_ticks != 0 { Some(time_ticks) } else { None },
+                );
                 out.metadata.is_duplicate = source_is_duplicate;
                 out.metadata.dirty_rects.clear();
                 if time_ticks != 0 {
@@ -2468,12 +2451,10 @@ impl WindowsGraphicsCaptureCapturer {
                 && out.width() == effective_desc.Width
                 && out.height() == effective_desc.Height
             {
-                out.metadata.capture_time = Some(capture_time);
-                out.metadata.present_time_qpc = if time_ticks != 0 {
-                    Some(time_ticks)
-                } else {
-                    None
-                };
+                out.metadata.set_timing(
+                    Some(capture_time),
+                    if time_ticks != 0 { Some(time_ticks) } else { None },
+                );
                 out.metadata.is_duplicate = source_is_duplicate || emitted_duplicate;
                 out.metadata.dirty_rects.clear();
                 if time_ticks != 0 {
@@ -2610,13 +2591,6 @@ impl WindowsGraphicsCaptureCapturer {
             CaptureMode::Screenshot => self.trim_scratch_for_screenshot(),
         }
     }
-
-    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
-        self.cursor_config = config;
-        let _ = self
-            .session
-            .SetIsCursorCaptureEnabled(self.cursor_config.capture_cursor);
-    }
 }
 
 impl Drop for WindowsGraphicsCaptureCapturer {
@@ -2670,10 +2644,6 @@ impl crate::backend::MonitorCapturer for WindowsMonitorCapturer {
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.inner.set_capture_mode(mode);
     }
-
-    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
-        self.inner.set_cursor_config(config);
-    }
 }
 
 pub(crate) struct WindowsWindowCapturer {
@@ -2706,10 +2676,6 @@ impl crate::backend::MonitorCapturer for WindowsWindowCapturer {
 
     fn set_capture_mode(&mut self, mode: CaptureMode) {
         self.inner.set_capture_mode(mode);
-    }
-
-    fn set_cursor_config(&mut self, config: CursorCaptureConfig) {
-        self.inner.set_cursor_config(config);
     }
 }
 

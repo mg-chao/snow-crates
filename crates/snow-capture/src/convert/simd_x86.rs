@@ -20,9 +20,6 @@ fn nt_prefix_pixels(dst: *mut u8, pixel_count: usize, alignment: usize) -> usize
     (bytes_to_align / 4).min(pixel_count)
 }
 
-// ---------------------------------------------------------------------------
-// AVX-512
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn convert_bgra_to_rgba_avx512_unchecked(
@@ -33,7 +30,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_avx512_unchecked(
     unsafe { avx512_bgra_core(src, dst, pixel_count, false, false) }
 }
 
-/// Streaming-store variant — uses non-temporal writes to bypass the cache.
+/// Streaming-store variant - uses non-temporal writes to bypass the cache.
 /// Caller must ensure `dst` will not be read back immediately (or issue an
 /// `_mm_sfence` afterwards).
 #[target_feature(enable = "avx512f,avx512bw")]
@@ -100,7 +97,7 @@ unsafe fn avx512_bgra_core(
         }
     }
 
-    // Process 128 pixels (8×16) per iteration to better amortise loop
+    // Process 128 pixels (8x16) per iteration to better amortise loop
     // overhead and improve instruction-level parallelism.
     while x + 128 <= pixel_count {
         let offset = x * 4;
@@ -163,9 +160,6 @@ unsafe fn avx512_bgra_core(
     }
 }
 
-// ---------------------------------------------------------------------------
-// AVX2
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn convert_bgra_to_rgba_avx2_unchecked(
@@ -286,9 +280,6 @@ unsafe fn avx2_bgra_core(
     }
 }
 
-// ---------------------------------------------------------------------------
-// SSSE3
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "ssse3")]
 pub(crate) unsafe fn convert_bgra_to_rgba_ssse3_unchecked(
@@ -396,28 +387,19 @@ unsafe fn ssse3_bgra_core(
     }
 }
 
-// ---------------------------------------------------------------------------
 // F16->sRGB via AVX2 + F16C
-// ---------------------------------------------------------------------------
-//
-// Uses `vcvtph2ps` (F16C) to bulk-convert half-floats to f32, then applies
-// a polynomial sRGB gamma approximation entirely in SIMD, packs to u8, and
-// writes out RGBA preserving the source alpha channel.
-//
+// Uses `vcvtph2ps` (F16C) to convert half-floats to f32, then applies
+// a SIMD sRGB approximation and preserves the source alpha channel.
 // The sRGB transfer function (IEC 61966-2-1:1999, Section 4.7) is:
-//   srgb(x) = 1.055 · x^(1/2.4) − 0.055   for x > 0.0031308
-//   srgb(x) = 12.92 · x                     for x ≤ 0.0031308
-//
+//   srgb(x) = 1.055 * x^(1/2.4) - 0.055   for x > 0.0031308
+//   srgb(x) = 12.92 * x                     for x <= 0.0031308
 // We approximate x^(1/2.4) via the classic "fast-pow" IEEE 754 bit trick:
-//
-//   reinterpret_as_int(x^p) ≈ p · reinterpret_as_int(x) + 0x3F800000 · (1 − p)
-//
+//   reinterpret_as_int(x^p) ~= p * reinterpret_as_int(x) + 0x3F800000 * (1 - p)
 // This exploits the fact that the integer representation of an IEEE 754
-// float is roughly proportional to its log₂.  The technique is described
+// float is roughly proportional to its log2.  The technique is described
 // in:
 //   - Schraudolph, N. N. (1999). "A Fast, Compact Approximation of the
-//     Exponential Function." Neural Computation, 11(4), 853–862.
-//
+//     Exponential Function." Neural Computation, 11(4), 853-62.
 // This is a speed/accuracy tradeoff; exact error depends on the input
 // distribution and platform math behavior.
 
@@ -432,7 +414,7 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_f16c_unchecked(
     }
 }
 
-/// Non-temporal store variant — uses streaming writes to bypass the cache.
+/// Non-temporal store variant - uses streaming writes to bypass the cache.
 #[target_feature(enable = "avx2,f16c")]
 pub(crate) unsafe fn convert_f16_rgba_to_srgb_f16c_nt_unchecked(
     src: *const u8,
@@ -466,7 +448,6 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
     use std::arch::x86_64::*;
 
     unsafe {
-        // sRGB constants
         let threshold = _mm256_set1_ps(0.003_130_8_f32);
         let linear_scale = _mm256_set1_ps(12.92);
         let a = _mm256_set1_ps(1.055);
@@ -476,7 +457,6 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
         let scale255 = _mm256_set1_ps(255.0);
         let half = _mm256_set1_ps(0.5);
 
-        // Fast pow constants for x^(1/2.4):
         //   as_int(x^p) ~ p * as_int(x) + 0x3F800000 * (1 - p)
         let pow_scale = _mm256_set1_ps(1.0 / 2.4);
         let pow_bias_f = 0x3F80_0000u32 as f32;
@@ -492,18 +472,12 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
         let mut dst_ptr = dst as *mut u8;
         let mut remaining = pixel_count;
 
-        // Inline helper: approximate sRGB gamma for 8 floats in [0,1]
-        // Returns 8 floats in [0,255]
         macro_rules! srgb_gamma_ps {
             ($v:expr) => {{
-                // Clamp to [0,1]
                 let clamped = _mm256_min_ps(_mm256_max_ps($v, zero), one);
 
-                // Linear segment: 12.92 * x
                 let lin = _mm256_mul_ps(clamped, linear_scale);
 
-                // Power segment: 1.055 * x^(1/2.4) - 0.055
-                // Fast x^(1/2.4) via integer bit trick
                 let xi = _mm256_castps_si256(clamped);
                 let pow_i = _mm256_add_epi32(
                     _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_cvtepi32_ps(xi), pow_scale)),
@@ -516,12 +490,10 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
                 let mask = _mm256_cmp_ps(clamped, threshold, _CMP_GT_OQ);
                 let result = _mm256_blendv_ps(lin, gamma, mask);
 
-                // Scale to [0,255] and round
                 _mm256_add_ps(_mm256_mul_ps(result, scale255), half)
             }};
         }
 
-        // Process 8 pixels per iteration (8 RGBA f16 pixels = 32 u16 = 64 bytes)
         while remaining >= 8 {
             // Prefetch source data for the next iteration (64 bytes ahead)
             if remaining >= 16 {
@@ -559,12 +531,10 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
             let b_vals = _mm256_permutevar8x32_ps(bb, perm);
             let a_vals = _mm256_permutevar8x32_ps(aa, perm);
 
-            // Apply sRGB gamma to each channel (8-wide)
             let r_srgb = srgb_gamma_ps!(r_vals);
             let g_srgb = srgb_gamma_ps!(g_vals);
             let b_srgb = srgb_gamma_ps!(b_vals);
 
-            // Alpha: linear clamp to [0,1] then scale to [0,255]
             let a_clamped = _mm256_min_ps(_mm256_max_ps(a_vals, zero), one);
             let a_srgb = _mm256_add_ps(_mm256_mul_ps(a_clamped, alpha_scale), alpha_half);
 
@@ -597,33 +567,26 @@ unsafe fn convert_f16_rgba_to_srgb_f16c_inner(
             _mm_sfence();
         }
 
-        // Scalar tail
         if remaining > 0 {
             convert_f16_rgba_to_srgb_scalar_unchecked(src_ptr as *const u8, dst_ptr, remaining);
         }
     } // unsafe
 }
 
-// ---------------------------------------------------------------------------
 // F16 HDR->sRGB via AVX2 + F16C (with PQ tonemap)
-// ---------------------------------------------------------------------------
-//
-// SIMD version of the HDR→SDR tonemap pipeline.  F16C converts half-floats
+// SIMD version of the HDR->SDR tonemap pipeline.  F16C converts half-floats
 // to f32, then we apply the same three-step algorithm as the scalar path:
-//
-//   1. White-point adjustment — rescale linear RGB by the ratio of SDR
+//   1. White-point adjustment - rescale linear RGB by the ratio of SDR
 //      white level to HDR paper white (see `adjust_hdr_whites` in f16.rs).
-//   2. Peak-luminance limiting — encode the max channel into the SMPTE
+//   2. Peak-luminance limiting - encode the max channel into the SMPTE
 //      ST 2084 PQ curve, clamp to `hdr_maximum_nits`, decode back to
 //      linear, and scale all channels uniformly. Because PQ encode/decode
 //      are monotonic inverses, this is equivalent to maxRGB clamping in
 //      linear space with hue-preserving uniform scaling (channel-max
 //      style, aligned with ITU-R BT.2408-7 Annex 5 guidance). BT.2408
 //      also notes possible perceptual artifacts for maxRGB-style limiting.
-//   3. sRGB gamma — apply the IEC 61966-2-1 transfer function.
-//
 // The PQ and sRGB transfer functions both use the fast-pow IEEE 754 bit
-// trick (see the F16→sRGB section above for references).
+// trick (see the F16->sRGB section above for references).
 
 #[target_feature(enable = "avx2,f16c")]
 pub(crate) unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_unchecked(
@@ -647,18 +610,15 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
     use std::arch::x86_64::*;
 
     unsafe {
-        // Pre-compute scalar constants from params
         let white_adjust = (params.sdr_white_level_nits / params.hdr_paper_white_nits).max(0.01);
         let inv_white_adjust = 1.0 / white_adjust;
         let max_nits_normalized = params.hdr_maximum_nits / 1000.0; // HDR_NITS_REFERENCE
 
-        // Broadcast constants
         let v_inv_white = _mm256_set1_ps(inv_white_adjust);
         let v_zero = _mm256_setzero_ps();
         let v_one = _mm256_set1_ps(1.0);
         let v_epsilon = _mm256_set1_ps(1e-6);
 
-        // PQ constants (used inside macros directly)
         let _pq_m1 = _mm256_set1_ps(0.159_301_758);
         let _pq_m2 = _mm256_set1_ps(78.843_75);
         let pq_c1 = _mm256_set1_ps(0.835_937_5);
@@ -667,7 +627,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
         let _pq_inv_m2 = _mm256_set1_ps(1.0 / 78.843_75);
         let _pq_inv_m1 = _mm256_set1_ps(1.0 / 0.159_301_758);
 
-        // sRGB constants
         let srgb_threshold = _mm256_set1_ps(0.003_130_8_f32);
         let srgb_linear_scale = _mm256_set1_ps(12.92);
         let srgb_a = _mm256_set1_ps(1.055);
@@ -675,7 +634,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
         let scale255 = _mm256_set1_ps(255.0);
         let half = _mm256_set1_ps(0.5);
 
-        // Fast pow constants
         let pow_bias_f = 0x3F80_0000u32 as f32;
 
         let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
@@ -695,7 +653,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
             }};
         }
 
-        // sRGB gamma for 8 floats in [0,1] -> [0,255]
         macro_rules! srgb_gamma_ps {
             ($v:expr) => {{
                 let clamped = _mm256_min_ps(_mm256_max_ps($v, v_zero), v_one);
@@ -717,7 +674,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
                 let num = _mm256_add_ps(pq_c1, _mm256_mul_ps(pq_c2, p));
                 let den = _mm256_add_ps(v_one, _mm256_mul_ps(pq_c3, p));
                 let ratio = _mm256_div_ps(num, den);
-                // ratio^PQ_M2
                 fast_pow_ps!(ratio, 78.843_75) // PQ_M2
             }};
         }
@@ -735,7 +691,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
             }};
         }
 
-        // Pre-compute max_2084 (constant across all pixels)
         let v_max_nits = _mm256_set1_ps(max_nits_normalized);
         let max_2084 = linear_to_pq_ps!(v_max_nits);
 
@@ -743,14 +698,12 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
         let mut dst_ptr = dst as *mut u8;
         let mut remaining = pixel_count;
 
-        // Process 8 pixels per iteration
         while remaining >= 8 {
             // Prefetch source data for the next iteration (64 bytes ahead)
             if remaining >= 16 {
                 _mm_prefetch(src_ptr.add(32) as *const i8, _MM_HINT_T0);
             }
 
-            // Load and convert F16 -> F32
             let h0 = _mm_loadu_si128(src_ptr as *const __m128i);
             let h1 = _mm_loadu_si128(src_ptr.add(8) as *const __m128i);
             let h2 = _mm_loadu_si128(src_ptr.add(16) as *const __m128i);
@@ -761,7 +714,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
             let f2 = _mm256_cvtph_ps(h2);
             let f3 = _mm256_cvtph_ps(h3);
 
-            // AoS -> SoA transpose
             let t0 = _mm256_unpacklo_ps(f0, f1);
             let t1 = _mm256_unpackhi_ps(f0, f1);
             let t2 = _mm256_unpacklo_ps(f2, f3);
@@ -782,8 +734,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
             g = _mm256_mul_ps(g, v_inv_white);
             b = _mm256_mul_ps(b, v_inv_white);
 
-            // Maximum nits limiting via PQ curve
-            // color_max = max(r, max(g, b))
             let color_max = _mm256_max_ps(r, _mm256_max_ps(g, b));
             let needs_limit = _mm256_cmp_ps(color_max, v_epsilon, _CMP_GT_OQ);
 
@@ -798,22 +748,18 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
             let safe_max = _mm256_max_ps(color_max, v_epsilon);
             let scale = _mm256_div_ps(limited_linear, safe_max);
 
-            // Apply scale only where color_max > epsilon
             let final_scale = _mm256_blendv_ps(v_one, scale, needs_limit);
             r = _mm256_mul_ps(r, final_scale);
             g = _mm256_mul_ps(g, final_scale);
             b = _mm256_mul_ps(b, final_scale);
 
-            // sRGB gamma
             let r_srgb = srgb_gamma_ps!(r);
             let g_srgb = srgb_gamma_ps!(g);
             let b_srgb = srgb_gamma_ps!(b);
 
-            // Alpha: linear clamp to [0,1] then scale to [0,255]
             let a_clamped = _mm256_min_ps(_mm256_max_ps(a_vals, v_zero), v_one);
             let a_srgb = _mm256_add_ps(_mm256_mul_ps(a_clamped, scale255), half);
 
-            // Pack to RGBA u8
             let r_i = _mm256_cvttps_epi32(r_srgb);
             let g_i = _mm256_cvttps_epi32(g_srgb);
             let b_i = _mm256_cvttps_epi32(b_srgb);
@@ -834,7 +780,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
             remaining -= 8;
         }
 
-        // Scalar tail
         if remaining > 0 {
             convert_f16_rgba_to_srgb_hdr_scalar_unchecked(
                 src_ptr as *const u8,
@@ -846,14 +791,9 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_f16c_inner(
     } // unsafe
 }
 
-// ---------------------------------------------------------------------------
 // F16->sRGB via AVX-512 + F16C (16 pixels per iteration)
-// ---------------------------------------------------------------------------
-//
 // Processes 16 RGBA f16 pixels at a time by splitting into two 8-wide
-// batches (F16C's `vcvtph2ps` operates on 128→256 bit), applying the
-// same fast-pow sRGB gamma approximation, then packing both halves into
-// a single 512-bit store.
+// batches and packing both halves into one 512-bit store.
 
 #[target_feature(enable = "avx512f,avx512bw,f16c")]
 pub(crate) unsafe fn convert_f16_rgba_to_srgb_avx512_unchecked(
@@ -864,7 +804,7 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_avx512_unchecked(
     unsafe { convert_f16_rgba_to_srgb_avx512_inner(src, dst, pixel_count, false, false) }
 }
 
-/// Non-temporal store variant for AVX-512 F16→sRGB.
+/// Non-temporal store variant for AVX-512 F16->sRGB.
 #[target_feature(enable = "avx512f,avx512bw,f16c")]
 pub(crate) unsafe fn convert_f16_rgba_to_srgb_avx512_nt_unchecked(
     src: *const u8,
@@ -894,7 +834,6 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
     use std::arch::x86_64::*;
 
     unsafe {
-        // sRGB constants (256-bit for the 8-wide sub-batches)
         let threshold = _mm256_set1_ps(0.003_130_8_f32);
         let linear_scale = _mm256_set1_ps(12.92);
         let a = _mm256_set1_ps(1.055);
@@ -927,7 +866,7 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
             }};
         }
 
-        // Process 8 RGBA f16 pixels → 8 RGBA u8 pixels (256-bit output)
+        // Process 8 RGBA f16 pixels -> 8 RGBA u8 pixels (256-bit output)
         macro_rules! convert_8px {
             ($src_ptr:expr) => {{
                 let h0 = _mm_loadu_si128($src_ptr as *const __m128i);
@@ -959,7 +898,6 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
                 let g_srgb = srgb_gamma_ps!(g_vals);
                 let b_srgb = srgb_gamma_ps!(b_vals);
 
-                // Alpha: linear clamp to [0,1] then scale to [0,255]
                 let a_clamped = _mm256_min_ps(_mm256_max_ps(a_vals, zero), one);
                 let a_srgb = _mm256_add_ps(_mm256_mul_ps(a_clamped, scale255), half);
 
@@ -982,7 +920,7 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
         let mut dst_ptr = dst as *mut u8;
         let mut remaining = pixel_count;
 
-        // Process 16 pixels per iteration (two 8-wide batches → one 512-bit store)
+        // Process 16 pixels per iteration (two 8-wide batches -> one 512-bit store)
         while remaining >= 16 {
             // Prefetch source data for the next iteration (128 bytes ahead)
             if remaining >= 32 {
@@ -1006,7 +944,6 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
             remaining -= 16;
         }
 
-        // 8-pixel tail
         if remaining >= 8 {
             let result = convert_8px!(src_ptr);
             if nontemporal {
@@ -1023,16 +960,13 @@ unsafe fn convert_f16_rgba_to_srgb_avx512_inner(
             _mm_sfence();
         }
 
-        // Scalar tail
         if remaining > 0 {
             convert_f16_rgba_to_srgb_scalar_unchecked(src_ptr as *const u8, dst_ptr, remaining);
         }
     } // unsafe
 }
 
-// ---------------------------------------------------------------------------
 // F16 HDR->sRGB via AVX-512 + F16C (16 pixels per iteration, with PQ tonemap)
-// ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx512f,avx512bw,f16c")]
 pub(crate) unsafe fn convert_f16_rgba_to_srgb_hdr_avx512_unchecked(
@@ -1128,7 +1062,7 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_avx512_inner(
         let v_max_nits = _mm256_set1_ps(max_nits_normalized);
         let max_2084 = linear_to_pq_ps!(v_max_nits);
 
-        // Process 8 HDR f16 pixels → 8 RGBA u8 pixels (256-bit output)
+        // Process 8 HDR f16 pixels -> 8 RGBA u8 pixels (256-bit output)
         macro_rules! convert_8px_hdr {
             ($src_ptr:expr) => {{
                 let h0 = _mm_loadu_si128($src_ptr as *const __m128i);
@@ -1179,7 +1113,6 @@ unsafe fn convert_f16_rgba_to_srgb_hdr_avx512_inner(
                 let g_srgb = srgb_gamma_ps!(g);
                 let b_srgb = srgb_gamma_ps!(b);
 
-                // Alpha: linear clamp to [0,1] then scale to [0,255]
                 let a_clamped = _mm256_min_ps(_mm256_max_ps(a_vals, v_zero), v_one);
                 let a_srgb = _mm256_add_ps(_mm256_mul_ps(a_clamped, scale255), half);
 

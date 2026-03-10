@@ -1,4 +1,4 @@
-﻿use anyhow::Context;
+use anyhow::Context;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, ID3D11Device,
     ID3D11DeviceContext, ID3D11Query, ID3D11Resource, ID3D11Texture2D,
@@ -12,18 +12,10 @@ use crate::frame::DirtyRect;
 
 use super::surface::{self, StagingSampleDesc};
 
-// ---------------------------------------------------------------------------
-// Spin-poll tuning constants shared by both GPU backends.
-// ---------------------------------------------------------------------------
-
 pub(crate) const REGION_SPIN_INITIAL_POLLS: u32 = 4;
 pub(crate) const REGION_SPIN_MIN_POLLS: u32 = 2;
 pub(crate) const REGION_SPIN_MAX_POLLS: u32 = 64;
 pub(crate) const REGION_SPIN_INCREASE_STEP: u32 = 4;
-
-// ---------------------------------------------------------------------------
-// RegionSlot trait 鈥?abstracts slot reset behaviour that differs per backend.
-// ---------------------------------------------------------------------------
 
 /// Trait abstracting the slot reset behavior that differs between backends.
 ///
@@ -31,16 +23,9 @@ pub(crate) const REGION_SPIN_INCREASE_STEP: u32 = 4;
 /// textures), while WGC calls `invalidate` (drops them).  Both backends call
 /// `invalidate` for the stronger teardown path.
 pub(crate) trait RegionSlot: Default {
-    /// Soft reset 鈥?clear runtime bookkeeping but may keep GPU resources.
     fn soft_reset(&mut self);
-    /// Hard reset 鈥?drop everything including GPU resources.
     fn hard_reset(&mut self);
 }
-
-// ---------------------------------------------------------------------------
-// RegionStagingSlotAccess 鈥?read/write access to the common slot fields
-// needed by the shared pipeline helpers.
-// ---------------------------------------------------------------------------
 
 /// Provides access to the common staging-slot fields that the shared region
 /// pipeline helpers need.  Each backend implements this for its own slot type.
@@ -53,9 +38,6 @@ pub(crate) trait RegionStagingSlotAccess {
     fn dirty_gpu_copy_preferred(&self) -> bool;
 }
 
-// ---------------------------------------------------------------------------
-// RegionPipelineState 鈥?shared bookkeeping embedded by both GPU backends.
-// ---------------------------------------------------------------------------
 
 /// Shared region-pipeline bookkeeping embedded by both GPU backends.
 ///
@@ -81,12 +63,16 @@ impl<S: RegionSlot, const N: usize> RegionPipelineState<S, N> {
         }
     }
 
-    /// Soft-reset the pipeline: clear bookkeeping and soft-reset each slot.
-    pub fn reset(&mut self) {
+    fn clear_pipeline_state(&mut self) {
         self.pending_slot = None;
         self.next_write_slot = 0;
         self.adaptive_spin_polls = REGION_SPIN_INITIAL_POLLS;
         self.blit = None;
+    }
+
+    /// Soft-reset the pipeline: clear bookkeeping and soft-reset each slot.
+    pub fn reset(&mut self) {
+        self.clear_pipeline_state();
         for slot in &mut self.slots {
             slot.soft_reset();
         }
@@ -94,10 +80,7 @@ impl<S: RegionSlot, const N: usize> RegionPipelineState<S, N> {
 
     /// Hard-reset the pipeline: clear bookkeeping and fully invalidate each slot.
     pub fn invalidate(&mut self) {
-        self.pending_slot = None;
-        self.next_write_slot = 0;
-        self.adaptive_spin_polls = REGION_SPIN_INITIAL_POLLS;
-        self.blit = None;
+        self.clear_pipeline_state();
         for slot in &mut self.slots {
             slot.hard_reset();
         }
@@ -113,13 +96,6 @@ impl<S: RegionSlot, const N: usize> RegionPipelineState<S, N> {
         self.blit = Some(blit);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Shared GPU pipeline helpers 鈥?free functions operating on D3D11 context +
-// slot references.  These encapsulate the mechanical D3D11 operations that
-// are identical between DXGI and WGC.
-// ---------------------------------------------------------------------------
-
 /// Check whether a D3D11 event query has been signalled.
 ///
 /// The DXGI backend intentionally ignores the `data` value (for

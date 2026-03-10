@@ -514,7 +514,6 @@ fn benchmark_workload(workload: &Workload, rounds: usize, iterations: usize) -> 
         best_direct_hinted = best_direct_hinted.min(direct_hinted_start.elapsed());
     }
 
-    // Correctness parity check on a single pass.
     let mut work_item_once = vec![0u8; buffer_len];
     let mut direct_scan_once = vec![0u8; buffer_len];
     let mut direct_hinted_once = vec![0u8; buffer_len];

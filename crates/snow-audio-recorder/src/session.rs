@@ -17,34 +17,34 @@ pub struct SourceConfig {
 }
 
 impl SourceConfig {
-    pub fn default_system() -> Self {
+    fn with_defaults(device: DeviceSelector, channels: u16) -> Self {
         Self {
             enabled: true,
             required: true,
-            device: DeviceSelector::DefaultRender,
-            output_format: AudioFormat::new(48_000, 2, AudioSampleFormat::F32),
+            device,
+            output_format: AudioFormat::new(48_000, channels, AudioSampleFormat::F32),
             packet_duration: Duration::from_millis(10),
         }
+    }
+
+    pub fn default_system() -> Self {
+        Self::with_defaults(DeviceSelector::DefaultRender, 2)
     }
 
     pub fn default_microphone() -> Self {
-        Self {
-            enabled: true,
-            required: true,
-            device: DeviceSelector::DefaultCapture,
-            output_format: AudioFormat::new(48_000, 1, AudioSampleFormat::F32),
-            packet_duration: Duration::from_millis(10),
-        }
+        Self::with_defaults(DeviceSelector::DefaultCapture, 1)
     }
 
     pub fn validate(&self) -> AudioResult<()> {
-        if self.enabled {
-            self.output_format.validate()?;
-            if self.packet_duration.is_zero() {
-                return Err(crate::error::AudioError::InvalidConfig(
-                    "packet duration must be greater than zero".into(),
-                ));
-            }
+        if !self.enabled {
+            return Ok(());
+        }
+
+        self.output_format.validate()?;
+        if self.packet_duration.is_zero() {
+            return Err(crate::error::AudioError::InvalidConfig(
+                "packet duration must be greater than zero".into(),
+            ));
         }
         Ok(())
     }
@@ -173,9 +173,10 @@ impl AudioSessionBuilder {
     }
 
     pub fn build(self) -> AudioResult<AudioSession> {
-        let backend = match self.backend_override {
-            Some(backend) => backend,
-            None => backend::backend_for_kind(self.backend_kind)?,
+        let backend = if let Some(backend) = self.backend_override {
+            backend
+        } else {
+            backend::backend_for_kind(self.backend_kind)?
         };
 
         Ok(AudioSession { backend })

@@ -1,6 +1,11 @@
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cursor")]
+pub use snow_cursor_capture::{CursorCompositionMode, CursorFrameSample, CursorShape};
+
 use crate::error::{CaptureError, CaptureResult};
+use snow_core::event::StreamEvent;
+use snow_core::timestamp::{StreamTimestamp, TickFormat};
 
 /// Color space / transfer function describing the frame's pixel data.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -20,8 +25,8 @@ pub enum ColorSpace {
 }
 
 /// Minimum allocation size to attempt large-page backing.
-/// 4K RGBA = 3840×2160×4 ≈ 33 MB — well above the 2 MB large page size.
-/// We only bother for allocations ≥ 4 MB to avoid overhead on small captures.
+/// 4K RGBA = 3840x2160x4 ~= 33 MB - well above the 2 MB large page size.
+/// We only bother for allocations >= 4 MB to avoid overhead on small captures.
 const LARGE_PAGE_MIN_BYTES: usize = 4 * 1024 * 1024;
 
 /// A rectangle describing a dirty (changed) region of the screen.
@@ -33,44 +38,19 @@ pub struct DirtyRect {
     pub height: u32,
 }
 
-/// Cursor shape data captured alongside the frame.
-#[derive(Clone, Debug)]
-pub struct CursorData {
-    /// Cursor hotspot X relative to the cursor image.
-    pub hotspot_x: u32,
-    /// Cursor hotspot Y relative to the cursor image.
-    pub hotspot_y: u32,
-    /// Cursor position X in desktop coordinates.
-    pub position_x: i32,
-    /// Cursor position Y in desktop coordinates.
-    pub position_y: i32,
-    /// Whether the cursor is currently visible.
-    pub visible: bool,
-    /// Cursor image width in pixels.
-    pub shape_width: u32,
-    /// Cursor image height in pixels.
-    pub shape_height: u32,
-    /// RGBA8 pixel data for the cursor shape.
-    pub shape_rgba: Vec<u8>,
-}
+/// Cursor data captured alongside the frame.
+#[cfg(feature = "cursor")]
+pub type CursorData = CursorFrameSample;
 
 /// Metadata attached to each captured frame for recording pipelines.
 #[derive(Clone, Debug, Default)]
 pub struct FrameMetadata {
-    /// Monotonic timestamp taken immediately after the frame was acquired
-    /// from the OS capture API. Use for frame pacing and drop detection.
-    pub capture_time: Option<Instant>,
-    /// OS presentation timestamp in QPC ticks (100ns units on Windows).
-    /// Sourced from `DXGI_OUTDUPL_FRAME_INFO.LastPresentTime` or
-    /// `Direct3D11CaptureFrame.SystemRelativeTime`. More accurate than
-    /// `capture_time` for A/V sync.
-    pub present_time_qpc: Option<i64>,
     /// Wall-clock time spent inside the capture call (GPU readback,
     /// staging copy, pixel conversion). Lets recorders detect when the
     /// capture pipeline itself is the bottleneck vs. the encoder.
     pub capture_duration: Option<Duration>,
     /// Whether this frame's content is identical to the previous frame.
-    /// `true` means no new desktop present occurred — a recorder can skip
+    /// `true` means no new desktop present occurred - a recorder can skip
     /// encoding this frame to save bitrate.
     pub is_duplicate: bool,
     /// Dirty rectangles describing which regions changed since the last
@@ -79,6 +59,7 @@ pub struct FrameMetadata {
     pub dirty_rects: Vec<DirtyRect>,
     /// Cursor shape and position at the time of capture. `None` when
     /// cursor capture is not enabled or not supported by the backend.
+    #[cfg(feature = "cursor")]
     pub cursor: Option<CursorData>,
     /// Monotonic sequence number incremented for each capture call.
     /// Useful for correlating frames across threads.
@@ -87,86 +68,20 @@ pub struct FrameMetadata {
     /// `Srgb` for standard dynamic range captures. HDR pipelines can
     /// check this to decide whether tonemapping or passthrough is needed.
     pub color_space: ColorSpace,
+    /// Unified timestamp. `tick_format` is `RawQpc`.
+    pub stream_timestamp: Option<StreamTimestamp>,
 }
 
-/// Anchor for converting raw QPC ticks into stream-relative durations.
-///
-/// Created from the first frame's `present_time_qpc` (or `capture_time`
-/// when QPC is unavailable). All subsequent frames can be mapped to a
-/// consistent `Duration` offset from stream start via
-/// [`stream_relative`](Self::stream_relative).
-#[derive(Clone, Debug)]
-pub struct FrameTimestampAnchor {
-    /// QPC ticks of the first frame (if available).
-    origin_qpc: Option<i64>,
-    /// `Instant` of the first frame (fallback when QPC is absent).
-    origin_instant: Instant,
-    /// QPC frequency (ticks per second), cached at construction.
-    qpc_frequency: i64,
-}
-
-impl FrameTimestampAnchor {
-    /// Build an anchor from the first captured frame's metadata.
-    pub fn from_first_frame(meta: &FrameMetadata) -> Self {
-        let qpc_frequency = qpc_frequency_cached();
-        Self {
-            origin_qpc: meta.present_time_qpc,
-            origin_instant: meta.capture_time.unwrap_or_else(Instant::now),
-            qpc_frequency,
-        }
-    }
-
-    /// Raw QPC ticks of the stream origin frame. Useful for correlating
-    /// with WASAPI audio timestamps which also use QPC.
-    pub fn origin_qpc_ticks(&self) -> Option<i64> {
-        self.origin_qpc
-    }
-
-    /// QPC tick frequency (ticks per second). Returns 0 on non-Windows.
-    pub fn qpc_frequency(&self) -> i64 {
-        self.qpc_frequency
-    }
-
-    /// The `Instant` of the stream origin frame.
-    pub fn origin_instant(&self) -> Instant {
-        self.origin_instant
-    }
-
-    /// Convert a frame's timestamp to a stream-relative `Duration`.
+impl FrameMetadata {
+    /// Set timing fields from a capture operation.
     ///
-    /// Uses QPC when both the anchor and the frame have QPC timestamps,
-    /// otherwise falls back to `capture_time` difference.
-    pub fn stream_relative(&self, meta: &FrameMetadata) -> Duration {
-        if let (Some(origin), Some(current)) = (self.origin_qpc, meta.present_time_qpc) {
-            let delta_ticks = current.saturating_sub(origin).max(0);
-            if self.qpc_frequency > 0 {
-                let secs = delta_ticks / self.qpc_frequency;
-                let remainder = delta_ticks % self.qpc_frequency;
-                let nanos = (remainder as u128 * 1_000_000_000) / self.qpc_frequency as u128;
-                return Duration::new(secs as u64, nanos as u32);
-            }
-        }
-        // Fallback: Instant-based delta.
-        meta.capture_time
-            .unwrap_or_else(Instant::now)
-            .saturating_duration_since(self.origin_instant)
-    }
-}
-
-/// Cached QPC frequency. Returns 0 if unavailable.
-fn qpc_frequency_cached() -> i64 {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::System::Performance::QueryPerformanceFrequency;
-        let mut freq = 0i64;
-        unsafe {
-            let _ = QueryPerformanceFrequency(&mut freq);
-        }
-        freq
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        0
+    /// Populates `stream_timestamp` from the capture time and QPC value.
+    pub(crate) fn set_timing(&mut self, capture_time: Option<Instant>, present_time_qpc: Option<i64>) {
+        self.stream_timestamp = Some(StreamTimestamp {
+            instant: capture_time.unwrap_or_else(Instant::now),
+            raw_os_ticks: present_time_qpc,
+            tick_format: TickFormat::RawQpc,
+        });
     }
 }
 
@@ -215,6 +130,31 @@ pub enum CaptureEvent {
     /// The stream encountered a fatal error and is about to exit.
     /// After receiving this event the channel will disconnect.
     Error(CaptureError),
+}
+
+impl StreamEvent for CaptureEvent {
+    fn is_paused(&self) -> bool {
+        matches!(self, CaptureEvent::Paused { .. })
+    }
+
+    fn is_resumed(&self) -> bool {
+        matches!(self, CaptureEvent::Resumed { .. })
+    }
+
+    fn is_stream_ended(&self) -> bool {
+        matches!(self, CaptureEvent::StreamEnded)
+    }
+
+    fn is_error(&self) -> bool {
+        matches!(self, CaptureEvent::Error(_))
+    }
+
+    fn timestamp(&self) -> Option<&StreamTimestamp> {
+        match self {
+            CaptureEvent::Frame(frame) => frame.metadata.stream_timestamp.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 pub struct Frame {
@@ -274,7 +214,6 @@ fn try_alloc_large_pages(size: usize) -> Option<LargePageAlloc> {
         return None;
     }
 
-    // Round up to large page boundary
     let aligned_size = (size + large_page_size - 1) & !(large_page_size - 1);
 
     let ptr = unsafe {
@@ -349,7 +288,6 @@ impl FrameBuffer {
             return;
         }
 
-        // If current backing can hold the new size, just adjust length.
         if len <= self.capacity() {
             match self {
                 FrameBuffer::Vec(v) => unsafe { v.set_len(len) },
@@ -359,17 +297,13 @@ impl FrameBuffer {
             return;
         }
 
-        // Need a new allocation — try large pages first on Windows.
         #[cfg(target_os = "windows")]
-        if len >= LARGE_PAGE_MIN_BYTES {
-            if let Some(mut lp) = try_alloc_large_pages(len) {
-                lp.len = len;
-                *self = FrameBuffer::LargePage(lp);
-                return;
-            }
+        if len >= LARGE_PAGE_MIN_BYTES && let Some(mut lp) = try_alloc_large_pages(len) {
+            lp.len = len;
+            *self = FrameBuffer::LargePage(lp);
+            return;
         }
 
-        // Fall back to Vec with headroom.
         let headroom = len / 8;
         let mut v = Vec::with_capacity(len + headroom);
         unsafe { v.set_len(len) };
@@ -443,12 +377,12 @@ impl Frame {
     /// Called at the start of each capture to avoid stale metadata from
     /// a reused frame leaking into the new result.
     pub(crate) fn reset_metadata(&mut self) {
-        self.metadata.capture_time = None;
-        self.metadata.present_time_qpc = None;
+        self.metadata.stream_timestamp = None;
         self.metadata.capture_duration = None;
         self.metadata.is_duplicate = false;
         self.metadata.dirty_rects.clear();
-        self.metadata.cursor = None;
+        #[cfg(feature = "cursor")]
+        { self.metadata.cursor = None; }
         self.metadata.color_space = ColorSpace::default();
         // sequence is set by the session, not reset here
     }
@@ -470,5 +404,225 @@ impl std::fmt::Debug for Frame {
             .field("data_len", &self.data.len())
             .field("metadata", &self.metadata)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use snow_core::timestamp::TickFormat;
+
+    // **Validates: Requirements 1.2, 1.3**
+    //
+    // Property 2: Tick format matches source type
+    //
+    // For any `FrameMetadata` with timing set (any combination of
+    // `capture_time` and QPC values including `None`),
+    // `stream_timestamp.tick_format` SHALL be `TickFormat::RawQpc`.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn prop_frame_metadata_tick_format_always_rawqpc(
+            has_capture_time in proptest::bool::ANY,
+            has_qpc in proptest::bool::ANY,
+            qpc_value in proptest::num::i64::ANY,
+        ) {
+            let capture_time = if has_capture_time { Some(Instant::now()) } else { None };
+            let qpc = if has_qpc { Some(qpc_value) } else { None };
+
+            let mut meta = FrameMetadata::default();
+            meta.set_timing(capture_time, qpc);
+
+            let ts = meta.stream_timestamp.as_ref()
+                .expect("stream_timestamp must be Some after set_timing");
+            prop_assert_eq!(ts.tick_format, TickFormat::RawQpc,
+                "FrameMetadata tick_format must always be RawQpc, got {:?}", ts.tick_format);
+        }
+    }
+
+    // **Validates: Requirements 1.6, 1.7, 7.2**
+    //
+    // Property 1: Leaf metadata always populates stream_timestamp
+    //
+    // For any call to `FrameMetadata::set_timing` with any combination of
+    // `capture_time` (Some/None) and QPC values (Some/None), the resulting
+    // `stream_timestamp` SHALL be `Some` with a valid `Instant`.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_frame_metadata_always_populates_stream_timestamp(
+            has_capture_time in proptest::bool::ANY,
+            has_qpc in proptest::bool::ANY,
+            qpc_value in proptest::num::i64::ANY,
+        ) {
+            let capture_time = if has_capture_time { Some(Instant::now()) } else { None };
+            let qpc = if has_qpc { Some(qpc_value) } else { None };
+
+            let mut meta = FrameMetadata::default();
+            let before = Instant::now();
+            meta.set_timing(capture_time, qpc);
+            let after = Instant::now();
+
+            // stream_timestamp must always be Some
+            let ts = meta.stream_timestamp.as_ref();
+            prop_assert!(ts.is_some(), "stream_timestamp must always be Some after set_timing");
+
+            let ts = ts.unwrap();
+
+            // instant must be valid (between before and after, or equal to capture_time)
+            if let Some(ct) = capture_time {
+                prop_assert_eq!(ts.instant, ct,
+                    "instant should equal the provided capture_time");
+            } else {
+                // When capture_time is None, instant is Instant::now() at call time
+                prop_assert!(ts.instant >= before,
+                    "instant should be >= time before set_timing call");
+                prop_assert!(ts.instant <= after,
+                    "instant should be <= time after set_timing call");
+            }
+
+            // raw_os_ticks should match the provided QPC
+            prop_assert_eq!(ts.raw_os_ticks, qpc,
+                "raw_os_ticks should match the provided QPC value");
+        }
+    }
+
+    // ── Strategies for generating random CaptureEvent variants ──
+
+    /// Build a `Frame` with an optional `stream_timestamp`.
+    fn arb_frame(has_timestamp: bool) -> Frame {
+        let mut frame = Frame::empty();
+        if has_timestamp {
+            frame.metadata.set_timing(Some(Instant::now()), Some(42));
+        }
+        frame
+    }
+
+    /// Strategy that produces random `CaptureEvent` variants.
+    fn arb_capture_event() -> impl Strategy<Value = CaptureEvent> {
+        prop_oneof![
+            // Frame with stream_timestamp set
+            Just(()).prop_map(|_| CaptureEvent::Frame(arb_frame(true))),
+            // Frame without stream_timestamp
+            Just(()).prop_map(|_| CaptureEvent::Frame(arb_frame(false))),
+            // ResolutionChanged with random dimensions
+            (1u32..4096, 1u32..4096, 1u32..4096, 1u32..4096).prop_map(
+                |(ow, oh, nw, nh)| CaptureEvent::ResolutionChanged {
+                    old_width: ow,
+                    old_height: oh,
+                    new_width: nw,
+                    new_height: nh,
+                }
+            ),
+            // FrameDropped with random sequence
+            any::<u64>().prop_map(|seq| CaptureEvent::FrameDropped { sequence: seq }),
+            // Paused
+            Just(()).prop_map(|_| CaptureEvent::Paused { at: Instant::now() }),
+            // Resumed
+            (0u64..10_000).prop_map(|gap_ms| CaptureEvent::Resumed {
+                at: Instant::now(),
+                gap: Duration::from_millis(gap_ms),
+            }),
+            // StreamEnded
+            Just(()).prop_map(|_| CaptureEvent::StreamEnded),
+            // Error
+            Just(()).prop_map(|_| CaptureEvent::Error(CaptureError::Timeout)),
+        ]
+    }
+
+    // **Validates: Requirements 3.3, 3.6**
+    //
+    // Property 3: StreamEvent lifecycle consistency (CaptureEvent)
+    //
+    // For lifecycle variants (Paused, Resumed, StreamEnded, Error), exactly
+    // one lifecycle method returns true. For data/control variants (Frame,
+    // FrameDropped, ResolutionChanged), all lifecycle methods return false.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn prop_capture_event_lifecycle_consistency(event in arb_capture_event()) {
+            let lifecycle_results = [
+                event.is_paused(),
+                event.is_resumed(),
+                event.is_stream_ended(),
+                event.is_error(),
+            ];
+            let true_count = lifecycle_results.iter().filter(|&&v| v).count();
+
+            let is_lifecycle_variant = matches!(
+                event,
+                CaptureEvent::Paused { .. }
+                    | CaptureEvent::Resumed { .. }
+                    | CaptureEvent::StreamEnded
+                    | CaptureEvent::Error(_)
+            );
+
+            if is_lifecycle_variant {
+                // Exactly one lifecycle method returns true
+                prop_assert_eq!(
+                    true_count, 1,
+                    "lifecycle variant should have exactly one true method, got {}",
+                    true_count
+                );
+            } else {
+                // Data/control variants: all lifecycle methods return false
+                prop_assert_eq!(
+                    true_count, 0,
+                    "data/control variant should have all false lifecycle methods, got {} true",
+                    true_count
+                );
+            }
+
+            // Verify specific lifecycle method matches the variant
+            match &event {
+                CaptureEvent::Paused { .. } => {
+                    prop_assert!(event.is_paused());
+                    prop_assert!(!event.is_resumed());
+                    prop_assert!(!event.is_stream_ended());
+                    prop_assert!(!event.is_error());
+                }
+                CaptureEvent::Resumed { .. } => {
+                    prop_assert!(!event.is_paused());
+                    prop_assert!(event.is_resumed());
+                    prop_assert!(!event.is_stream_ended());
+                    prop_assert!(!event.is_error());
+                }
+                CaptureEvent::StreamEnded => {
+                    prop_assert!(!event.is_paused());
+                    prop_assert!(!event.is_resumed());
+                    prop_assert!(event.is_stream_ended());
+                    prop_assert!(!event.is_error());
+                }
+                CaptureEvent::Error(_) => {
+                    prop_assert!(!event.is_paused());
+                    prop_assert!(!event.is_resumed());
+                    prop_assert!(!event.is_stream_ended());
+                    prop_assert!(event.is_error());
+                }
+                _ => {}
+            }
+
+            // Verify timestamp() behavior:
+            // - Frame with stream_timestamp set → Some
+            // - All other variants → None
+            match &event {
+                CaptureEvent::Frame(frame) => {
+                    if frame.metadata.stream_timestamp.is_some() {
+                        prop_assert!(event.timestamp().is_some(),
+                            "Frame with stream_timestamp should return Some from timestamp()");
+                    } else {
+                        prop_assert!(event.timestamp().is_none(),
+                            "Frame without stream_timestamp should return None from timestamp()");
+                    }
+                }
+                _ => {
+                    prop_assert!(event.timestamp().is_none(),
+                        "Non-Frame variant should return None from timestamp()");
+                }
+            }
+        }
     }
 }

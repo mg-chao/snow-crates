@@ -1,4 +1,4 @@
-﻿use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -21,20 +21,11 @@ use super::monitor::ResolvedMonitor;
 const WM_QUIT_LISTENER: u32 = WM_USER + 1;
 
 /// Shared state that the listener thread writes to and readers consume.
+#[derive(Default)]
 struct DisplayCacheState {
     monitors: Vec<MonitorId>,
     resolved: Vec<ResolvedMonitor>,
     refreshed_at: Option<Instant>,
-}
-
-impl Default for DisplayCacheState {
-    fn default() -> Self {
-        Self {
-            monitors: Vec::new(),
-            resolved: Vec::new(),
-            refreshed_at: None,
-        }
-    }
 }
 
 /// A display information cache that refreshes when Windows sends
@@ -64,11 +55,8 @@ impl DisplayInfoCache {
             running: AtomicBool::new(false),
         });
 
-        // Perform initial enumeration synchronously so callers have data
-        // right away.
         cache.refresh()?;
 
-        // Spawn the background listener.
         cache.start_listener()?;
 
         Ok(cache)
@@ -186,7 +174,6 @@ impl DisplayInfoCache {
         };
 
         if let Some(hwnd) = hwnd {
-            // Post our custom quit message to break the GetMessage loop.
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_QUIT_LISTENER, WPARAM(0), LPARAM(0));
             }
@@ -210,10 +197,6 @@ impl Drop for DisplayInfoCache {
         self.stop_listener();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Listener thread
-// ---------------------------------------------------------------------------
 
 /// Class name for our message-only window.
 const CLASS_NAME: &str = "SnowCaptureDisplayChangeListener";

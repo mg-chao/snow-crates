@@ -34,7 +34,6 @@ fn window_under_cursor() -> Result<isize> {
         anyhow::bail!("no window found under cursor at ({}, {})", pt.x, pt.y);
     }
 
-    // Walk up to the top-level (root) window so we capture the whole thing.
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
     let handle = if root.0.is_null() { hwnd } else { root };
 

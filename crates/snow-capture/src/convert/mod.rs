@@ -7,15 +7,11 @@ mod simd_x86;
 use parallel::{install_conversion_pool, parallel_chunk_pixels, should_parallelize};
 use std::sync::OnceLock;
 
-/// Pre-initialize expensive one-time resources (rayon thread pool, F16 LUT,
 /// SIMD kernel selection) so the first capture doesn't pay the cost.
-/// Safe to call multiple times — only the first call does real work.
+/// Safe to call multiple times - only the first call does real work.
 pub fn warmup() {
-    // Thread pool
     parallel::warmup_pool(CONVERSION_PARALLEL_MAX_WORKERS);
-    // F16→sRGB lookup table (64 KB, ~1-2 ms to build)
     f16::warmup_lut();
-    // Force kernel selection OnceLocks
     let _ = bgra_kernel();
     let _ = bgra_kernel_nt();
     let _ = bgra_kernel_nt_nofence();
@@ -48,7 +44,7 @@ const BGRA_PARALLEL_MIN_CHUNK_PIXELS: usize = 131_072;
 const BGRA_PARALLEL_MAX_WORKERS: usize = 9;
 
 /// Lower threshold for the non-temporal path used where `src != dst` is
-/// guaranteed (GDI capture, DXGI staging→frame).  256K pixels lets us
+/// guaranteed (GDI capture, DXGI staging->frame).  256K pixels lets us
 /// parallelise earlier while still keeping chunks large enough to
 /// amortise rayon overhead.
 const BGRA_NT_PARALLEL_MIN_PIXELS: usize = 262_144;
@@ -74,14 +70,14 @@ pub enum SurfacePixelFormat {
     Rgba16Float,
 }
 
-/// Parameters controlling the HDR→SDR tonemapping pipeline.
+/// Parameters controlling the HDR->SDR tonemapping pipeline.
 ///
 /// The conversion is a two-step process:
 ///
-///   1. White-point normalisation — rescale linear RGB so that the HDR
+///   1. White-point normalisation - rescale linear RGB so that the HDR
 ///      "paper white" level (`hdr_paper_white_nits`) maps to the SDR
 ///      display's white level (`sdr_white_level_nits`).
-///   2. Peak-luminance limiting — encode the brightest channel into the
+///   2. Peak-luminance limiting - encode the brightest channel into the
 ///      SMPTE ST 2084 PQ curve, clamp to `hdr_maximum_nits`, decode
 ///      back to linear, and scale all channels uniformly.  Because the
 ///      PQ helpers are monotonic inverses, this is equivalent to a
@@ -94,17 +90,17 @@ pub enum SurfacePixelFormat {
 /// gamma curve and quantised to 8-bit RGBA.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HdrToSdrParams {
-    /// The luminance (in cd/m²) that the HDR content considers "paper white"
-    /// — i.e. the brightness of a white UI element or document background.
+    /// The luminance (in cd/m^2) that the HDR content considers "paper white"
+    /// - i.e. the brightness of a white UI element or document background.
     /// In desktop capture this is often an assumption from the caller; when
     /// explicit content metadata is unavailable we fall back to 80 nits.
     /// Typical values: 80 (SDR reference) to 200+ (bright HDR UIs).
     pub hdr_paper_white_nits: f32,
-    /// The peak luminance (in cd/m²) of the HDR display used as the
+    /// The peak luminance (in cd/m^2) of the HDR display used as the
     /// channel-max limiter target in step 2.
     /// Common values: 1000 (entry-level HDR) to 4000+ (high-end panels).
     pub hdr_maximum_nits: f32,
-    /// The luminance (in cd/m²) that the SDR output considers "white".
+    /// The luminance (in cd/m^2) that the SDR output considers "white".
     /// 80 nits is the SDR reference white (IEC 61966-2-1), but in Windows HDR
     /// mode this is user/display dependent (`DISPLAYCONFIG_SDR_WHITE_LEVEL`).
     pub sdr_white_level_nits: f32,
@@ -136,13 +132,13 @@ impl HdrToSdrParams {
 }
 
 impl Default for HdrToSdrParams {
-    /// Conservative fallback defaults for HDR→SDR conversion:
-    ///   - `hdr_paper_white_nits = 80.0` — the sRGB reference white
+    /// Conservative fallback defaults for HDR->SDR conversion:
+    ///   - `hdr_paper_white_nits = 80.0` - the sRGB reference white
     ///     (IEC 61966-2-1); used as a fallback assumption when no explicit
     ///     content paper-white metadata is available.
-    ///   - `hdr_maximum_nits = 1000.0` — a typical entry-level HDR
+    ///   - `hdr_maximum_nits = 1000.0` - a typical entry-level HDR
     ///     display peak and common HDR10 mastering target.
-    ///   - `sdr_white_level_nits = 80.0` — SDR reference white fallback.
+    ///   - `sdr_white_level_nits = 80.0` - SDR reference white fallback.
     fn default() -> Self {
         Self {
             hdr_paper_white_nits: 80.0,
@@ -720,11 +716,11 @@ unsafe fn run_rows_serial_nt(layout: SurfaceLayout, kernel: PixelKernel) {
 /// Minimum pixel count for non-temporal stores to be beneficial.
 /// Below this threshold the destination buffer likely fits in L3 cache
 /// and temporal stores are faster (avoids write-combine overhead).
-/// ~128K pixels ≈ 512 KB at 4 bytes/pixel — well below typical L3
+/// ~128K pixels ~= 512 KB at 4 bytes/pixel - well below typical L3
 /// sizes but large enough that write-allocate traffic starts to hurt.
 /// Decoupled from the parallelisation thresholds so that medium-
-/// resolution captures (e.g. 720p–1080p) still benefit from NT stores
-/// in the staging→frame path where src != dst is guaranteed.
+/// resolution captures (e.g. 720p-1080p) still benefit from NT stores
+/// in the staging->frame path where src != dst is guaranteed.
 const NT_STORE_MIN_PIXELS: usize = 131_072;
 
 #[inline(always)]
@@ -1162,7 +1158,7 @@ unsafe fn memcpy_rgba_unchecked(src: *const u8, dst: *mut u8, pixel_count: usize
 
 /// Non-temporal passthrough copy for RGBA8 data.  Uses streaming stores
 /// to avoid polluting the cache when the destination won't be read back
-/// before the next capture (staging→frame path).
+/// before the next capture (staging->frame path).
 unsafe fn memcpy_rgba_nt_unchecked(src: *const u8, dst: *mut u8, pixel_count: usize) {
     unsafe {
         memcpy_rgba_nt_impl(src, dst, pixel_count, true);
@@ -1197,7 +1193,6 @@ unsafe fn memcpy_rgba_nt_impl(src: *const u8, dst: *mut u8, pixel_count: usize, 
             return;
         }
     }
-    // Fallback: regular copy
     unsafe {
         std::ptr::copy_nonoverlapping(src, dst, pixel_count * 4);
     }
@@ -1314,14 +1309,14 @@ fn bgra_kernel_nt_nofence() -> PixelKernel {
     *KERNEL.get_or_init(select_bgra_kernel_nt_nofence)
 }
 
-/// Best-available F16→sRGB kernel (SIMD when possible, scalar fallback).
+/// Best-available F16->sRGB kernel (SIMD when possible, scalar fallback).
 #[inline(always)]
 fn f16_kernel() -> PixelKernel {
     static KERNEL: OnceLock<PixelKernel> = OnceLock::new();
     *KERNEL.get_or_init(select_f16_kernel)
 }
 
-/// Non-temporal (streaming-store) variant of the F16→sRGB kernel.
+/// Non-temporal (streaming-store) variant of the F16->sRGB kernel.
 /// Uses NT stores for the output to avoid cache pollution on large surfaces.
 #[inline(always)]
 fn f16_kernel_nt() -> PixelKernel {
@@ -1370,7 +1365,6 @@ fn select_f16_kernel_nt() -> PixelKernel {
         }
     }
 
-    // Scalar path has no NT variant; fall back to the regular kernel.
     f16::convert_f16_rgba_to_srgb_scalar_unchecked
 }
 
@@ -1390,11 +1384,10 @@ fn select_f16_kernel_nt_nofence() -> PixelKernel {
         }
     }
 
-    // Scalar path has no NT variant; fall back to the regular kernel.
     f16::convert_f16_rgba_to_srgb_scalar_unchecked
 }
 
-/// Best-available F16 HDR→sRGB kernel (SIMD when possible, scalar fallback).
+/// Best-available F16 HDR->sRGB kernel (SIMD when possible, scalar fallback).
 #[inline(always)]
 fn f16_hdr_kernel() -> HdrPixelKernel {
     static KERNEL: OnceLock<HdrPixelKernel> = OnceLock::new();
@@ -1455,7 +1448,6 @@ fn select_bgra_kernel_nt() -> PixelKernel {
         }
     }
 
-    // Scalar path has no NT variant; fall back to the regular kernel.
     scalar::convert_bgra_to_rgba_scalar_unchecked
 }
 
@@ -1475,7 +1467,6 @@ fn select_bgra_kernel_nt_nofence() -> PixelKernel {
         }
     }
 
-    // Scalar path has no NT variant; fall back to the regular kernel.
     scalar::convert_bgra_to_rgba_scalar_unchecked
 }
 
@@ -1500,14 +1491,14 @@ pub(crate) unsafe fn convert_bgra_to_rgba_unchecked(
     }
 }
 
-/// Non-temporal BGRA→RGBA conversion optimised for the GDI capture path.
+/// Non-temporal BGRA->RGBA conversion optimised for the GDI capture path.
 ///
 /// Differences from `convert_bgra_to_rgba_unchecked`:
-///   1. Always uses streaming (NT) stores — the destination buffer will
+///   1. Always uses streaming (NT) stores - the destination buffer will
 ///      not be read back before the next capture, so polluting the cache
 ///      with write-allocate traffic is pure waste.
 ///   2. Uses a lower parallelisation threshold so that 1080p captures
-///      (≈ 2 MP) reliably hit the multi-threaded path.
+///      (~2 MP) reliably hit the multi-threaded path.
 ///
 /// # Safety
 ///
@@ -1543,7 +1534,7 @@ pub(crate) unsafe fn convert_bgra_to_rgba_nt_unchecked(
         }
         return;
     }
-    // Serial path — still use NT stores since src != dst is guaranteed
+    // Serial path - still use NT stores since src != dst is guaranteed
     // by the caller and the working set far exceeds the cache.
     unsafe {
         nt_kernel(src, dst, pixel_count);
@@ -1571,7 +1562,7 @@ pub(crate) unsafe fn convert_f16_rgba_to_srgb_unchecked(
     }
 }
 
-/// Non-temporal F16→sRGB conversion for non-overlapping buffers.
+/// Non-temporal F16->sRGB conversion for non-overlapping buffers.
 ///
 /// Uses the lower NT parallelisation thresholds since the destination
 /// buffer won't be read back before the next capture.
@@ -1655,7 +1646,7 @@ unsafe fn convert_bgra_to_rgba_parallel_inner(
     }
 
     let chunk_count = pixel_count.div_ceil(chunk_pixels);
-    // Use non-temporal stores in the parallel path — each chunk is large
+    // Use non-temporal stores in the parallel path - each chunk is large
     // enough that the destination lines won't be read back before the
     // full conversion completes, so bypassing the cache is a net win.
     let kernel = nt_kernel.unwrap_or_else(bgra_kernel);

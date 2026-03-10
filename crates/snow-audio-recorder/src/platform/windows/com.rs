@@ -7,7 +7,11 @@ use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
 
 use crate::error::{AudioError, AudioResult};
 
-fn platform_err<E>(err: E) -> AudioError
+/// Convert any `anyhow`-compatible error into `AudioError::Platform`.
+///
+/// Shared by all Windows platform modules to avoid duplicating this
+/// trivial adapter in every file.
+pub(crate) fn platform_err<E>(err: E) -> AudioError
 where
     E: Into<anyhow::Error>,
 {
@@ -29,7 +33,7 @@ impl CoInitGuard {
 
         hr.ok()
             .context("failed to initialize COM with CoInitializeEx(COINIT_MULTITHREADED)")
-            .map_err(AudioError::platform)?;
+            .map_err(platform_err)?;
 
         Ok(Self {
             should_uninit: true,

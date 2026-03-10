@@ -1502,8 +1502,6 @@ mod tests {
         }
         .expect("baseline conversion failed");
 
-        // Deliberately inconsistent hints should fall back to runtime scanning
-        // instead of returning an incorrect converted count.
         let mut hinted = vec![0u8; dst_len];
         let hinted_converted = unsafe {
             convert_dirty_rects_trusted_direct_unchecked(
@@ -1762,7 +1760,6 @@ mod tests {
                 total_dirty_pixels: Some(dirty_pixels),
             };
 
-            // Correctness parity check.
             let mut scan_out = vec![0u8; buffer_len];
             let mut hinted_out = vec![0u8; buffer_len];
             let converted_scan = unsafe {

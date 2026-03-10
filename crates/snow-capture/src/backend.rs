@@ -8,18 +8,13 @@ use crate::monitor::MonitorId;
 use crate::window::WindowId;
 
 /// Capture intent used to tune backend behavior for latency/throughput.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CaptureMode {
     /// Favor low-overhead single-shot behavior for snapshots.
+    #[default]
     Screenshot,
     /// Favor sustained throughput for continuous recording pipelines.
     ScreenRecording,
-}
-
-impl Default for CaptureMode {
-    fn default() -> Self {
-        Self::Screenshot
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,14 +75,6 @@ pub const DEFAULT_AUTO_BACKEND_PRIORITY: [CaptureBackendKind; 3] = [
     CaptureBackendKind::WindowsGraphicsCapture,
     CaptureBackendKind::Gdi,
 ];
-
-/// Configuration for cursor capture behavior.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CursorCaptureConfig {
-    /// When `true`, the backend will capture cursor shape and position
-    /// data and attach it to `Frame::metadata.cursor`.
-    pub capture_cursor: bool,
-}
 
 /// Source/destination rectangle pair used for partial monitor capture writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,10 +145,6 @@ pub trait MonitorCapturer: Send {
 
     /// Set capture mode so backends can tune buffering/conversion policy.
     fn set_capture_mode(&mut self, _mode: CaptureMode) {}
-
-    /// Set cursor capture configuration. Backends that don't support
-    /// cursor capture may ignore this.
-    fn set_cursor_config(&mut self, _config: CursorCaptureConfig) {}
 }
 
 pub trait CaptureBackend: Send + Sync {
